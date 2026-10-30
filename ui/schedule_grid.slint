@@ -1,0 +1,190 @@
+import { Button } from "std-widgets.slint";
+
+export component ScheduleGrid inherits VerticalLayout {
+    in-out property <[bool]> slots; // length 168: day * 24 + hour
+    in property <color> active-color: #3b82f6;
+    in property <color> inactive-color: #1e293b;
+    in property <color> border-color: #334155;
+    in property <color> text-color: #94a3b8;
+
+    property <bool> is-dragging: false;
+    property <bool> drag-target-state: true;
+    property <int> last-touched-index: -1;
+
+    callback toggle-slot(int /* day */, int /* hour */, bool /* new_state */);
+    callback toggle-day(int /* day */);
+    callback toggle-hour(int /* hour */);
+    callback apply-preset(string /* preset */);
+
+    spacing: 8px;
+
+    // Presets Row
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+
+        Text {
+            text: "Presets:";
+            color: root.text-color;
+            vertical-alignment: center;
+            font-size: 13px;
+        }
+
+        Button {
+            text: "Work Hours (M-F 9-5)";
+            clicked => { root.apply-preset("work_hours"); }
+        }
+
+        Button {
+            text: "Evenings";
+            clicked => { root.apply-preset("evenings"); }
+        }
+
+        Button {
+            text: "Select All";
+            clicked => { root.apply-preset("select_all"); }
+        }
+
+        Button {
+            text: "Clear All";
+            clicked => { root.apply-preset("clear"); }
+        }
+    }
+
+    // Grid Container
+    VerticalLayout {
+        spacing: 4px;
+
+        // Header Row (Day labels)
+        HorizontalLayout {
+            spacing: 2px;
+            height: 24px;
+
+            // Empty space above row hour labels
+            Rectangle {
+                width: 45px;
+            }
+
+            // Day headers
+            for day-name[d] in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]: Rectangle {
+                background: day-touch.has-hover ? #334155 : #0f172a;
+                border-radius: 3px;
+                border-width: 1px;
+                border-color: root.border-color;
+
+                Text {
+                    text: day-name;
+                    color: root.text-color;
+                    font-size: 11px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                day-touch := TouchArea {
+                    clicked => {
+                        root.toggle-day(d);
+                    }
+                }
+            }
+        }
+
+        // 24 Hour Rows
+        HorizontalLayout {
+            spacing: 2px;
+
+            // Hour labels column (Left)
+            VerticalLayout {
+                width: 45px;
+                spacing: 2px;
+
+                for hour-name[h] in [
+                    "00:00", "01:00", "02:00", "03:00", "04:00", "05:00",
+                    "06:00", "07:00", "08:00", "09:00", "10:00", "11:00",
+                    "12:00", "13:00", "14:00", "15:00", "16:00", "17:00",
+                    "18:00", "19:00", "20:00", "21:00", "22:00", "23:00"
+                ]: Rectangle {
+                    height: 16px;
+                    background: hour-touch.has-hover ? #334155 : transparent;
+                    border-radius: 2px;
+
+                    Text {
+                        text: hour-name;
+                        color: root.text-color;
+                        font-size: 9px;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+
+                    hour-touch := TouchArea {
+                        clicked => {
+                            root.toggle-hour(h);
+                        }
+                    }
+                }
+            }
+
+            // Interactive 7x24 Matrix with Single TouchArea
+            grid-container := Rectangle {
+                clip: true;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: root.border-color;
+
+                // Visual cell representation: 7 columns
+                HorizontalLayout {
+                    spacing: 2px;
+                    padding: 1px;
+
+                    for d in [0, 1, 2, 3, 4, 5, 6]: VerticalLayout {
+                        spacing: 2px;
+
+                        for h in [
+                            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+                        ]: Rectangle {
+                            height: 16px;
+                            border-radius: 2px;
+                            background: root.slots[d * 24 + h] ? root.active-color : root.inactive-color;
+                            animate background { duration: 100ms; }
+                        }
+                    }
+                }
+
+                // Single unified TouchArea over entire 7x24 grid area
+                // Uses reactive element properties instead of invalid C-style `int col = ...` statements
+                TouchArea {
+                    property <int> current-col: self.width > 0px ? Math.min(Math.max(Math.floor(self.mouse-x / (self.width / 7)), 0), 6) : 0;
+                    property <int> current-row: self.height > 0px ? Math.min(Math.max(Math.floor(self.mouse-y / (self.height / 24)), 0), 23) : 0;
+                    property <int> current-idx: self.current-col * 24 + self.current-row;
+
+                    pointer-event(event) => {
+                        if (self.width <= 0px || self.height <= 0px) {
+                            return;
+                        }
+
+                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                            root.is-dragging = true;
+                            root.drag-target-state = !root.slots[self.current-idx];
+                            root.last-touched-index = self.current-idx;
+                            root.toggle-slot(self.current-col, self.current-row, root.drag-target-state);
+                        }
+                        if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                            root.is-dragging = false;
+                            root.last-touched-index = -1;
+                        }
+                    }
+
+                    moved => {
+                        if (root.is-dragging && self.width > 0px && self.height > 0px) {
+                            if (self.current-idx != root.last-touched-index) {
+                                root.last-touched-index = self.current-idx;
+                                root.toggle-slot(self.current-col, self.current-row, root.drag-target-state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

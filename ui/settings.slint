@@ -1,0 +1,1453 @@
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Slider, SpinBox, TextEdit, Palette } from "std-widgets.slint";
+import { ScheduleGrid } from "schedule_grid.slint";
+import { ExecutableSelector } from "executable_selector.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { DurationInput } from "duration_input.slint";
+
+export struct RuleView {
+    id: string,
+    enabled: bool,
+    name: string,
+    monitor-selection: string, // "Executables" | "Titles" | "Urls"
+    target-executables: [string],
+    title-regex: string,
+    url-regex: string,
+    trigger: string, // "Period" | "Limit"
+    period-val: int,
+    period-unit: string,
+    reset-afk-val: int,
+    reset-afk-unit: string,
+    limit-val: int,
+    limit-unit: string,
+    action: string, // "Show Overlay" | "Show Notification" | "Show Statistics" | "Lock Workstation" | "Close Tab" | "Close Window" | "Kill Process"
+    warn-before-val: int,
+    warn-before-unit: string,
+    grace-val: int,
+    grace-unit: string,
+    break-val: int,
+    break-unit: string,
+    click-through: bool,
+    strict-mode: bool,
+    notification-method: string, // "HUD" | "Windows"
+    notification-duration-val: int,
+    notification-duration-unit: string,
+    show-remaining-time: bool,
+    message: string,
+    schedule-slots: [bool],
+    status-text: string,
+}
+
+component FormatToggleBtn inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-active;
+    in property <bool> is-italic: false;
+    in property <length> btn-width: 48px;
+    callback clicked();
+
+    width: root.btn-width;
+    height: 28px;
+    border-radius: 4px;
+    background: root.is-active ? #2563eb : (touch.has-hover ? #334155 : #0f172a);
+    border-width: 1px;
+    border-color: root.is-active ? #60a5fa : #475569;
+
+    Text {
+        text: root.text;
+        font-weight: 700;
+        font-italic: root.is-italic;
+        font-size: 12px;
+        color: root.is-active ? #ffffff : #cbd5e1;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component SectionCard inherits Rectangle {
+    in property <length> card-padding: 16px;
+    in property <length> card-spacing: 14px;
+    background: #1e293b;
+    border-radius: 8px;
+
+    VerticalLayout {
+        padding: root.card-padding;
+        spacing: root.card-spacing;
+        @children
+    }
+}
+
+component FormRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <length> label-width: 190px;
+    spacing: 12px;
+
+    Text {
+        text: root.label;
+        color: #cbd5e1;
+        vertical-alignment: center;
+        width: root.label-width;
+    }
+    @children
+}
+
+component SidebarNavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <bool> highlight-text: root.active;
+    callback clicked <=> touch.clicked;
+
+    height: 38px;
+    border-radius: 6px;
+    background: root.active ? #3b82f6.with-alpha(0.25) : (touch.has-hover ? #334155 : transparent);
+    border-width: root.active ? 1px : 0px;
+    border-color: #3b82f6;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        spacing: 10px;
+        Text {
+            text: root.text;
+            font-size: 14px;
+            font-weight: root.active ? 700 : 500;
+            color: root.highlight-text ? #60a5fa : #cbd5e1;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {}
+}
+
+export component SettingsWindow inherits Window {
+    title: "AW-Enforcer Settings";
+    icon: @image-url("../assets/app_icon_256.png");
+    min-width: 960px;
+    min-height: 680px;
+    preferred-width: 1060px;
+    preferred-height: 760px;
+    background: #0f172a;
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    // Navigation Tab state: 0 = General, 1 = Rules, 2 = Live Status
+    in-out property <int> active-tab: 0;
+
+    // Rules Navigation: -1 = All Rules Overview, >= 0 = specific child rule
+    in-out property <int> selected-rule-idx: -1;
+
+    // General Settings Properties
+    in-out property <int> aw-port: 5600;
+    in-out property <int> poll-interval-seconds: 10;
+    in-out property <bool> autostart: true;
+    in-out property <string> api-key: "";
+    in-out property <int> day-start-hour: 4;
+    in-out property <bool> suppress-fullscreen-d3d: true;
+    in-out property <bool> strict-lock-active: false;
+    in-out property <bool> strict-unlocked: false;
+    in-out property <int> strict-unlock-countdown: 0;
+    property <bool> ui-locked-by-strict: root.strict-lock-active && !root.strict-unlocked;
+    callback request-strict-unlock();
+    in-out property <float> overlay-opacity: 0.90;
+    in-out property <string> accent-color-hex: "#3b82f6";
+    in-out property <int> daily-target-minutes: 480;
+    in-out property <int> threshold-excessive-minutes: 600;
+    in-out property <string> time-format-code: "%H:%M";
+    in property <string> time-format-preview: "✓ Preview: 14:30";
+    in property <bool> time-format-valid: true;
+    in-out property <bool> has-unsaved-changes: false;
+
+    // Unified Rules Data
+    in-out property <[RuleView]> rules;
+
+    // Known apps for dropdown picker
+    in property <[string]> known-apps;
+
+    // Live Message Preview & Editor state
+    in property <[FormattedParagraph]> preview-paragraphs;
+    in-out property <int> selected-message-line: 0;
+    in-out property <string> editor-message-text: "";
+    in property <[int]> message-lines: [1, 2, 3];
+    in property <bool> line-is-h1: false;
+    in property <bool> line-is-h2: false;
+    in property <bool> line-is-bold: false;
+    in property <bool> line-is-italic: false;
+    in property <bool> line-is-underline: false;
+    in property <string> line-color: "";
+    in property <int> line-size: 0;
+    in property <string> line-color-display: "Color: Default";
+    in property <string> line-size-display: "Size: Default";
+
+    // Live Status metrics
+    in property <bool> aw-connected: false;
+    in property <string> current-streak-text: "0m";
+    in property <string> today-screentime-text: "0h 0m";
+    in property <string> current-active-app: "None";
+
+    // Callbacks to Rust daemon
+    callback save-config();
+    callback discard-changes();
+    callback test-overlay(string /* mode */);
+    callback show-activity-stats();
+    callback validate-time-format(string /* code */);
+    callback browse-executable();
+    callback refresh-known-apps();
+
+    callback add-rule();
+    callback delete-rule(int /* rule_idx */);
+
+    callback add-known-app-to-rule(int /* rule_idx */, string /* app */);
+    callback remove-executable-from-rule(int /* rule_idx */, int /* exe_idx */);
+    callback toggle-schedule-slot(int /* rule_idx */, int /* day */, int /* hour */, bool /* state */);
+    callback toggle-schedule-day(int /* rule_idx */, int /* day */);
+    callback toggle-schedule-hour(int /* rule_idx */, int /* hour */);
+    callback apply-schedule-preset(int /* rule_idx */, string /* preset */);
+    callback select-message-line(int /* line_idx */);
+    callback message-text-edited(string /* text */);
+    callback apply-line-style(int /* line_idx */, string /* style */);
+    callback append-placeholder(int /* line_idx */, string /* placeholder */);
+    callback update-message-preview(int /* rule_idx */);
+
+    HorizontalLayout {
+        // ==========================================
+        // LEFT SIDEBAR NAVIGATION
+        // ==========================================
+        Rectangle {
+            width: 230px;
+            background: #1e293b;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                // Logo / App Title
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: #3b82f6;
+
+                        Text {
+                            text: "⏱";
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: "AW-Enforcer";
+                        font-size: 18px;
+                        font-weight: 800;
+                        color: #f8fafc;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Rectangle { height: 1px; background: #334155; }
+
+                // Navigation Buttons
+                ScrollView {
+                    VerticalLayout {
+                        spacing: 4px;
+
+                        // Tab 0: General
+                        SidebarNavItem {
+                            text: "⚙ General";
+                            active: root.active-tab == 0;
+                            clicked => { root.active-tab = 0; }
+                        }
+
+                        // Tab 1: Rules Root
+                        SidebarNavItem {
+                            text: "📋 Rules";
+                            active: root.active-tab == 1 && root.selected-rule-idx == -1;
+                            highlight-text: root.active-tab == 1;
+                            clicked => {
+                                root.active-tab = 1;
+                                root.selected-rule-idx = -1;
+                            }
+                        }
+
+                        // Indented sub-items under "Rules"
+                        for r[i] in root.rules : Rectangle {
+                            height: 32px;
+                            border-radius: 6px;
+                            background: root.active-tab == 1 && root.selected-rule-idx == i ? #3b82f6.with-alpha(0.25) : (subnav.has-hover ? #334155.with-alpha(0.6) : transparent);
+                            border-width: root.active-tab == 1 && root.selected-rule-idx == i ? 1px : 0px;
+                            border-color: #3b82f6.with-alpha(0.7);
+
+                            HorizontalLayout {
+                                padding-left: 24px;
+                                padding-right: 8px;
+                                spacing: 8px;
+
+                                Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: r.enabled ? #10b981 : #64748b;
+                                    y: (parent.height - self.height) / 2;
+                                }
+
+                                Text {
+                                    text: r.name != "" ? r.name : ("Rule " + (i + 1));
+                                    font-size: 12px;
+                                    font-weight: root.active-tab == 1 && root.selected-rule-idx == i ? 700 : 400;
+                                    color: root.active-tab == 1 && root.selected-rule-idx == i ? #93c5fd : #94a3b8;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            subnav := TouchArea {
+                                clicked => {
+                                    root.active-tab = 1;
+                                    root.selected-rule-idx = i;
+                                    root.editor-message-text = r.message;
+                                    root.update-message-preview(i);
+                                }
+                            }
+                        }
+
+                        // Tab 2: Live Status
+                        SidebarNavItem {
+                            text: "📊 Live Status";
+                            active: root.active-tab == 2;
+                            clicked => {
+                                root.active-tab = 2;
+                            }
+                        }
+                    }
+                }
+
+                // Spacer pushing Save Button to bottom
+                Rectangle { height: 1px; background: #334155; }
+
+                if root.ui-locked-by-strict : Rectangle {
+                    background: #7f1d1d.with-alpha(0.4);
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: #ef4444;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+                        Text {
+                            text: "🔒 Strict Rule Enforcing";
+                            color: #fca5a5;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                        Button {
+                            text: root.strict-unlock-countdown > 0
+                                ? ("Unlocking in " + root.strict-unlock-countdown + "s...")
+                                : "Unlock Editing (15s)";
+                            enabled: root.strict-unlock-countdown == 0;
+                            clicked => {
+                                root.request-strict-unlock();
+                            }
+                        }
+                    }
+                }
+
+                // Save & Apply Button
+                Rectangle {
+                    height: 38px;
+                    background: (!root.time-format-valid || root.ui-locked-by-strict) ? #1e293b.darker(0.3) :
+                                root.has-unsaved-changes ? (save_touch.pressed ? #1d4ed8 : (save_touch.has-hover ? #3b82f6 : #2563eb)) :
+                                (save_touch.pressed ? #0f172a : (save_touch.has-hover ? #334155 : #1e293b));
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: (!root.time-format-valid || root.ui-locked-by-strict) ? #334155 :
+                                 root.has-unsaved-changes ? #60a5fa :
+                                 (save_touch.has-hover ? #64748b : #475569);
+                    animate background { duration: 150ms; }
+                    animate border-color { duration: 150ms; }
+
+                    save_touch := TouchArea {
+                        enabled: root.time-format-valid && !root.ui-locked-by-strict;
+                        mouse-cursor: (root.time-format-valid && !root.ui-locked-by-strict) ? pointer : not-allowed;
+                        clicked => {
+                            if !root.ui-locked-by-strict {
+                                root.has-unsaved-changes = false;
+                                root.save-config();
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+
+                        if root.has-unsaved-changes : Text {
+                            text: "●";
+                            color: #38bdf8;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: "Save & Apply Changes";
+                            font-size: 13px;
+                            font-weight: root.has-unsaved-changes ? 700 : 500;
+                            color: (!root.time-format-valid || root.ui-locked-by-strict) ? #64748b :
+                                   root.has-unsaved-changes ? #ffffff : #cbd5e1;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Discard Changes Button
+                Rectangle {
+                    height: 36px;
+                    background: root.has-unsaved-changes ?
+                                (discard_touch.pressed ? #450a0a : (discard_touch.has-hover ? #7f1d1d.with-alpha(0.35) : #1e293b)) :
+                                #0f172a.with-alpha(0.3);
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: root.has-unsaved-changes ?
+                                 (discard_touch.has-hover ? #ef4444 : #475569) :
+                                 #1e293b;
+                    animate background { duration: 150ms; }
+                    animate border-color { duration: 150ms; }
+
+                    discard_touch := TouchArea {
+                        enabled: root.has-unsaved-changes && !root.ui-locked-by-strict;
+                        mouse-cursor: (root.has-unsaved-changes && !root.ui-locked-by-strict) ? pointer : not-allowed;
+                        clicked => {
+                            if !root.ui-locked-by-strict {
+                                root.discard-changes();
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 6px;
+
+                        Text {
+                            text: "Discard Changes";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: root.has-unsaved-changes ?
+                                   (discard_touch.has-hover ? #fca5a5 : #cbd5e1) :
+                                   #475569;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ==========================================
+        // MAIN CONTENT PANE
+        // ==========================================
+        ScrollView {
+            VerticalLayout {
+                alignment: start;
+                padding: 24px;
+
+                // ------------------------------------------
+                // TAB 0: GENERAL SETTINGS
+                // ------------------------------------------
+                if root.active-tab == 0 : VerticalLayout {
+                    spacing: 18px;
+
+                    Text {
+                        text: "General Settings";
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 16px;
+
+                        FormRow {
+                            label: "ActivityWatch Port:";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.aw-port;
+                                minimum: 1000;
+                                maximum: 65535;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Polling Interval (Seconds):";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.poll-interval-seconds;
+                                minimum: 1;
+                                maximum: 120;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Start on Windows Login:";
+                            label-width: 220px;
+                            CheckBox {
+                                checked <=> root.autostart;
+                                text: "Launch minimized to system tray on login";
+                                toggled => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "API Key (Optional):";
+                            label-width: 220px;
+                            LineEdit {
+                                text <=> root.api-key;
+                                placeholder-text: "Optional Bearer auth token";
+                                edited(val) => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Logical Day Start Hour (0–23):";
+                            label-width: 220px;
+                            SpinBox {
+                                width: 140px;
+                                value: root.day-start-hour;
+                                minimum: 0;
+                                maximum: 23;
+                                edited(val) => {
+                                    root.day-start-hour = val;
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Fullscreen / Presentation DND:";
+                            label-width: 220px;
+                            CheckBox {
+                                text: "Downgrade breaks during fullscreen apps & presentations";
+                                checked <=> root.suppress-fullscreen-d3d;
+                                toggled => { root.has-unsaved-changes = true; }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Overlay Theme & Appearance";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 16px;
+
+                        FormRow {
+                            label: "Overlay Opacity: " + Math.round(root.overlay-opacity * 100) + "%";
+                            label-width: 220px;
+                            Slider {
+                                value: root.overlay-opacity;
+                                minimum: 0.1;
+                                maximum: 1.0;
+                                changed(val) => {
+                                    root.overlay-opacity = val;
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Accent Color (Hex):";
+                            label-width: 220px;
+                            LineEdit {
+                                text <=> root.accent-color-hex;
+                                placeholder-text: "#3b82f6";
+                                edited(val) => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Test Overlays:";
+                            label-width: 220px;
+                            Button { text: "Test Break Screen"; clicked => { root.test-overlay("break"); } }
+                            Button { text: "Test HUD Toast"; clicked => { root.test-overlay("hud_toast"); } }
+                            Button { text: "Test HUD Timer"; clicked => { root.test-overlay("hud_timer"); } }
+                            Button { text: "Test 24h Stats HUD"; clicked => { root.test-overlay("hud_status"); } }
+                        }
+                    }
+
+                    Text {
+                        text: "Activity Statistics & 24h HUD Configuration";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 16px;
+
+                        FormRow {
+                            label: "Daily Target Screen Time (Mins):";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.daily-target-minutes;
+                                minimum: 60;
+                                maximum: 1440;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Excessive Threshold (Mins):";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.threshold-excessive-minutes;
+                                minimum: 60;
+                                maximum: 1440;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Histogram Time Format (Strftime):";
+                            label-width: 220px;
+                            LineEdit {
+                                text <=> root.time-format-code;
+                                edited(val) => {
+                                    root.validate-time-format(val);
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+                            Text {
+                                text: root.time-format-preview;
+                                color: root.time-format-valid ? #10b981 : #ef4444;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        FormRow {
+                            label: "Show Activity Stats Overlay:";
+                            label-width: 220px;
+                            Button {
+                                text: "Open 24-Hour Activity HUD";
+                                clicked => {
+                                    root.show-activity-stats();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------
+                // TAB 1: UNIFIED RULES (OVERVIEW OR CHILD TAB)
+                // ------------------------------------------
+                if root.active-tab == 1 : VerticalLayout {
+                    spacing: 18px;
+
+                    // Top Sub-Tab Bar
+                    VerticalLayout {
+                        spacing: 0px;
+
+                        ScrollView {
+                            height: 40px;
+
+                            HorizontalLayout {
+                                spacing: 4px;
+                                alignment: start;
+
+                                // Overview Tab
+                                Rectangle {
+                                    height: 38px;
+                                    border-top-left-radius: 6px;
+                                    border-top-right-radius: 6px;
+                                    background: root.selected-rule-idx == -1 ? #1e293b : (ov_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
+                                    border-width: 1px;
+                                    border-color: root.selected-rule-idx == -1 ? #3b82f6 : #334155;
+
+                                    if root.selected-rule-idx == -1 : Rectangle {
+                                        y: 0px;
+                                        height: 3px;
+                                        background: #3b82f6;
+                                        border-top-left-radius: 5px;
+                                        border-top-right-radius: 5px;
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 16px;
+                                        Text {
+                                            text: "All Rules (Overview)";
+                                            color: root.selected-rule-idx == -1 ? #ffffff : #94a3b8;
+                                            font-weight: root.selected-rule-idx == -1 ? 700 : 500;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    ov_touch := TouchArea {
+                                        clicked => {
+                                            root.selected-rule-idx = -1;
+                                        }
+                                    }
+                                }
+
+                                // Individual Rule Tabs
+                                for r[i] in root.rules : Rectangle {
+                                    height: 38px;
+                                    border-top-left-radius: 6px;
+                                    border-top-right-radius: 6px;
+                                    background: root.selected-rule-idx == i ? #1e293b : (rule_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
+                                    border-width: 1px;
+                                    border-color: root.selected-rule-idx == i ? #3b82f6 : #334155;
+
+                                    if root.selected-rule-idx == i : Rectangle {
+                                        y: 0px;
+                                        height: 3px;
+                                        background: #3b82f6;
+                                        border-top-left-radius: 5px;
+                                        border-top-right-radius: 5px;
+                                    }
+
+                                    HorizontalLayout {
+                                        padding-left: 14px;
+                                        padding-right: 14px;
+                                        spacing: 8px;
+
+                                        Rectangle {
+                                            width: 6px;
+                                            height: 6px;
+                                            border-radius: 3px;
+                                            background: r.enabled ? #10b981 : #64748b;
+                                            y: (parent.height - self.height) / 2;
+                                        }
+
+                                        Text {
+                                            text: r.name != "" ? r.name : ("Rule " + (i + 1));
+                                            color: root.selected-rule-idx == i ? #ffffff : #94a3b8;
+                                            font-weight: root.selected-rule-idx == i ? 700 : 500;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    rule_touch := TouchArea {
+                                        clicked => {
+                                            root.selected-rule-idx = i;
+                                            root.editor-message-text = r.message;
+                                            root.update-message-preview(i);
+                                        }
+                                    }
+                                }
+
+                                // Add Rule Button
+                                Button {
+                                    text: "+ Add Rule";
+                                    clicked => {
+                                        root.add-rule();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Tab baseline border
+                        Rectangle {
+                            height: 1px;
+                            background: #334155;
+                        }
+                    }
+
+                    // 1A. ROOT RULES OVERVIEW PANE
+                    if root.selected-rule-idx == -1 : VerticalLayout {
+                        spacing: 16px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+
+                            Text {
+                                text: "Configured Rules";
+                                font-size: 22px;
+                                font-weight: 700;
+                                color: #f8fafc;
+                                vertical-alignment: center;
+                            }
+
+                            Button {
+                                text: "+ Add Rule";
+                                primary: true;
+                                clicked => { root.add-rule(); }
+                            }
+                        }
+
+                        if root.rules.length == 0 : Rectangle {
+                            background: #1e293b;
+                            border-radius: 8px;
+                            height: 140px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 10px;
+
+                                Text {
+                                    text: "No rules configured yet.";
+                                    font-size: 16px;
+                                    color: #94a3b8;
+                                    horizontal-alignment: center;
+                                }
+
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Button {
+                                        text: "+ Create Your First Rule";
+                                        clicked => { root.add-rule(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        for r[i] in root.rules : Rectangle {
+                            background: #1e293b;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: #334155;
+
+                            HorizontalLayout {
+                                padding: 16px;
+                                spacing: 14px;
+                                alignment: space-between;
+
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    alignment: start;
+
+                                    CheckBox {
+                                        checked: r.enabled;
+                                        enabled: !root.ui-locked-by-strict;
+                                        toggled => {
+                                            root.rules[i].enabled = self.checked;
+                                            root.has-unsaved-changes = true;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 4px;
+                                        alignment: center;
+
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+
+                                            Text {
+                                                text: r.name != "" ? r.name : ("Rule " + (i + 1));
+                                                font-size: 16px;
+                                                font-weight: 700;
+                                                color: r.enabled ? #f8fafc : #64748b;
+                                                vertical-alignment: center;
+                                            }
+
+                                            if r.status-text != "" : Rectangle {
+                                                background: #0284c7.with-alpha(0.2);
+                                                border-radius: 4px;
+                                                border-width: 1px;
+                                                border-color: #38bdf8.with-alpha(0.4);
+
+                                                HorizontalLayout {
+                                                    padding-left: 6px;
+                                                    padding-right: 6px;
+                                                    padding-top: 2px;
+                                                    padding-bottom: 2px;
+                                                    Text {
+                                                        text: r.status-text;
+                                                        font-size: 11px;
+                                                        font-weight: 600;
+                                                        color: #38bdf8;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Text {
+                                            text: "Monitor: " + r.monitor-selection + "  •  Trigger: " +
+                                                (r.trigger == "Period"
+                                                    ? ("Every " + r.period-val + " " + r.period-unit)
+                                                    : ("Daily Limit " + r.limit-val + " " + r.limit-unit)) +
+                                                "  •  Action: " + r.action;
+                                            font-size: 12px;
+                                            color: #94a3b8;
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    alignment: end;
+
+                                    Button {
+                                        text: "Configure";
+                                        clicked => {
+                                            root.selected-rule-idx = i;
+                                            root.editor-message-text = r.message;
+                                            root.update-message-preview(i);
+                                        }
+                                    }
+
+                                    Button {
+                                        text: "Delete";
+                                        enabled: !root.ui-locked-by-strict;
+                                        clicked => {
+                                            root.delete-rule(i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 1B. CHILD RULE TAB
+                    if root.selected-rule-idx >= 0 && root.selected-rule-idx < root.rules.length : child_rule_view := VerticalLayout {
+                        property <string> cur-monitor: root.rules[root.selected-rule-idx].monitor-selection;
+                        property <string> cur-trigger: root.rules[root.selected-rule-idx].trigger;
+                        property <string> cur-action: root.rules[root.selected-rule-idx].action;
+                        property <bool> has-target-executables: root.rules[root.selected-rule-idx].target-executables.length > 0;
+
+                        spacing: 16px;
+
+                        // ==========================================
+                        // SECTION 1: GENERAL
+                        // ==========================================
+                        Text { text: "1. General Settings"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+                        SectionCard {
+                            FormRow {
+                                label: "Rule Enabled:";
+                                CheckBox {
+                                    checked: root.rules[root.selected-rule-idx].enabled;
+                                    text: "Active during scheduled hours";
+                                    toggled => {
+                                        root.rules[root.selected-rule-idx].enabled = self.checked;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            FormRow {
+                                label: "Rule Name:";
+                                LineEdit {
+                                    text: root.rules[root.selected-rule-idx].name;
+                                    edited(val) => {
+                                        root.rules[root.selected-rule-idx].name = val;
+                                        root.has-unsaved-changes = true;
+                                        root.update-message-preview(root.selected-rule-idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ==========================================
+                        // SECTION 2: MONITOR
+                        // ==========================================
+                        Text { text: "2. Monitor Target"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+                        SectionCard {
+                            FormRow {
+                                label: "Selection Mode:";
+                                ComboBox {
+                                    width: 200px;
+                                    model: ["Executables", "Titles", "Urls"];
+                                    current-value: root.rules[root.selected-rule-idx].monitor-selection;
+                                    selected(val) => {
+                                        root.rules[root.selected-rule-idx].monitor-selection = val;
+                                        if val == "Executables" {
+                                            if root.rules[root.selected-rule-idx].action == "Kill Process" && root.rules[root.selected-rule-idx].target-executables.length == 0 {
+                                                root.rules[root.selected-rule-idx].action = "Close Window";
+                                            }
+                                        } else {
+                                            if root.rules[root.selected-rule-idx].action == "Kill Process" {
+                                                root.rules[root.selected-rule-idx].action = "Close Window";
+                                            }
+                                        }
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-monitor == "Executables" : VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Monitored Executables ('*' = all active screen time):"; font-size: 14px; font-weight: 600; color: #f8fafc; }
+                                ExecutableSelector {
+                                    executables: root.rules[root.selected-rule-idx].target-executables;
+                                    known-apps: root.known-apps;
+                                    empty-text: "No executables listed — rule applies to all active screen time (*).";
+                                    browse-executable => { root.browse-executable(); }
+                                    refresh-known-apps => { root.refresh-known-apps(); }
+                                    add-known-app(app) => { root.add-known-app-to-rule(root.selected-rule-idx, app); }
+                                    remove-executable(idx) => { root.remove-executable-from-rule(root.selected-rule-idx, idx); }
+                                }
+                            }
+
+                            if child_rule_view.cur-monitor == "Titles" : FormRow {
+                                label: "Window Title Regex:";
+                                LineEdit {
+                                    text: root.rules[root.selected-rule-idx].title-regex;
+                                    placeholder-text: "(?i)(youtube|twitch|reddit)";
+                                    edited(val) => {
+                                        root.rules[root.selected-rule-idx].title-regex = val;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-monitor == "Urls" : FormRow {
+                                label: "Browser URL Regex:";
+                                LineEdit {
+                                    text: root.rules[root.selected-rule-idx].url-regex;
+                                    placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
+                                    edited(val) => {
+                                        root.rules[root.selected-rule-idx].url-regex = val;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // ==========================================
+                        // SECTION 3: TRIGGER
+                        // ==========================================
+                        Text { text: "3. Trigger"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+                        SectionCard {
+                            // 2A. Trigger: Period | Limit
+                            FormRow {
+                                label: "Trigger:";
+                                ComboBox {
+                                    width: 220px;
+                                    model: ["Period", "Limit"];
+                                    current-value: root.rules[root.selected-rule-idx].trigger;
+                                    selected(val) => {
+                                        root.rules[root.selected-rule-idx].trigger = val;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-trigger == "Period" : DurationInput {
+                                label: "Period:";
+                                minimum-value: 1;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].period-val;
+                                unit: root.rules[root.selected-rule-idx].period-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].period-val = val;
+                                    root.rules[root.selected-rule-idx].period-unit = u;
+                                    root.update-message-preview(root.selected-rule-idx);
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            if child_rule_view.cur-trigger == "Period" : DurationInput {
+                                label: "Reset Session after AFK:";
+                                minimum-value: 1;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].reset-afk-val;
+                                unit: root.rules[root.selected-rule-idx].reset-afk-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].reset-afk-val = val;
+                                    root.rules[root.selected-rule-idx].reset-afk-unit = u;
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            if child_rule_view.cur-trigger == "Limit" : DurationInput {
+                                label: "Daily Limit (0 = immediate):";
+                                minimum-value: 0;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].limit-val;
+                                unit: root.rules[root.selected-rule-idx].limit-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].limit-val = val;
+                                    root.rules[root.selected-rule-idx].limit-unit = u;
+                                    root.update-message-preview(root.selected-rule-idx);
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+                        }
+
+                        // ==========================================
+                        // SECTION 4: ACTION
+                        // ==========================================
+                        Text { text: "4. Action"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+                        SectionCard {
+                            // 3A. Action selector
+                            FormRow {
+                                label: "Action:";
+                                ComboBox {
+                                    width: 220px;
+                                    model: (child_rule_view.cur-monitor == "Executables" && child_rule_view.has-target-executables)
+                                        ? ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]
+                                        : ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window"];
+                                    current-value: root.rules[root.selected-rule-idx].action;
+                                    selected(val) => {
+                                        root.rules[root.selected-rule-idx].action = val;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Notification" : FormRow {
+                                label: "Notification Method:";
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    for method in ["HUD", "Windows"] : Rectangle {
+                                        width: 106px;
+                                        height: 32px;
+                                        border-radius: 6px;
+                                        background: root.rules[root.selected-rule-idx].notification-method == method
+                                            ? #2563eb
+                                            : (method_touch.has-hover ? #334155 : #0f172a);
+                                        border-width: 1px;
+                                        border-color: root.rules[root.selected-rule-idx].notification-method == method
+                                            ? #60a5fa
+                                            : #475569;
+
+                                        Text {
+                                            text: method;
+                                            color: root.rules[root.selected-rule-idx].notification-method == method
+                                                ? #ffffff
+                                                : #cbd5e1;
+                                            font-size: 13px;
+                                            font-weight: root.rules[root.selected-rule-idx].notification-method == method ? 700 : 500;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+
+                                        method_touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                root.rules[root.selected-rule-idx].notification-method = method;
+                                                root.has-unsaved-changes = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Notification" && root.rules[root.selected-rule-idx].notification-method == "HUD" : DurationInput {
+                                label: "Duration:";
+                                minimum-value: 1;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].notification-duration-val;
+                                unit: root.rules[root.selected-rule-idx].notification-duration-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].notification-duration-val = val;
+                                    root.rules[root.selected-rule-idx].notification-duration-unit = u;
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Notification" && root.rules[root.selected-rule-idx].notification-method == "HUD" : FormRow {
+                                label: "Show Time Remaining:";
+                                CheckBox {
+                                    text: "Show countdown timer on notification";
+                                    checked: root.rules[root.selected-rule-idx].show-remaining-time;
+                                    toggled => {
+                                        root.rules[root.selected-rule-idx].show-remaining-time = self.checked;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            DurationInput {
+                                label: "Warn Before Action (0 = disabled):";
+                                minimum-value: 0;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].warn-before-val;
+                                unit: root.rules[root.selected-rule-idx].warn-before-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].warn-before-val = val;
+                                    root.rules[root.selected-rule-idx].warn-before-unit = u;
+                                    root.update-message-preview(root.selected-rule-idx);
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            DurationInput {
+                                label: "Grace Countdown (0 = disabled):";
+                                minimum-value: 0;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].grace-val;
+                                unit: root.rules[root.selected-rule-idx].grace-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].grace-val = val;
+                                    root.rules[root.selected-rule-idx].grace-unit = u;
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Overlay" : DurationInput {
+                                label: "Break Duration:";
+                                minimum-value: 1;
+                                maximum-value: 3600;
+                                value: root.rules[root.selected-rule-idx].break-val;
+                                unit: root.rules[root.selected-rule-idx].break-unit;
+                                edited(val, u) => {
+                                    root.rules[root.selected-rule-idx].break-val = val;
+                                    root.rules[root.selected-rule-idx].break-unit = u;
+                                    root.update-message-preview(root.selected-rule-idx);
+                                    root.has-unsaved-changes = true;
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Overlay" : FormRow {
+                                label: "Click-through Overlay:";
+                                CheckBox {
+                                    text: "Pass mouse clicks and keystrokes through overlay";
+                                    checked: root.rules[root.selected-rule-idx].click-through;
+                                    toggled => {
+                                        root.rules[root.selected-rule-idx].click-through = self.checked;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            if child_rule_view.cur-action == "Show Overlay" : FormRow {
+                                label: "Strict Mode:";
+                                CheckBox {
+                                    text: "Hide Skip/Snooze buttons and lock settings during enforcement";
+                                    checked: root.rules[root.selected-rule-idx].strict-mode;
+                                    toggled => {
+                                        root.rules[root.selected-rule-idx].strict-mode = self.checked;
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                            }
+
+                            // 3H. Message Template & Formatting Toolbar Sub-card
+                            if child_rule_view.cur-action == "Show Overlay" || child_rule_view.cur-action == "Show Notification" : Rectangle {
+                                background: #0f172a.with-alpha(0.6);
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #334155;
+
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 12px;
+
+                                    Text {
+                                        text: "Message Template & Formatting Toolbar:";
+                                        font-size: 15px;
+                                        font-weight: 600;
+                                        color: #f8fafc;
+                                    }
+
+                                // Formatting Toolbar Row 1: Active Styles & Formatting Tools
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+
+                                    FormatToggleBtn { text: "H1"; btn-width: 36px; is-active: root.line-is-h1; clicked => { root.apply-line-style(root.selected-message-line, "h1"); } }
+                                    FormatToggleBtn { text: "H2"; btn-width: 36px; is-active: root.line-is-h2; clicked => { root.apply-line-style(root.selected-message-line, "h2"); } }
+                                    FormatToggleBtn { text: "Bold"; btn-width: 48px; is-active: root.line-is-bold; clicked => { root.apply-line-style(root.selected-message-line, "bold"); } }
+                                    FormatToggleBtn { text: "Italic"; btn-width: 48px; is-active: root.line-is-italic; is-italic: true; clicked => { root.apply-line-style(root.selected-message-line, "italic"); } }
+                                    FormatToggleBtn { text: "Underline"; btn-width: 68px; is-active: root.line-is-underline; clicked => { root.apply-line-style(root.selected-message-line, "underline"); } }
+
+                                    // Color selector tool
+                                    ComboBox {
+                                        width: 135px;
+                                        model: ["Color: Default", "Color: Sky Blue", "Color: Emerald", "Color: Amber", "Color: Rose", "Color: Purple", "Color: Indigo", "Color: White"];
+                                        current-value: root.line-color-display;
+                                        selected(val) => {
+                                            root.apply-line-style(root.selected-message-line, val);
+                                        }
+                                    }
+
+                                    // Size selector tool
+                                    ComboBox {
+                                        width: 115px;
+                                        model: ["Size: Default", "Size: 12px", "Size: 14px", "Size: 16px", "Size: 18px", "Size: 20px", "Size: 24px", "Size: 28px", "Size: 32px"];
+                                        current-value: root.line-size-display;
+                                        selected(val) => {
+                                            root.apply-line-style(root.selected-message-line, val);
+                                        }
+                                    }
+                                }
+
+                                // Formatting Toolbar Row 2: Variable Quick-Insert Chips
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+
+                                    Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
+                                    for chip in ["{rule_name}", "{streak}", "{break_time}", "{app}", "{used}", "{limit}", "{remaining}"] : Button {
+                                        text: "+ " + chip;
+                                        clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                                    }
+                                }
+
+                                // Multi-line Message TextEdit with Left Line Selection Column
+                                HorizontalLayout {
+                                    spacing: 8px;
+
+                                    // Left Line Selection Gutter
+                                    Rectangle {
+                                        width: 44px;
+                                        background: #0f172a;
+                                        border-radius: 4px;
+                                        border-width: 1px;
+                                        border-color: #334155;
+
+                                        VerticalLayout {
+                                            padding-top: 6px;
+                                            padding-bottom: 6px;
+                                            padding-left: 4px;
+                                            padding-right: 4px;
+                                            spacing: 0px;
+                                            alignment: start;
+
+                                            for line-num[i] in root.message-lines : Rectangle {
+                                                height: 20px;
+                                                border-radius: 3px;
+                                                background: root.selected-message-line == i ? #1e3a8a : (gutter_touch.has-hover ? #1e293b : transparent);
+
+                                                HorizontalLayout {
+                                                    padding-left: 4px;
+                                                    padding-right: 4px;
+                                                    spacing: 3px;
+                                                    alignment: start;
+
+                                                    Rectangle {
+                                                        width: 10px;
+                                                        if root.selected-message-line == i : Text {
+                                                            text: "▶";
+                                                            color: #38bdf8;
+                                                            font-size: 10px;
+                                                            vertical-alignment: center;
+                                                            horizontal-alignment: center;
+                                                        }
+                                                    }
+
+                                                    Text {
+                                                        text: line-num;
+                                                        color: root.selected-message-line == i ? #38bdf8 : #64748b;
+                                                        font-size: 12px;
+                                                        font-weight: root.selected-message-line == i ? 700 : 400;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+
+                                                gutter_touch := TouchArea {
+                                                    clicked => {
+                                                        root.selected-message-line = i;
+                                                        root.select-message-line(i);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Single text block TextEdit
+                                    TextEdit {
+                                        height: 120px;
+                                        font-size: 15px;
+                                        text <=> root.editor-message-text;
+                                        edited(val) => {
+                                            root.rules[root.selected-rule-idx].message = val;
+                                            root.message-text-edited(val);
+                                            root.has-unsaved-changes = true;
+                                        }
+                                    }
+                                }
+
+                                // Live Message Preview Box
+                                Text { text: "Live Preview:"; color: #94a3b8; font-size: 12px; }
+                                Rectangle {
+                                    background: #0f172a.with-alpha(root.overlay-opacity);
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: #334155;
+
+                                    VerticalLayout {
+                                        padding: 12px;
+                                        FormattedText {
+                                            paragraphs: root.preview-paragraphs;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        }
+
+                        // ==========================================
+                        // SECTION 5: SCHEDULE
+                        // ==========================================
+                        Text { text: "5. Active Hours Schedule"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+                        SectionCard {
+                            ScheduleGrid {
+                                slots: root.rules[root.selected-rule-idx].schedule-slots;
+                                toggle-slot(d, h, s) => { root.toggle-schedule-slot(root.selected-rule-idx, d, h, s); }
+                                toggle-day(d) => { root.toggle-schedule-day(root.selected-rule-idx, d); }
+                                toggle-hour(h) => { root.toggle-schedule-hour(root.selected-rule-idx, h); }
+                                apply-preset(p) => { root.apply-schedule-preset(root.selected-rule-idx, p); }
+                            }
+                        }
+                    }
+                }
+
+                // ------------------------------------------
+                // TAB 2: LIVE STATUS
+                // ------------------------------------------
+                if root.active-tab == 2 : VerticalLayout {
+                    spacing: 18px;
+
+                    Text {
+                        text: "Live ActivityWatch Status";
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 14px;
+
+                        FormRow {
+                            label: "ActivityWatch Server:";
+                            label-width: 200px;
+                            Text {
+                                text: root.aw-connected ? "● Connected (localhost:" + root.aw-port + ")" : "○ Disconnected / Connecting...";
+                                color: root.aw-connected ? #10b981 : #ef4444;
+                                font-weight: 700;
+                            }
+                        }
+
+                        FormRow {
+                            label: "Current Continuous Streak:";
+                            label-width: 200px;
+                            Text { text: root.current-streak-text; color: #38bdf8; font-weight: 700; }
+                        }
+
+                        FormRow {
+                            label: "Today's Active Time:";
+                            label-width: 200px;
+                            Text { text: root.today-screentime-text; color: #f8fafc; font-weight: 700; }
+                        }
+
+                        FormRow {
+                            label: "Active Foreground Window:";
+                            label-width: 200px;
+                            Text { text: root.current-active-app; color: #a78bfa; font-weight: 600; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

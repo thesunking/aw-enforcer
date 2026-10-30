@@ -1,0 +1,107 @@
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+
+export component ExecutableSelector inherits VerticalLayout {
+    in property <[string]> executables;
+    in property <[string]> known-apps;
+    in property <string> empty-text: "No executables selected.";
+    in property <color> chip-background: #1e293b;
+    in property <color> chip-text-color: #f8fafc;
+    in property <color> accent-color: #3b82f6;
+
+    callback browse-executable();
+    callback refresh-known-apps();
+    callback add-known-app(string /* app_name */);
+    callback remove-executable(int /* index */);
+
+    spacing: 8px;
+
+    // Action Row (Browse, Refresh, Pick dropdown)
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+
+        Button {
+            text: "Browse .exe...";
+            clicked => { root.browse-executable(); }
+        }
+
+        Button {
+            text: "Refresh Running Apps";
+            clicked => { root.refresh-known-apps(); }
+        }
+
+        app-combo := ComboBox {
+            width: 240px;
+            model: root.known-apps;
+            current-value: "Pick running/recent app...";
+            selected(val) => {
+                if (val != "" && val != "Pick running/recent app...") {
+                    root.add-known-app(val);
+                }
+            }
+        }
+    }
+
+    // Chip List / Tag Pills (Horizontal ScrollView avoids invalid `wrap: true` on HorizontalLayout)
+    ScrollView {
+        height: 38px;
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            if root.executables.length == 0 : Text {
+                text: root.empty-text;
+                color: #64748b;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            for exe[i] in root.executables : Rectangle {
+                background: root.chip-background;
+                border-radius: 14px;
+                border-width: 1px;
+                border-color: #334155;
+                height: 28px;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 8px;
+                    spacing: 6px;
+                    alignment: center;
+
+                    Text {
+                        text: exe;
+                        color: root.chip-text-color;
+                        font-size: 12px;
+                        font-weight: 500;
+                        vertical-alignment: center;
+                    }
+
+                    // Remove 'X' button
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        background: remove-touch.has-hover ? #ef4444 : #475569;
+
+                        Text {
+                            text: "X";
+                            color: #ffffff;
+                            font-size: 10px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        remove-touch := TouchArea {
+                            clicked => {
+                                root.remove-executable(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

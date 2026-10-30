@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug AW-Enforcer",
+            "program": "${workspaceFolder}/target/debug/aw-enforcer.exe",
+            "cwd": "${workspaceFolder}",
+            "terminal": "integrated"
+        }
+    ]
+}

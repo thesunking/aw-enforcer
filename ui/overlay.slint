@@ -1,0 +1,455 @@
+import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+
+export component OverlayWindow inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    in property <string> mode: "hidden"; // "break" | "hud_toast" | "hud_timer" | "hud_status" | "hidden"
+    in property <string> rule-id: "";
+    in property <string> title-text: "";
+    in property <[FormattedParagraph]> message-paragraphs;
+    in property <string> countdown-text: "00:00";
+    in property <float> progress-ratio: 1.0;
+    in property <bool> allow-snooze: true;
+    in property <bool> strict-mode: false;
+    in property <bool> click-through: false;
+    in property <bool> is-user-idle: true;
+    in property <bool> show-time-remaining: false;
+
+    // Theme & Styling properties
+    in property <float> overlay-opacity: 0.90;
+    in property <color> accent-color: #3b82f6;
+    in property <color> backdrop-color: #0f172a;
+
+    // Histogram & Status properties
+    in property <string> status-level: "Great"; // "Great" | "Okay" | "Excessive"
+    in property <int> total-active-minutes: 0;
+    in property <int> target-minutes: 480;
+    in property <[float]> histogram-values;
+    in property <[string]> histogram-labels;
+    in property <bool> is-loading: false;
+
+    // Toast dropdown properties
+    in property <[string]> snooze-labels: ["5 min", "10 min", "15 min"];
+    in property <[int]> snooze-options: [5, 10, 15];
+    in-out property <int> selected-snooze-index: 0;
+
+    callback snooze-clicked(string /* rule_id */, int /* minutes */);
+    callback skip-break-clicked(string /* rule_id */);
+    callback acknowledge-toast-clicked(string /* rule_id */);
+    callback close-status-clicked();
+    callback drag-status-window();
+
+    // ==========================================
+    // 1. FULL-SCREEN BREAK ENFORCER OVERLAY
+    // ==========================================
+    if root.mode == "break" : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.backdrop-color.with-alpha(root.overlay-opacity);
+
+        VerticalLayout {
+            alignment: center;
+
+            HorizontalLayout {
+                alignment: center;
+
+                Rectangle {
+                    width: 520px;
+                    background: #1e293b;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: root.accent-color.with-alpha(0.4);
+
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 16px;
+
+                        // Title
+                        Text {
+                            text: root.title-text != "" ? root.title-text : "Break Required";
+                            font-size: 22px;
+                            font-weight: 700;
+                            color: #f8fafc;
+                            horizontal-alignment: center;
+                        }
+
+                        // Formatted Message Body
+                        FormattedText {
+                            paragraphs: root.message-paragraphs;
+                        }
+
+                        // Big Countdown Timer
+                        Rectangle {
+                            height: 64px;
+                            background: #0f172a;
+                            border-radius: 8px;
+
+                            Text {
+                                text: root.countdown-text;
+                                font-size: 36px;
+                                font-weight: 800;
+                                color: root.is-user-idle ? #38bdf8 : #f59e0b;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Progress Bar
+                        Rectangle {
+                            height: 6px;
+                            background: #334155;
+                            border-radius: 3px;
+
+                            Rectangle {
+                                x: 0;
+                                width: parent.width * Math.min(Math.max(root.progress-ratio, 0.0), 1.0);
+                                height: parent.height;
+                                background: root.accent-color;
+                                border-radius: 3px;
+                            }
+                        }
+
+                        if !root.is-user-idle : Text {
+                            text: "⏸ Input detected — timer paused until you step away";
+                            color: #f59e0b;
+                            font-size: 13px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                        }
+
+                        // Interaction controls (hidden if click-through == true)
+                        if !root.click-through : HorizontalLayout {
+                            spacing: 12px;
+                            alignment: center;
+
+                            if !root.strict-mode : Button {
+                                text: "Skip Break";
+                                clicked => {
+                                    root.skip-break-clicked(root.rule-id);
+                                }
+                            }
+
+                            if root.allow-snooze : Button {
+                                text: "Snooze (5m)";
+                                clicked => {
+                                    root.snooze-clicked(root.rule-id, 5);
+                                }
+                            }
+                        }
+
+                        if root.click-through : Text {
+                            text: "Click-through break active. Dismiss via system tray or step away from your PC.";
+                            color: #94a3b8;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // 2. INTERACTIVE HUD TOAST CARD (Top-Right)
+    // ==========================================
+    if root.mode == "hud_toast" : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.backdrop-color.with-alpha(root.overlay-opacity);
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: root.accent-color.with-alpha(0.5);
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            // Header
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "🔔 " + (root.title-text != "" ? root.title-text : "Limit Warning");
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: #f8fafc;
+                    vertical-alignment: center;
+                }
+
+                if root.show-time-remaining : Text {
+                    text: root.countdown-text;
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: #38bdf8;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Scrollable message body so content never pushes buttons off
+            ScrollView {
+                FormattedText {
+                    paragraphs: root.message-paragraphs;
+                }
+            }
+
+            // Controls: Snooze dropdown & Acknowledge
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                height: 34px;
+
+                if root.allow-snooze && !root.strict-mode : HorizontalLayout {
+                    spacing: 8px;
+
+                    ComboBox {
+                        width: 110px;
+                        model: root.snooze-labels;
+                        current-index <=> root.selected-snooze-index;
+                    }
+
+                    Button {
+                        text: "Snooze";
+                        clicked => {
+                            root.snooze-clicked(
+                                root.rule-id,
+                                root.snooze-options.length > 0
+                                    ? root.snooze-options[Math.min(Math.max(root.selected-snooze-index, 0), root.snooze-options.length - 1)]
+                                    : 5
+                            );
+                        }
+                    }
+                }
+
+                Button {
+                    text: "OK";
+                    primary: true;
+                    clicked => {
+                        root.acknowledge-toast-clicked(root.rule-id);
+                    }
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // 3. HUD TIMER / GRACE COUNTDOWN CARD
+    // ==========================================
+    if root.mode == "hud_timer" : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.backdrop-color.with-alpha(root.overlay-opacity);
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #f59e0b;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            // Header & Countdown
+            HorizontalLayout {
+                Text {
+                    text: "⚠️ " + (root.title-text != "" ? root.title-text : "Quota Approaching");
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: #f8fafc;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.countdown-text;
+                    font-size: 18px;
+                    font-weight: 800;
+                    color: #f59e0b;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+
+            ScrollView {
+                FormattedText {
+                    paragraphs: root.message-paragraphs;
+                }
+            }
+
+            // Progress Bar
+            Rectangle {
+                height: 5px;
+                background: #334155;
+                border-radius: 2px;
+
+                Rectangle {
+                    x: 0;
+                    width: parent.width * Math.min(Math.max(root.progress-ratio, 0.0), 1.0);
+                    height: parent.height;
+                    background: #f59e0b;
+                    border-radius: 2px;
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // 4. HUD STATUS / 24-HOUR HISTOGRAM CARD
+    // ==========================================
+    if root.mode == "hud_status" : Rectangle {
+        property <color> status-color: root.is-loading ? #38bdf8 :
+            (root.status-level == "Great" ? #10b981 :
+            (root.status-level == "Okay" ? #f59e0b : #ef4444));
+
+        width: 100%;
+        height: 100%;
+        background: root.backdrop-color.with-alpha(root.overlay-opacity);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: root.accent-color.with-alpha(0.5);
+
+        card_drag := TouchArea {
+            mouse-cursor: move;
+            pointer-event(pe) => {
+                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+                    root.drag-status-window();
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding-left: 20px;
+            padding-right: 24px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            // Header & Evaluation Badge
+            HorizontalLayout {
+                alignment: space-between;
+                spacing: 12px;
+
+                Text {
+                    text: "📊 " + (root.title-text != "" ? root.title-text : "24-Hour Screen Time Activity");
+                    font-size: 15px;
+                    font-weight: 700;
+                    color: #f8fafc;
+                    vertical-alignment: center;
+                }
+
+                // Status Badge
+                Rectangle {
+                    border-radius: 4px;
+                    background: status-color.with-alpha(0.2);
+                    border-width: 1px;
+                    border-color: status-color;
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
+
+                        Text {
+                            text: root.is-loading ? "Loading..." : root.status-level;
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: status-color;
+                        }
+                    }
+                }
+            }
+
+            // Histogram Bars + Formatted Time Labels Container
+            Rectangle {
+                height: 150px;
+                background: #0f172a;
+                border-radius: 6px;
+
+                if root.is-loading : VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    Text {
+                        text: "⏳ Loading 24-Hour Timeline...";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: #38bdf8;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Querying ActivityWatch REST API...";
+                        font-size: 11px;
+                        color: #94a3b8;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                if !root.is-loading : VerticalLayout {
+                    padding-left: 14px;
+                    padding-right: 18px;
+                    padding-top: 10px;
+                    padding-bottom: 8px;
+                    spacing: 4px;
+
+                    // Bars Row
+                    HorizontalLayout {
+                        height: 114px;
+                        spacing: 3px;
+                        alignment: space-between;
+
+                        for val[idx] in root.histogram-values : Rectangle {
+                            width: 12px;
+                            height: 114px;
+
+                            Rectangle {
+                                width: 12px;
+                                height: Math.max(114px * Math.min(Math.max(val, 0.0), 1.0), 2px);
+                                y: parent.height - self.height;
+                                background: val > 0.8 ? #ef4444 : (val > 0.5 ? #f59e0b : root.accent-color);
+                                border-radius: 2px;
+                            }
+                        }
+                    }
+
+                    // Time Labels Row (formatted via config.stats.histogram_time_format)
+                    HorizontalLayout {
+                        height: 14px;
+                        spacing: 3px;
+                        alignment: space-between;
+
+                        for lbl[idx] in root.histogram-labels : Rectangle {
+                            width: 12px;
+                            Text {
+                                text: lbl;
+                                color: #94a3b8;
+                                font-size: 8px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bottom Summary & Close Button
+            HorizontalLayout {
+                alignment: space-between;
+                spacing: 12px;
+
+                Text {
+                    text: root.is-loading ? "Fetching activity from ActivityWatch server..." : ("Active: " + Math.floor(root.total-active-minutes / 60) + "h " + Math.mod(root.total-active-minutes, 60) + "m  /  Target: " + Math.floor(root.target-minutes / 60) + "h " + Math.mod(root.target-minutes, 60) + "m");
+                    color: #94a3b8;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                if !root.click-through : Button {
+                    text: "Close";
+                    clicked => {
+                        root.close-status-clicked();
+                    }
+                }
+            }
+        }
+    }
+}

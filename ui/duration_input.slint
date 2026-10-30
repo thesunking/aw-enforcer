@@ -1,0 +1,43 @@
+import { SpinBox, ComboBox } from "std-widgets.slint";
+
+export component DurationInput inherits HorizontalLayout {
+    in property <string> label;
+    in property <int> minimum-value: 0;
+    in property <int> maximum-value: 3600;
+    in-out property <int> value: 10;
+    in-out property <string> unit: "Min"; // "Hr" | "Min" | "Sec"
+
+    callback edited(int /* value */, string /* unit */);
+
+    spacing: 10px;
+    alignment: start;
+
+    Text {
+        text: root.label;
+        color: #cbd5e1;
+        font-size: 13px;
+        vertical-alignment: center;
+        width: 190px;
+    }
+
+    SpinBox {
+        width: 110px;
+        value: root.value;
+        minimum: root.minimum-value;
+        maximum: root.maximum-value;
+        edited(val) => {
+            root.value = val;
+            root.edited(val, root.unit);
+        }
+    }
+
+    ComboBox {
+        width: 85px;
+        model: ["Hr", "Min", "Sec"];
+        current-value: root.unit;
+        selected(u) => {
+            root.unit = u;
+            root.edited(root.value, u);
+        }
+    }
+}

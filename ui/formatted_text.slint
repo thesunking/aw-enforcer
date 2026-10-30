@@ -1,0 +1,40 @@
+export enum TextAlignment {
+    left,
+    center,
+    right,
+}
+
+export struct FormattedParagraph {
+    text: string,
+    font-size: length,
+    font-weight: int,
+    italic: bool,
+    underline: bool,
+    color: color,
+    alignment: TextAlignment,
+}
+
+export component FormattedText inherits VerticalLayout {
+    in property <[FormattedParagraph]> paragraphs;
+    spacing: 6px;
+
+    for para in root.paragraphs : VerticalLayout {
+        spacing: 2px;
+        min-height: para.font-size * 1.2;
+        txt := Text {
+            text: para.text;
+            font-size: para.font-size;
+            font-weight: para.font-weight;
+            font-italic: para.italic;
+            color: para.color;
+            horizontal-alignment: para.alignment == TextAlignment.center ? TextHorizontalAlignment.center : (para.alignment == TextAlignment.right ? TextHorizontalAlignment.right : TextHorizontalAlignment.left);
+            wrap: word-wrap;
+            width: 100%;
+        }
+        if para.underline : Rectangle {
+            width: 100%;
+            height: 1.5px;
+            background: para.color.with-alpha(0.65);
+        }
+    }
+}
