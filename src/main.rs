@@ -128,18 +128,10 @@ fn view_to_rule(view: &RuleView) -> Rule {
 
     let monitor_selection = MonitorSelection::from_str_lossy(view.monitor_selection.as_str());
     let trigger = TriggerType::from_str_lossy(view.trigger.as_str());
-    let mut action = RuleAction::from_str_lossy(view.action.as_str());
-    if monitor_selection == MonitorSelection::Executables {
-        let has_specific = targets.iter().any(|t| t != "*");
-        if !has_specific && action == RuleAction::KillProcess {
-            action = RuleAction::CloseWindow;
-        }
-    } else if action == RuleAction::KillProcess {
-        action = RuleAction::CloseWindow;
-    }
+    let action = RuleAction::from_str_lossy(view.action.as_str());
     let notification_method = NotificationMethod::from_str_lossy(view.notification_method.as_str());
 
-    Rule {
+    let mut rule = Rule {
         id: view.id.to_string(),
         enabled: view.enabled,
         name: view.name.to_string(),
@@ -183,7 +175,9 @@ fn view_to_rule(view: &RuleView) -> Rule {
         show_remaining_time: view.show_remaining_time,
         message: view.message.to_string(),
         schedule: RuleSchedule::from_bool_array(&slots),
-    }
+    };
+    rule.sanitize();
+    rule
 }
 
 /// Refreshes the message editor UI state (line count, active selection, toggle highlights, color/size dropdowns, and preview).

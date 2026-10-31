@@ -211,7 +211,6 @@ impl DurationConfig {
     }
 
     /// Formats the duration as a compact string such as `"2h"`, `"45m"`, or `"30s"`.
-    #[allow(dead_code)]
     pub fn to_short_string(&self) -> String {
         match self.unit {
             TimeUnit::Hr => format!("{}h", self.value),
@@ -391,6 +390,19 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Enforces safety invariants on this rule, downgrading `KillProcess` to `CloseWindow`
+    /// whenever the rule does not target at least one specific executable name.
+    pub fn sanitize(&mut self) {
+        let has_specific_exe = self.monitor_selection == MonitorSelection::Executables
+            && self.target_executables.iter().any(|t| {
+                let s = t.trim();
+                !s.is_empty() && s != "*"
+            });
+        if !has_specific_exe && self.action == RuleAction::KillProcess {
+            self.action = RuleAction::CloseWindow;
+        }
+    }
+
     /// Creates a new rule populated with sensible ergonomic defaults for the UI "+ Add Rule" action.
     pub fn default_template(index: usize) -> Self {
         Self {
@@ -651,10 +663,6 @@ impl Config {
 
         cfg.overlay.opacity = cfg.overlay.opacity.clamp(0.1, 1.0);
 
-        if cfg.rules.is_empty() {
-            cfg.rules = Self::default().rules;
-        }
-
         cfg.sanitize_rules();
 
         Ok(cfg)
@@ -664,17 +672,7 @@ impl Config {
     /// whenever a rule does not target at least one specific executable name.
     pub fn sanitize_rules(&mut self) {
         for rule in &mut self.rules {
-            if rule.monitor_selection == MonitorSelection::Executables {
-                let has_specific = rule.target_executables.iter().any(|t| {
-                    let s = t.trim();
-                    !s.is_empty() && s != "*"
-                });
-                if !has_specific && rule.action == RuleAction::KillProcess {
-                    rule.action = RuleAction::CloseWindow;
-                }
-            } else if rule.action == RuleAction::KillProcess {
-                rule.action = RuleAction::CloseWindow;
-            }
+            rule.sanitize();
         }
     }
 
