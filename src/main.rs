@@ -350,7 +350,7 @@ fn add_executable_to_rule(
     if trimmed.is_empty() || trimmed == "*" {
         return;
     }
-    update_rule_at(rm, sw, rule_idx, |rule_view, _| {
+    update_rule_at(rm, sw, rule_idx, |rule_view, win| {
         let mut targets: Vec<slint::SharedString> = rule_view
             .target_executables
             .iter()
@@ -362,6 +362,12 @@ fn add_executable_to_rule(
         if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(trimmed)) {
             targets.push(trimmed.into());
             rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
+            refresh_message_editor_state(
+                win,
+                &rule_view.message,
+                win.get_selected_message_line() as usize,
+                Some(rule_view),
+            );
             return true;
         }
         false
@@ -632,9 +638,17 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_add_rule(move || {
             if let Some(win) = sw.upgrade() {
-                let idx = rm.row_count();
-                let new_rule = Rule::default_template(idx);
+                let mut n = rm.row_count() + 1;
+                while (0..rm.row_count()).any(|i| {
+                    rm.row_data(i)
+                        .map(|r| r.id.as_str() == format!("rule-{n}"))
+                        .unwrap_or(false)
+                }) {
+                    n += 1;
+                }
+                let new_rule = Rule::default_template(n - 1);
                 let rv = rule_to_view(&new_rule);
+                let idx = rm.row_count();
                 rm.push(rv.clone());
                 win.set_selected_rule_idx(idx as i32);
                 refresh_message_editor_state(&win, &new_rule.message, 0, Some(&rv));
@@ -717,7 +731,7 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_remove_executable_from_rule(move |rule_idx, exe_idx| {
             let e_idx = exe_idx as usize;
-            update_rule_at(&rm, &sw, rule_idx, |rule_view, _| {
+            update_rule_at(&rm, &sw, rule_idx, |rule_view, win| {
                 let mut current_targets: Vec<slint::SharedString> =
                     rule_view.target_executables.iter().collect();
                 if e_idx < current_targets.len() {
@@ -727,6 +741,12 @@ fn open_settings_window(
                     }
                     rule_view.target_executables =
                         ModelRc::from(Rc::new(VecModel::from(current_targets)));
+                    refresh_message_editor_state(
+                        win,
+                        &rule_view.message,
+                        win.get_selected_message_line() as usize,
+                        Some(rule_view),
+                    );
                     return true;
                 }
                 false

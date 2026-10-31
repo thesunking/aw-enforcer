@@ -1119,6 +1119,7 @@ export component SettingsWindow inherits Window {
                                                 root.rules[root.selected-rule-idx].action = "Close Window";
                                             }
                                         }
+                                        root.update-message-preview(root.selected-rule-idx);
                                         root.has-unsaved-changes = true;
                                     }
                                 }
@@ -1177,6 +1178,7 @@ export component SettingsWindow inherits Window {
                                     current-value: root.rules[root.selected-rule-idx].trigger;
                                     selected(val) => {
                                         root.rules[root.selected-rule-idx].trigger = val;
+                                        root.update-message-preview(root.selected-rule-idx);
                                         root.has-unsaved-changes = true;
                                     }
                                 }
@@ -1502,7 +1504,6 @@ export component SettingsWindow inherits Window {
                                         font-size: 15px;
                                         text <=> root.editor-message-text;
                                         edited(val) => {
-                                            root.rules[root.selected-rule-idx].message = val;
                                             root.message-text-edited(val);
                                             root.has-unsaved-changes = true;
                                         }
