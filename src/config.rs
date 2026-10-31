@@ -48,7 +48,7 @@ impl MonitorSelection {
     }
 }
 
-/// Determines whether a rule triggers on continuous active streaks (`Period`) or cumulative daily usage (`Limit`).
+/// Determines whether a rule triggers on continuous active session duration (`Period`) or cumulative daily usage (`Limit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TriggerType {
     #[default]
@@ -325,7 +325,7 @@ fn default_notification_duration() -> DurationConfig {
     DurationConfig::new(10, TimeUnit::Sec)
 }
 
-/// Serde default helper for AFK duration required to reset a continuous streak (5 minutes).
+/// Serde default helper for AFK duration required to reset a continuous session duration (5 minutes).
 fn default_reset_after_afk() -> DurationConfig {
     DurationConfig::new(5, TimeUnit::Min)
 }
@@ -409,7 +409,7 @@ impl Rule {
             notification_method: NotificationMethod::Hud,
             notification_duration: DurationConfig::new(10, TimeUnit::Sec),
             show_remaining_time: false,
-            message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {streak}.\nPlease step away for {break_time} to recharge.".to_string(),
+            message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
             schedule: RuleSchedule::default(),
         }
     }
@@ -548,7 +548,7 @@ impl Default for Config {
                     notification_method: NotificationMethod::Hud,
                     notification_duration: DurationConfig::new(10, TimeUnit::Sec),
                     show_remaining_time: false,
-                    message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {streak}.\nPlease step away for {break_time} to recharge.".to_string(),
+                    message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
                     schedule: RuleSchedule {
                         mon: "000000001111111111000000".to_string(),
                         tue: "000000001111111111000000".to_string(),

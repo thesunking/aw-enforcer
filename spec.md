@@ -196,7 +196,7 @@ break_duration = { value = 10, unit = "Min" }
 click_through = false
 strict_mode = false
 notification_method = "HUD"
-message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {streak}.\nPlease step away for {break_time} to recharge."
+message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
 
 [rules.schedule]
 mon = "000000001111111111000000"
@@ -297,7 +297,7 @@ When `active-tab == 1 && selected-rule-idx >= 0`, `child_rule_view` binds reacti
 ### B. Three-Stage Evaluation (`evaluate_rule`)
 For each enabled rule active in the current `(day_index, hour_index)` schedule slot:
 1. **Progress Calculation:**
-   - **`TriggerType::Period`:** Computes continuous active session duration (`streak`) via `calculate_continuous_streak_for_rule` (resetting to `0` on any AFK gap $\ge$ `reset_after_afk`). Threshold is `rule.period.to_seconds()`.
+   - **`TriggerType::Period`:** Computes continuous active session duration (`session_duration`) via `calculate_continuous_session_for_rule` (resetting to `0` on any AFK gap $\ge$ `reset_after_afk`). Threshold is `rule.period.to_seconds()`.
    - **`TriggerType::Limit`:** Computes cumulative active duration since `logical_day_start` (`day_start_hour`) via `calculate_usage_for_rule`. Threshold is `rule.limit.to_seconds()`.
 2. **Stage 1 — Pre-Action Warning (`warn_before > 0`):**
    - When `threshold > 0 && warn_before > 0 && elapsed >= threshold - warn_before && elapsed < threshold` and a matching non-minimized window is open (`find_matching_window_for_rule`):

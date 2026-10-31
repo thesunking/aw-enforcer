@@ -33,7 +33,7 @@
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
 
 - **Rich Message Editor & Live Preview:**
-  - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{streak}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
+  - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
 
 - **7×24 Weekly Active Hours Schedule:**
   - Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
@@ -131,7 +131,7 @@ strict_mode = false
 notification_method = "HUD"
 notification_duration = { value = 10, unit = "Sec" }
 show_remaining_time = false
-message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {streak}.\nPlease step away for {break_time} to recharge."
+message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
 
 [rules.schedule]
 mon = "000000001111111111000000"
@@ -152,7 +152,7 @@ sun = "000000000000000000000000"
 | `src/main.rs` | Single-instance mutex, system tray menu, Slint UI state synchronization, and Tokio runtime setup |
 | `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and rule safety sanitization |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` discovery and `filter_period_intersect` queries) |
-| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, streak/quota calculation, and 3-stage rule evaluation |
+| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, session duration/quota calculation, and 3-stage rule evaluation |
 | `src/enforcer.rs` | Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, process termination, and workstation lock |
 | `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
 | `src/formatter.rs` | Message template placeholder interpolation and line-level attribute/heading parser |

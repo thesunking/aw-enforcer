@@ -261,7 +261,7 @@ fn refresh_message_editor_state(
                 r.name.to_string()
             },
             app: app_name,
-            streak: format!("{} {}", r.period_val, r.period_unit),
+            session_duration: format!("{} {}", r.period_val, r.period_unit),
             break_time: format!("{} {}", r.break_val, r.break_unit),
             used,
             limit: format!("{} {}", r.limit_val, r.limit_unit),
@@ -992,7 +992,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             mgr.update_overlay_config(theme_cfg);
                         }
                         OverlayAction::UpdateLiveStatus {
-                            streak_text,
+                            session_duration_text,
                             screentime_text,
                             active_app,
                             strict_lock_active,
@@ -1000,7 +1000,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tray_tooltip,
                         } => {
                             if let Some(win) = sw.upgrade() {
-                                win.set_current_streak_text(streak_text.as_str().into());
+                                win.set_current_session_duration_text(session_duration_text.as_str().into());
                                 win.set_today_screentime_text(screentime_text.as_str().into());
                                 win.set_current_active_app(active_app.as_str().into());
                                 win.set_strict_lock_active(strict_lock_active);

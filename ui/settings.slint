@@ -184,7 +184,7 @@ export component SettingsWindow inherits Window {
 
     // Live Status metrics
     in property <bool> aw-connected: false;
-    in property <string> current-streak-text: "0m";
+    in property <string> current-session-duration-text: "0m";
     in property <string> today-screentime-text: "0h 0m";
     in property <string> current-active-app: "None";
 
@@ -1297,7 +1297,7 @@ export component SettingsWindow inherits Window {
                                     alignment: start;
 
                                     Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
-                                    for chip in ["{rule_name}", "{streak}", "{break_time}", "{app}", "{used}", "{limit}", "{remaining}"] : Button {
+                                    for chip in ["{rule_name}", "{session_duration}", "{break_time}", "{app}", "{used}", "{limit}", "{remaining}"] : Button {
                                         text: "+ " + chip;
                                         clicked => { root.append-placeholder(root.selected-message-line, chip); }
                                     }
@@ -1440,9 +1440,9 @@ export component SettingsWindow inherits Window {
                         }
 
                         FormRow {
-                            label: "Current Continuous Streak:";
+                            label: "Current Session Duration:";
                             label-width: 200px;
-                            Text { text: root.current-streak-text; color: #38bdf8; font-weight: 700; }
+                            Text { text: root.current-session-duration-text; color: #38bdf8; font-weight: 700; }
                         }
 
                         FormRow {

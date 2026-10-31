@@ -77,7 +77,7 @@ pub fn is_valid_attr_block(inner: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct MessageContext {
     pub rule_name: String,
-    pub streak: String,
+    pub session_duration: String,
     pub break_time: String,
     pub app: String,
     pub used: String,
@@ -90,7 +90,7 @@ impl MessageContext {
     pub fn sample() -> Self {
         Self {
             rule_name: "Workday Ergonomic Break".to_string(),
-            streak: "50m".to_string(),
+            session_duration: "50m".to_string(),
             break_time: "10m".to_string(),
             app: "steam.exe".to_string(),
             used: "55m".to_string(),
@@ -103,7 +103,7 @@ impl MessageContext {
     pub fn interpolate(&self, template: &str) -> String {
         template
             .replace("{rule_name}", &self.rule_name)
-            .replace("{streak}", &self.streak)
+            .replace("{session_duration}", &self.session_duration)
             .replace("{break_time}", &self.break_time)
             .replace("{app}", &self.app)
             .replace("{used}", &self.used)
@@ -610,13 +610,13 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn test_append_placeholder_And_parse_message() {
-        let s1 = append_placeholder("", 0, "{streak}");
-        assert_eq!(s1, "{streak}");
+        let s1 = append_placeholder("", 0, "{session_duration}");
+        assert_eq!(s1, "{session_duration}");
         let s2 = append_placeholder(&s1, 0, "{break_time}");
-        assert_eq!(s2, "{streak} {break_time}");
+        assert_eq!(s2, "{session_duration} {break_time}");
 
         let ctx = MessageContext::sample();
-        let paras = parse_formatted_text_with_context("# Header\r\n\r\nActive for {streak}", &ctx);
+        let paras = parse_formatted_text_with_context("# Header\r\n\r\nActive for {session_duration}", &ctx);
         assert_eq!(paras.len(), 3);
         assert_eq!(paras[0].text.as_str(), "Header");
         assert_eq!(paras[0].font_size, 26.0);

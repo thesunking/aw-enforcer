@@ -114,7 +114,7 @@ pub enum OverlayAction {
     },
     UpdateTheme(OverlayConfig),
     UpdateLiveStatus {
-        streak_text: String,
+        session_duration_text: String,
         screentime_text: String,
         active_app: String,
         strict_lock_active: bool,
@@ -128,7 +128,7 @@ pub enum OverlayAction {
 #[derive(Debug, Clone)]
 pub struct RuleRuntime {
     pub compiled_regex: Option<Regex>,
-    pub current_streak_seconds: u32,
+    pub current_session_seconds: u32,
     pub last_completed_at: Option<DateTime<Local>>,
     pub warned_current_cycle: bool,
     pub pending_break_since: Option<DateTime<Local>>,
@@ -144,7 +144,7 @@ impl RuleRuntime {
     pub fn from_rule(rule: &Rule) -> Self {
         Self {
             compiled_regex: Self::compile_regex(rule),
-            current_streak_seconds: 0,
+            current_session_seconds: 0,
             last_completed_at: None,
             warned_current_cycle: false,
             pending_break_since: None,
@@ -264,7 +264,7 @@ impl Engine {
                 let now = Local::now();
                 let until = now + Duration::minutes(minutes as i64);
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.active_break = None;
                     rt.grace_countdown = None;
                     rt.snoozed_until = Some(until);
@@ -286,7 +286,7 @@ impl Engine {
             DaemonCommand::SkipBreak { rule_id } => {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.active_break = None;
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.snoozed_until = None;
                     rt.last_completed_at = Some(Local::now());
                     rt.action_executed_today = true;
@@ -303,7 +303,7 @@ impl Engine {
                 let now = Local::now();
                 for rt in self.runtimes.values_mut() {
                     if rt.active_break.take().is_some() {
-                        rt.current_streak_seconds = 0;
+                        rt.current_session_seconds = 0;
                         rt.snoozed_until = None;
                         rt.last_completed_at = Some(now);
                         rt.action_executed_today = true;
@@ -322,7 +322,7 @@ impl Engine {
                 let until = now + Duration::minutes(minutes as i64);
                 self.global_snoozed_until = Some(until);
                 for rt in self.runtimes.values_mut() {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.active_break = None;
                     rt.grace_countdown = None;
                     rt.snoozed_until = Some(until);
@@ -343,7 +343,7 @@ impl Engine {
                 self.config.general.pause_all_rules = paused;
                 if paused {
                     for rt in self.runtimes.values_mut() {
-                        rt.current_streak_seconds = 0;
+                        rt.current_session_seconds = 0;
                         rt.active_break = None;
                         rt.grace_countdown = None;
                         rt.warned_current_cycle = false;
@@ -375,7 +375,7 @@ impl Engine {
                 }
                 if paused {
                     for rt in self.runtimes.values_mut() {
-                        rt.current_streak_seconds = 0;
+                        rt.current_session_seconds = 0;
                         rt.active_break = None;
                         rt.grace_countdown = None;
                         rt.warned_current_cycle = false;
@@ -421,7 +421,7 @@ impl Engine {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let matched_app = find_matching_window_for_rule(&rule, re.as_ref())
                     .unwrap_or_else(|| "Active Application".to_string());
-                let elapsed = self.runtimes.get(&rule.id).map(|rt| rt.current_streak_seconds).unwrap_or(0);
+                let elapsed = self.runtimes.get(&rule.id).map(|rt| rt.current_session_seconds).unwrap_or(0);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
                     TriggerType::Limit => rule.limit.to_seconds(),
@@ -467,7 +467,7 @@ impl Engine {
 
                 if *rem == 0 {
                     rt.active_break = None;
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.snoozed_until = None;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(Local::now());
@@ -510,7 +510,7 @@ impl Engine {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let matched_name = find_matching_window_for_rule(&rule, re.as_ref())
                     .unwrap_or_else(|| "Active Application".to_string());
-                let elapsed = self.runtimes.get(&rule.id).map(|r| r.current_streak_seconds).unwrap_or(0);
+                let elapsed = self.runtimes.get(&rule.id).map(|r| r.current_session_seconds).unwrap_or(0);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
                     TriggerType::Limit => rule.limit.to_seconds(),
@@ -659,13 +659,13 @@ impl Engine {
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
         if self.config.general.pause_all_rules || is_globally_snoozed {
             for rt in self.runtimes.values_mut() {
-                rt.current_streak_seconds = 0;
+                rt.current_session_seconds = 0;
             }
         } else {
             for rule in self.config.rules.clone() {
                 if !rule.enabled || !rule.schedule.is_active(day_index, hour_index) {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                        rt.current_streak_seconds = 0;
+                        rt.current_session_seconds = 0;
                     }
                     continue;
                 }
@@ -690,7 +690,7 @@ impl Engine {
         }
 
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
-        let max_streak_secs = self.runtimes.values().map(|rt| rt.current_streak_seconds).max().unwrap_or(0);
+        let max_session_secs = self.runtimes.values().map(|rt| rt.current_session_seconds).max().unwrap_or(0);
 
         let total_today_secs: f64 = all_events
             .iter()
@@ -722,8 +722,8 @@ impl Engine {
                 "Snoozed".to_string()
             } else if rule.trigger == TriggerType::Period {
                 format!(
-                    "Streak: {} / {}",
-                    formatter::format_seconds_human(rt.current_streak_seconds),
+                    "Session: {} / {}",
+                    formatter::format_seconds_human(rt.current_session_seconds),
                     rule.period.to_short_string()
                 )
             } else {
@@ -758,16 +758,16 @@ impl Engine {
             )
         } else {
             format!(
-                "AW-Enforcer — Today: {}h {}m | Streak: {}m",
+                "AW-Enforcer — Today: {}h {}m | Session: {}m",
                 total_today_mins / 60,
                 total_today_mins % 60,
-                max_streak_secs / 60
+                max_session_secs / 60
             )
         };
 
         self.overlay_tx
             .send(OverlayAction::UpdateLiveStatus {
-                streak_text: format!("{}m", max_streak_secs / 60),
+                session_duration_text: format!("{}m", max_session_secs / 60),
                 screentime_text: format!("{}h {}m", total_today_mins / 60, total_today_mins % 60),
                 active_app,
                 strict_lock_active,
@@ -780,7 +780,7 @@ impl Engine {
         self.refresh_stats_overlay_from_events(now, &all_events);
     }
 
-    /// Builds a `MessageContext` populated with formatted streak, usage, limit, and remaining durations for a rule.
+    /// Builds a `MessageContext` populated with formatted session duration, usage, limit, and remaining durations for a rule.
     fn build_message_context(
         &self,
         rule: &Rule,
@@ -792,13 +792,13 @@ impl Engine {
         let used_str = formatter::format_seconds_human(elapsed_secs);
         let limit_str = rule.limit.to_short_string();
         let rem_str = formatter::format_seconds_human(rem_secs);
-        let streak_str = formatter::format_seconds_human(elapsed_secs);
+        let session_duration_str = formatter::format_seconds_human(elapsed_secs);
         let break_str = rule.break_duration.to_short_string();
 
         MessageContext {
             rule_name: rule.name.clone(),
             app: matched_app_name.to_string(),
-            streak: streak_str,
+            session_duration: session_duration_str,
             break_time: break_str,
             used: used_str,
             limit: limit_str,
@@ -878,7 +878,7 @@ impl Engine {
                 let last_completed = self.runtimes.get(&rule.id).and_then(|r| r.last_completed_at);
                 let reset_gap = rule.reset_after_afk.to_seconds().max(1);
                 let period_secs = rule.period.to_seconds().max(1);
-                let streak = calculate_continuous_streak_for_rule(
+                let session_duration = calculate_continuous_session_for_rule(
                     events,
                     now,
                     last_completed,
@@ -887,18 +887,18 @@ impl Engine {
                     compiled_re,
                 );
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    if streak == 0 {
+                    if session_duration == 0 {
                         rt.warned_current_cycle = false;
                     }
-                    rt.current_streak_seconds = streak;
+                    rt.current_session_seconds = session_duration;
                 }
-                (streak, period_secs)
+                (session_duration, period_secs)
             }
             TriggerType::Limit => {
                 let used = calculate_usage_for_rule(events, rule, compiled_re, start_of_day_utc, now_utc);
                 let limit_secs = rule.limit.to_seconds();
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                 }
                 (used, limit_secs)
             }
@@ -1016,7 +1016,7 @@ impl Engine {
                     && enforcer::is_fullscreen_or_presentation_active()
                 {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                        rt.current_streak_seconds = 0;
+                        rt.current_session_seconds = 0;
                         rt.warned_current_cycle = false;
                         rt.last_completed_at = Some(now);
                         rt.action_executed_today = true;
@@ -1055,7 +1055,7 @@ impl Engine {
             }
             RuleAction::ShowNotification => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1086,7 +1086,7 @@ impl Engine {
             }
             RuleAction::ShowStatistics => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1095,7 +1095,7 @@ impl Engine {
             }
             RuleAction::LockWorkstation => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1104,7 +1104,7 @@ impl Engine {
             }
             RuleAction::CloseTab => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1128,7 +1128,7 @@ impl Engine {
             }
             RuleAction::CloseWindow => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1151,7 +1151,7 @@ impl Engine {
             }
             RuleAction::KillProcess => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
+                    rt.current_session_seconds = 0;
                     rt.warned_current_cycle = false;
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
@@ -1457,8 +1457,8 @@ pub fn find_matching_window_for_rule(rule: &Rule, compiled_re: Option<&Regex>) -
     }
 }
 
-/// Computes continuous active streak by walking backward from now.
-pub fn calculate_continuous_streak_for_rule(
+/// Computes continuous active session duration by walking backward from now.
+pub fn calculate_continuous_session_for_rule(
     events: &[AwEvent],
     now: DateTime<Local>,
     last_break_completed_at: Option<DateTime<Local>>,
@@ -1494,12 +1494,12 @@ pub fn calculate_continuous_streak_for_rule(
     let last_ev_end =
         last_ev.timestamp + Duration::milliseconds((last_ev.duration * 1000.0) as i64);
 
-    // If currently AFK for >= reset_gap_sec, streak has reset
+    // If currently AFK for >= reset_gap_sec, session duration has reset
     if (now_utc - last_ev_end).num_seconds() >= reset_gap_sec {
         return 0;
     }
 
-    let mut streak_seconds = 0i64;
+    let mut session_seconds = 0i64;
     let mut current_boundary = last_ev_end;
 
     for ev in relevant.iter().rev() {
@@ -1507,7 +1507,7 @@ pub fn calculate_continuous_streak_for_rule(
         let gap = (current_boundary - ev_end).num_seconds();
 
         if gap >= reset_gap_sec {
-            break; // Streak interrupted by AFK gap
+            break; // Session interrupted by AFK gap
         }
 
         let effective_start = if let Some(min_dt) = min_allowed_utc {
@@ -1518,12 +1518,12 @@ pub fn calculate_continuous_streak_for_rule(
         let clamped_end = ev_end.min(current_boundary);
 
         if clamped_end > effective_start {
-            streak_seconds += (clamped_end - effective_start).num_milliseconds() / 1000;
+            session_seconds += (clamped_end - effective_start).num_milliseconds() / 1000;
         }
         current_boundary = current_boundary.min(effective_start);
     }
 
-    streak_seconds.max(0) as u32
+    session_seconds.max(0) as u32
 }
 
 /// Calculates total active usage seconds for a rule from a list of events.
@@ -1575,40 +1575,40 @@ mod tests {
         assert_eq!(l_start2.hour(), 4);
     }
 
-    /// Verifies `calculate_continuous_streak_for_rule` across sub-reset gaps, AFK breaks, completion clipping, and overlapping events.
+    /// Verifies `calculate_continuous_session_for_rule` across sub-reset gaps, AFK breaks, completion clipping, and overlapping events.
     #[test]
-    fn test_continuous_streak_afk_gaps_clipping_and_overlap() {
+    fn test_continuous_session_afk_gaps_clipping_and_overlap() {
         let now = Local.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
         let now_utc = now.with_timezone(&Utc);
         let rule = Rule::default_template(0);
         let reset_gap_secs = 300; // 5 minutes
 
-        // 1. Two 10-min events separated by 2 mins (< 5m reset gap) -> 20m (1200s) streak
+        // 1. Two 10-min events separated by 2 mins (< 5m reset gap) -> 20m (1200s) session duration
         let ev1 = make_event(now_utc - Duration::minutes(22), 600.0, "code.exe", "main.rs", "");
         let ev2 = make_event(now_utc - Duration::minutes(10), 600.0, "code.exe", "main.rs", "");
-        let streak = calculate_continuous_streak_for_rule(&[ev1.clone(), ev2.clone()], now, None, reset_gap_secs, &rule, None);
-        assert_eq!(streak, 1200);
+        let session = calculate_continuous_session_for_rule(&[ev1.clone(), ev2.clone()], now, None, reset_gap_secs, &rule, None);
+        assert_eq!(session, 1200);
 
         // 2. Event separated by 6 mins (>= 5m reset gap) before ev1 is ignored
         let ev_old = make_event(now_utc - Duration::minutes(38), 600.0, "code.exe", "main.rs", "");
-        let streak_with_gap = calculate_continuous_streak_for_rule(&[ev_old, ev1.clone(), ev2.clone()], now, None, reset_gap_secs, &rule, None);
-        assert_eq!(streak_with_gap, 1200);
+        let session_with_gap = calculate_continuous_session_for_rule(&[ev_old, ev1.clone(), ev2.clone()], now, None, reset_gap_secs, &rule, None);
+        assert_eq!(session_with_gap, 1200);
 
-        // 3. Currently AFK for >= 5m -> streak resets to 0
+        // 3. Currently AFK for >= 5m -> session duration resets to 0
         let future_now = now + Duration::minutes(5);
-        let afk_streak = calculate_continuous_streak_for_rule(&[ev1.clone(), ev2.clone()], future_now, None, reset_gap_secs, &rule, None);
-        assert_eq!(afk_streak, 0);
+        let afk_session = calculate_continuous_session_for_rule(&[ev1.clone(), ev2.clone()], future_now, None, reset_gap_secs, &rule, None);
+        assert_eq!(afk_session, 0);
 
         // 4. Clipping against last_break_completed_at (5 mins into ev2 -> only 300s counted)
         let completed_at = (now_utc - Duration::minutes(5)).with_timezone(&Local);
-        let clipped_streak = calculate_continuous_streak_for_rule(&[ev1, ev2], now, Some(completed_at), reset_gap_secs, &rule, None);
-        assert_eq!(clipped_streak, 300);
+        let clipped_session = calculate_continuous_session_for_rule(&[ev1, ev2], now, Some(completed_at), reset_gap_secs, &rule, None);
+        assert_eq!(clipped_session, 300);
 
         // 5. Overlapping events do not double-count
         let ov1 = make_event(now_utc - Duration::minutes(10), 600.0, "code.exe", "", "");
         let ov2 = make_event(now_utc - Duration::minutes(5), 300.0, "code.exe", "", "");
-        let ov_streak = calculate_continuous_streak_for_rule(&[ov1, ov2], now, None, reset_gap_secs, &rule, None);
-        assert_eq!(ov_streak, 600);
+        let ov_session = calculate_continuous_session_for_rule(&[ov1, ov2], now, None, reset_gap_secs, &rule, None);
+        assert_eq!(ov_session, 600);
     }
 
     /// Verifies `calculate_usage_for_rule` clips cross-boundary events at `start_of_day_utc` and matches executables/URLs.
