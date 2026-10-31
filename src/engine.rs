@@ -128,6 +128,7 @@ pub enum OverlayAction {
 pub struct RuleRuntime {
     pub compiled_regex: Option<Regex>,
     pub current_session_seconds: u32,
+    pub daily_usage_seconds: u32,
     pub last_completed_at: Option<DateTime<Local>>,
     pub prev_completed_at: Option<DateTime<Local>>,
     pub warned_current_cycle: bool,
@@ -145,6 +146,7 @@ impl RuleRuntime {
         Self {
             compiled_regex: Self::compile_regex(rule),
             current_session_seconds: 0,
+            daily_usage_seconds: 0,
             last_completed_at: None,
             prev_completed_at: None,
             warned_current_cycle: false,
@@ -639,6 +641,7 @@ impl Engine {
                 rt.grace_countdown = None;
                 rt.snoozed_until = None;
                 rt.pending_break_since = None;
+                rt.daily_usage_seconds = 0;
             }
         }
 
@@ -696,12 +699,14 @@ impl Engine {
         };
 
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
+        let mut evaluated_in_step_4 = std::collections::HashSet::new();
         if self.config.general.pause_all_rules || is_globally_snoozed {
             for rt in self.runtimes.values_mut() {
                 rt.current_session_seconds = 0;
             }
         } else {
-            for rule in self.config.rules.clone() {
+            for idx in 0..self.config.rules.len() {
+                let rule = self.config.rules[idx].clone();
                 if !rule.enabled || !rule.schedule.is_active(day_index, hour_index) {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                         rt.current_session_seconds = 0;
@@ -716,15 +721,19 @@ impl Engine {
                 };
 
                 let compiled_re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
-                self.evaluate_rule(
-                    &rule,
-                    compiled_re.as_ref(),
-                    now,
-                    events_for_rule,
-                    start_of_day_utc,
-                    now_utc,
-                )
-                .await;
+                if self
+                    .evaluate_rule(
+                        &rule,
+                        compiled_re.as_ref(),
+                        now,
+                        events_for_rule,
+                        start_of_day_utc,
+                        now_utc,
+                    )
+                    .await
+                {
+                    evaluated_in_step_4.insert(rule.id.clone());
+                }
             }
         }
 
@@ -765,18 +774,24 @@ impl Engine {
                     rule.period.to_short_string()
                 )
             } else {
-                let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
-                    &web_events
+                let daily_usage_seconds = if evaluated_in_step_4.contains(&rule.id) {
+                    rt.daily_usage_seconds
                 } else {
-                    &all_events
+                    let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
+                        &web_events
+                    } else {
+                        &all_events
+                    };
+                    let used = calculate_usage_for_rule(
+                        events_for_rule,
+                        rule,
+                        rt.compiled_regex.as_ref(),
+                        start_of_day_utc,
+                        now_utc,
+                    );
+                    rt.daily_usage_seconds = used;
+                    used
                 };
-                let daily_usage_seconds = calculate_usage_for_rule(
-                    events_for_rule,
-                    rule,
-                    rt.compiled_regex.as_ref(),
-                    start_of_day_utc,
-                    now_utc,
-                );
                 format!(
                     "Used: {} / {}",
                     formatter::format_seconds_human(daily_usage_seconds),
@@ -891,19 +906,19 @@ impl Engine {
         events: &[AwEvent],
         start_of_day_utc: DateTime<Utc>,
         now_utc: DateTime<Utc>,
-    ) {
+    ) -> bool {
         // 1. Skip if currently in break, waiting for natural pause, in grace countdown, or snoozed
         {
-            let Some(rt) = self.runtimes.get_mut(&rule.id) else { return };
+            let Some(rt) = self.runtimes.get_mut(&rule.id) else { return false; };
             if rt.active_break.is_some()
                 || rt.pending_break_since.is_some()
                 || rt.grace_countdown.is_some()
             {
-                return;
+                return false;
             }
             if let Some(until) = rt.snoozed_until {
                 if now < until {
-                    return;
+                    return false;
                 } else {
                     rt.snoozed_until = None;
                 }
@@ -937,6 +952,7 @@ impl Engine {
                 let limit_secs = rule.limit.to_seconds();
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.current_session_seconds = 0;
+                    rt.daily_usage_seconds = used;
                 }
                 (used, limit_secs)
             }
@@ -950,7 +966,7 @@ impl Engine {
             self.config.general.poll_interval_seconds,
         );
         let Some(matched_app_name) = matched_window else {
-            return;
+            return true;
         };
 
         let warn_secs = rule.warn_before.to_seconds();
@@ -976,7 +992,7 @@ impl Engine {
                 let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, rem_secs);
                 self.dispatch_pre_action_warning(rule, &ctx, rem_secs);
             }
-            return;
+            return true;
         }
 
         // 4. Stage 2: Threshold Reached
@@ -997,7 +1013,7 @@ impl Engine {
                 .unwrap_or(false);
 
             if rule.trigger == TriggerType::Limit && !is_destructive && already_executed {
-                return;
+                return true;
             }
 
             if rule.trigger == TriggerType::Limit
@@ -1006,7 +1022,7 @@ impl Engine {
                 && get_idle_time_millis()
                     >= (self.config.general.poll_interval_seconds.max(2) as u32) * 1000
             {
-                return;
+                return true;
             }
 
             let effective_grace = if rule.trigger == TriggerType::Limit && already_executed && grace_secs > 0 {
@@ -1049,6 +1065,8 @@ impl Engine {
                 self.execute_rule_action(rule, compiled_re, now, &matched_app_name, elapsed_secs, threshold_secs).await;
             }
         }
+
+        true
     }
 
     /// Executes the rule's configured `RuleAction` once its threshold (and any grace countdown) has completed.
@@ -1881,5 +1899,49 @@ mod tests {
             }
             other => panic!("Expected HudStatus, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_daily_usage_caching_and_rollover() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut limit_rule = Rule::default_template(0);
+        limit_rule.trigger = TriggerType::Limit;
+        limit_rule.target_executables = vec!["discord.exe".to_string()];
+        cfg.rules = vec![limit_rule];
+        let rule_id = cfg.rules[0].id.clone();
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Initialized to 0
+        let rt = engine.runtimes.get(&rule_id).unwrap();
+        assert_eq!(rt.daily_usage_seconds, 0);
+
+        // 2. Evaluated Limit rule populates daily_usage_seconds
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_utc = now_utc - Duration::hours(2);
+        let ev = make_event(start_utc + Duration::minutes(10), 1200.0, "discord.exe", "Chat", "");
+        let rule = engine.config.rules[0].clone();
+        engine
+            .evaluate_rule(&rule, None, now, &[ev], start_utc, now_utc)
+            .await;
+        assert_eq!(engine.runtimes.get(&rule_id).unwrap().daily_usage_seconds, 1200);
+
+        // 3. Day rollover resets daily_usage_seconds to 0
+        engine.last_reset_date = engine.last_reset_date - chrono::Duration::days(1);
+        let logical_now = logical_day_start(now, engine.config.general.day_start_hour);
+        if logical_now.date_naive() != engine.last_reset_date {
+            engine.last_reset_date = logical_now.date_naive();
+            for rt in engine.runtimes.values_mut() {
+                rt.warned_current_cycle = false;
+                rt.action_executed_today = false;
+                rt.grace_countdown = None;
+                rt.snoozed_until = None;
+                rt.pending_break_since = None;
+                rt.daily_usage_seconds = 0;
+            }
+        }
+        assert_eq!(engine.runtimes.get(&rule_id).unwrap().daily_usage_seconds, 0);
     }
 }
