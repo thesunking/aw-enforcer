@@ -528,12 +528,6 @@ impl OverlayManager {
         }
     }
 
-    /// Alias for `hide_all()` to destroy all overlay windows on demand.
-    #[allow(dead_code)]
-    pub fn hide(&mut self) {
-        self.hide_all();
-    }
-
     /// Configures and displays the overlay windows according to the given `OverlayMode`.
     pub fn show_mode(&mut self, mode: OverlayMode) {
         let monitors = Self::enumerate_monitors();

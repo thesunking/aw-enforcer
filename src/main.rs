@@ -34,6 +34,10 @@ use overlay::OverlayManager;
 
 slint::include_modules!();
 
+thread_local! {
+    static OVERLAY_ACTION_HANDLER: RefCell<Option<Box<dyn Fn(OverlayAction)>>> = const { RefCell::new(None) };
+}
+
 /// Ensures only a single instance of AW-Enforcer runs at any time.
 fn check_single_instance() -> bool {
     let mutex_name: Vec<u16> = "Global\\AW_Enforcer_SingleInstance_Mutex\0"
@@ -1095,7 +1099,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok();
     let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
 
-    // 10. Main Thread UI Loop Timer (processes overlay actions, tray events, and live status)
+    // 10. Event-driven overlay action dispatch
+    {
+        let overlay_mgr = overlay_manager.clone();
+        let settings_slot_ref = settings_slot.clone();
+        let rules_model_ref = rules_model.clone();
+        let live_state_ref = live_ui_state.clone();
+        let tray_icon_ref = tray_icon_cell.clone();
+        let item_dismiss = item_dismiss.clone();
+        let item_snooze = item_snooze.clone();
+        let item_pause = item_pause.clone();
+
+        OVERLAY_ACTION_HANDLER.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
+                let mut mgr = overlay_mgr.borrow_mut();
+                match action {
+                    OverlayAction::Show(mode) => {
+                        mgr.show_mode(mode);
+                        mgr.apply_pending_win32_styles();
+                    }
+                    OverlayAction::UpdateCountdown {
+                        remaining,
+                        total,
+                        is_idle,
+                    } => {
+                        mgr.update_countdown(remaining, total, is_idle);
+                    }
+                    OverlayAction::UpdateTheme(theme_cfg) => {
+                        mgr.update_overlay_config(theme_cfg);
+                    }
+                    OverlayAction::UpdateLiveStatus {
+                        session_duration_text,
+                        screentime_text,
+                        active_app,
+                        strict_lock_active,
+                        rule_statuses,
+                        tray_tooltip,
+                    } => {
+                        {
+                            let mut ls = live_state_ref.borrow_mut();
+                            ls.session_duration_text = session_duration_text.clone();
+                            ls.screentime_text = screentime_text.clone();
+                            ls.active_app = active_app.clone();
+                            ls.strict_lock_active = strict_lock_active;
+                            ls.rule_statuses = rule_statuses.clone();
+                        }
+
+                        if let Some(ref win) = *settings_slot_ref.borrow() {
+                            win.set_current_session_duration_text(session_duration_text.as_str().into());
+                            win.set_today_screentime_text(screentime_text.as_str().into());
+                            win.set_current_active_app(active_app.as_str().into());
+                            win.set_strict_lock_active(strict_lock_active);
+                            if !strict_lock_active {
+                                win.set_strict_unlocked(false);
+                                win.set_strict_unlock_countdown(0);
+                            }
+                        }
+
+                        item_dismiss.set_enabled(!strict_lock_active);
+                        item_snooze.set_enabled(!strict_lock_active);
+                        item_pause.set_enabled(!strict_lock_active);
+
+                        if settings_slot_ref.borrow().is_some() {
+                            for (rule_id, status_text) in rule_statuses {
+                                for idx in 0..rules_model_ref.row_count() {
+                                    if let Some(mut r) = rules_model_ref.row_data(idx) {
+                                        if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                                            r.status_text = status_text.as_str().into();
+                                            rules_model_ref.set_row_data(idx, r);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(ref ti) = *tray_icon_ref.borrow() {
+                            let _ = ti.set_tooltip(Some(&tray_tooltip));
+                        }
+                    }
+                    OverlayAction::Hide => mgr.hide_all(),
+                }
+            }));
+        });
+    }
+
+    let overlay_forwarder_handle = rt_handle.clone();
+    overlay_forwarder_handle.spawn(async move {
+        while let Some(action) = overlay_action_rx.recv().await {
+            slint::invoke_from_event_loop(move || {
+                OVERLAY_ACTION_HANDLER.with(|cell| {
+                    if let Some(ref handler) = *cell.borrow() {
+                        handler(action);
+                    }
+                });
+            })
+            .ok();
+        }
+    });
+
+    // 11. Main Thread UI Loop Timer (processes tray events, countdowns, and connection health)
     let main_timer = slint::Timer::default();
     {
         let overlay_mgr = overlay_manager.clone();
@@ -1107,9 +1209,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
         let handle = rt_handle.clone();
-        let tray_icon_ref = tray_icon_cell.clone();
-        let item_dismiss = item_dismiss.clone();
-        let item_snooze = item_snooze.clone();
         let item_pause = item_pause.clone();
 
         let mut conn_check_counter = 0u32;
@@ -1117,79 +1216,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         main_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(35),
+            Duration::from_millis(250),
             move || {
-                // Process incoming OverlayActions from Tokio engine
-                while let Ok(action) = overlay_action_rx.try_recv() {
-                    let mut mgr = overlay_mgr.borrow_mut();
-                    match action {
-                        OverlayAction::Show(mode) => mgr.show_mode(mode),
-                        OverlayAction::UpdateCountdown {
-                            remaining,
-                            total,
-                            is_idle,
-                        } => {
-                            mgr.update_countdown(remaining, total, is_idle);
-                        }
-                        OverlayAction::UpdateTheme(theme_cfg) => {
-                            mgr.update_overlay_config(theme_cfg);
-                        }
-                        OverlayAction::UpdateLiveStatus {
-                            session_duration_text,
-                            screentime_text,
-                            active_app,
-                            strict_lock_active,
-                            rule_statuses,
-                            tray_tooltip,
-                        } => {
-                            {
-                                let mut ls = live_state_ref.borrow_mut();
-                                ls.session_duration_text = session_duration_text.clone();
-                                ls.screentime_text = screentime_text.clone();
-                                ls.active_app = active_app.clone();
-                                ls.strict_lock_active = strict_lock_active;
-                                ls.rule_statuses = rule_statuses.clone();
-                            }
-
-                            if let Some(ref win) = *settings_slot_ref.borrow() {
-                                win.set_current_session_duration_text(session_duration_text.as_str().into());
-                                win.set_today_screentime_text(screentime_text.as_str().into());
-                                win.set_current_active_app(active_app.as_str().into());
-                                win.set_strict_lock_active(strict_lock_active);
-                                if !strict_lock_active {
-                                    win.set_strict_unlocked(false);
-                                    win.set_strict_unlock_countdown(0);
-                                }
-                            }
-
-                            item_dismiss.set_enabled(!strict_lock_active);
-                            item_snooze.set_enabled(!strict_lock_active);
-                            item_pause.set_enabled(!strict_lock_active);
-
-                            if settings_slot_ref.borrow().is_some() {
-                                for (rule_id, status_text) in rule_statuses {
-                                    for idx in 0..rules_model_ref.row_count() {
-                                        if let Some(mut r) = rules_model_ref.row_data(idx) {
-                                            if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
-                                                r.status_text = status_text.as_str().into();
-                                                rules_model_ref.set_row_data(idx, r);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(ref ti) = *tray_icon_ref.borrow() {
-                                let _ = ti.set_tooltip(Some(&tray_tooltip));
-                            }
-                        }
-                        OverlayAction::Hide => mgr.hide_all(),
-                    }
-                }
-
-                // Strict unlock countdown tick (~1s)
+                // Strict unlock countdown tick (~1s = 4 ticks at 250ms)
                 unlock_counter += 1;
-                if unlock_counter >= 28 {
+                if unlock_counter >= 4 {
                     unlock_counter = 0;
                     if let Some(ref win) = *settings_slot_ref.borrow() {
                         let cd = win.get_strict_unlock_countdown();
@@ -1268,27 +1299,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Periodically check ActivityWatch connection status (~every 3 seconds) using shared runtime
+                // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
                 conn_check_counter += 1;
-                if conn_check_counter >= 85 {
+                if conn_check_counter >= 12 {
                     conn_check_counter = 0;
-                    let sw_opt = settings_slot_ref.borrow().as_ref().map(|w| w.as_weak());
-                    let conn_flag = aw_connected_flag_ref.clone();
-                    let client = ui_client_cell.borrow().clone();
+                    if let Some(win) = settings_slot_ref.borrow().as_ref() {
+                        let sw = win.as_weak();
+                        let conn_flag = aw_connected_flag_ref.clone();
+                        let client = ui_client_cell.borrow().clone();
 
-                    handle.spawn(async move {
-                        let connected = client.check_connection().await;
-                        conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
+                        handle.spawn(async move {
+                            let connected = client.check_connection().await;
+                            conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
 
-                        if let Some(sw) = sw_opt {
                             slint::invoke_from_event_loop(move || {
-                                if let Some(win) = sw.upgrade() {
-                                    win.set_aw_connected(connected);
+                                if let Some(w) = sw.upgrade() {
+                                    w.set_aw_connected(connected);
                                 }
                             })
                             .ok();
-                        }
-                    });
+                        });
+                    }
                 }
             },
         );
