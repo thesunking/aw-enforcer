@@ -402,9 +402,9 @@ impl Engine {
 
     /// Real-time 1-second countdown tick updating overlays and idle counters.
     pub async fn realtime_tick(&mut self) {
-        let is_idle = get_idle_time_millis() >= 3000;
-        let now = Local::now();
         let idle_ms = get_idle_time_millis();
+        let is_idle = idle_ms >= 3000;
+        let now = Local::now();
 
         // 0. Check pending natural break delays
         let mut launched_breaks = Vec::new();
@@ -1440,57 +1440,62 @@ pub fn calculate_continuous_session_for_rule(
     let reset_gap_sec = reset_gap_secs as i64;
     let min_allowed_utc = last_break_completed_at.map(|dt| dt.with_timezone(&Utc));
 
-    let mut relevant: Vec<&AwEvent> = events
+    let mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
         .iter()
-        .filter(|ev| {
-            if let Some(min_dt) = min_allowed_utc {
-                let ev_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-                if ev_end <= min_dt {
-                    return false;
-                }
+        .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+        .filter_map(|ev| {
+            let start_utc = if let Some(min_dt) = min_allowed_utc {
+                ev.timestamp.max(min_dt)
+            } else {
+                ev.timestamp
+            };
+            let end_utc = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+            if end_utc > start_utc {
+                Some((start_utc, end_utc))
+            } else {
+                None
             }
-
-            event_matches_rule(ev, rule, compiled_re)
         })
         .collect();
 
-    if relevant.is_empty() {
+    if intervals.is_empty() {
         return 0;
     }
 
-    relevant.sort_by_key(|e| e.timestamp);
+    intervals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let last_ev = relevant.last().unwrap();
-    let last_ev_end =
-        last_ev.timestamp + Duration::milliseconds((last_ev.duration * 1000.0) as i64);
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            } else {
+                merged.push((start, end));
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
 
-    // If currently AFK for >= reset_gap_sec, session duration has reset
-    if (now_utc - last_ev_end).num_seconds() >= reset_gap_sec {
+    let last_end = merged.last().unwrap().1;
+    if (now_utc - last_end).num_seconds() >= reset_gap_sec {
         return 0;
     }
 
     let mut session_seconds = 0i64;
-    let mut current_boundary = last_ev_end;
+    let mut prev_start: Option<DateTime<Utc>> = None;
 
-    for ev in relevant.iter().rev() {
-        let ev_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-        let gap = (current_boundary - ev_end).num_seconds();
-
-        if gap >= reset_gap_sec {
-            break; // Session interrupted by AFK gap
+    for (start, end) in merged.iter().rev() {
+        if let Some(p_start) = prev_start {
+            let gap = (p_start - *end).num_seconds();
+            if gap >= reset_gap_sec {
+                break;
+            }
         }
-
-        let effective_start = if let Some(min_dt) = min_allowed_utc {
-            ev.timestamp.max(min_dt)
-        } else {
-            ev.timestamp
-        };
-        let clamped_end = ev_end.min(current_boundary);
-
-        if clamped_end > effective_start {
-            session_seconds += (clamped_end - effective_start).num_milliseconds() / 1000;
-        }
-        current_boundary = current_boundary.min(effective_start);
+        session_seconds += (*end - *start).num_milliseconds() / 1000;
+        prev_start = Some(*start);
     }
 
     session_seconds.max(0) as u32
@@ -1580,6 +1585,31 @@ mod tests {
         let ov2 = make_event(now_utc - Duration::minutes(5), 300.0, "code.exe", "", "");
         let ov_session = calculate_continuous_session_for_rule(&[ov1, ov2], now, None, reset_gap_secs, &rule, None);
         assert_eq!(ov_session, 600);
+    }
+
+    /// Verifies `calculate_continuous_session_for_rule` correctly merges nested and overlapping events,
+    /// ensuring a 20-minute event enclosing a 1-minute event 18 minutes ago is not falsely treated as AFK.
+    #[test]
+    fn test_nested_and_overlapping_events_in_continuous_session() {
+        let now = Local.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+        let now_utc = now.with_timezone(&Utc);
+        let rule = Rule::default_template(0);
+        let reset_gap_secs = 300; // 5 minutes
+
+        // 20-minute outer event from 11:40 to 12:00 (1200s)
+        let ev_outer = make_event(now_utc - Duration::minutes(20), 1200.0, "code.exe", "main.rs", "");
+        // 1-minute inner event from 11:41 to 11:42 (60s), ending 18 minutes ago
+        let ev_inner = make_event(now_utc - Duration::minutes(19), 60.0, "code.exe", "main.rs", "");
+
+        let session = calculate_continuous_session_for_rule(
+            &[ev_outer, ev_inner],
+            now,
+            None,
+            reset_gap_secs,
+            &rule,
+            None,
+        );
+        assert_eq!(session, 1200);
     }
 
     /// Verifies `calculate_usage_for_rule` clips cross-boundary events at `start_of_day_utc` and matches executables/URLs.
