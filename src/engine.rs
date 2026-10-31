@@ -130,6 +130,7 @@ pub struct RuleRuntime {
     pub compiled_regex: Option<Regex>,
     pub current_session_seconds: u32,
     pub last_completed_at: Option<DateTime<Local>>,
+    pub prev_completed_at: Option<DateTime<Local>>,
     pub warned_current_cycle: bool,
     pub pending_break_since: Option<DateTime<Local>>,
     pub active_break: Option<(u32, u32)>,    // (remaining_secs, total_secs)
@@ -146,6 +147,7 @@ impl RuleRuntime {
             compiled_regex: Self::compile_regex(rule),
             current_session_seconds: 0,
             last_completed_at: None,
+            prev_completed_at: None,
             warned_current_cycle: false,
             pending_break_since: None,
             active_break: None,
@@ -154,6 +156,36 @@ impl RuleRuntime {
             snoozed_until: None,
             live_status_badge: String::new(),
         }
+    }
+
+    /// Clears active break, grace countdown, pending break, and warning flags for the current cycle.
+    pub fn reset_active_timers(&mut self) {
+        self.current_session_seconds = 0;
+        self.active_break = None;
+        self.grace_countdown = None;
+        self.warned_current_cycle = false;
+        self.pending_break_since = None;
+    }
+
+    /// Marks a rule cycle as completed at `now`, resetting timers and recording execution.
+    pub fn complete_cycle(&mut self, now: DateTime<Local>) {
+        self.reset_active_timers();
+        self.snoozed_until = None;
+        self.prev_completed_at = self.last_completed_at;
+        self.last_completed_at = Some(now);
+        self.action_executed_today = true;
+    }
+
+    /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
+    /// the current session so the snoozed rule re-triggers once `until` expires instead of wiping
+    /// the pre-snooze session.
+    pub fn snooze(&mut self, until: DateTime<Local>) {
+        self.reset_active_timers();
+        self.snoozed_until = Some(until);
+        if self.action_executed_today {
+            self.last_completed_at = self.prev_completed_at;
+        }
+        self.action_executed_today = false;
     }
 
     /// Recompiles the rule's title or URL regex when configuration is reloaded without losing runtime state.
@@ -264,16 +296,7 @@ impl Engine {
                 let now = Local::now();
                 let until = now + Duration::minutes(minutes as i64);
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.current_session_seconds = 0;
-                    rt.active_break = None;
-                    rt.grace_countdown = None;
-                    rt.snoozed_until = Some(until);
-                    rt.action_executed_today = false;
-                    rt.warned_current_cycle = false;
-                    rt.pending_break_since = None;
-                    if rt.last_completed_at.is_none() {
-                        rt.last_completed_at = Some(now);
-                    }
+                    rt.snooze(until);
                 }
                 self.hide_overlay();
             }
@@ -285,13 +308,7 @@ impl Engine {
             }
             DaemonCommand::SkipBreak { rule_id } => {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.active_break = None;
-                    rt.current_session_seconds = 0;
-                    rt.snoozed_until = None;
-                    rt.last_completed_at = Some(Local::now());
-                    rt.action_executed_today = true;
-                    rt.warned_current_cycle = false;
-                    rt.pending_break_since = None;
+                    rt.complete_cycle(Local::now());
                 }
                 self.hide_overlay();
             }
@@ -302,14 +319,12 @@ impl Engine {
                 }
                 let now = Local::now();
                 for rt in self.runtimes.values_mut() {
-                    if rt.active_break.take().is_some() {
-                        rt.current_session_seconds = 0;
-                        rt.snoozed_until = None;
-                        rt.last_completed_at = Some(now);
-                        rt.action_executed_today = true;
+                    if rt.active_break.is_some() {
+                        rt.complete_cycle(now);
+                    } else {
+                        rt.warned_current_cycle = false;
+                        rt.pending_break_since = None;
                     }
-                    rt.warned_current_cycle = false;
-                    rt.pending_break_since = None;
                 }
                 self.hide_overlay();
             }
@@ -322,16 +337,7 @@ impl Engine {
                 let until = now + Duration::minutes(minutes as i64);
                 self.global_snoozed_until = Some(until);
                 for rt in self.runtimes.values_mut() {
-                    rt.current_session_seconds = 0;
-                    rt.active_break = None;
-                    rt.grace_countdown = None;
-                    rt.snoozed_until = Some(until);
-                    rt.action_executed_today = false;
-                    rt.warned_current_cycle = false;
-                    rt.pending_break_since = None;
-                    if rt.last_completed_at.is_none() {
-                        rt.last_completed_at = Some(now);
-                    }
+                    rt.snooze(until);
                 }
                 self.hide_overlay();
             }
@@ -343,11 +349,7 @@ impl Engine {
                 self.config.general.pause_all_rules = paused;
                 if paused {
                     for rt in self.runtimes.values_mut() {
-                        rt.current_session_seconds = 0;
-                        rt.active_break = None;
-                        rt.grace_countdown = None;
-                        rt.warned_current_cycle = false;
-                        rt.pending_break_since = None;
+                        rt.reset_active_timers();
                     }
                     self.hide_overlay();
                 }
@@ -375,11 +377,7 @@ impl Engine {
                 }
                 if paused {
                     for rt in self.runtimes.values_mut() {
-                        rt.current_session_seconds = 0;
-                        rt.active_break = None;
-                        rt.grace_countdown = None;
-                        rt.warned_current_cycle = false;
-                        rt.pending_break_since = None;
+                        rt.reset_active_timers();
                     }
                     self.hide_overlay();
                 }
@@ -438,6 +436,7 @@ impl Engine {
                 };
                 let break_secs = rule.break_duration.to_seconds().max(1);
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                    rt.prev_completed_at = rt.last_completed_at;
                     rt.active_break = Some((break_secs, break_secs));
                     rt.action_executed_today = true;
                 }
@@ -476,12 +475,7 @@ impl Engine {
                     .ok();
 
                 if *rem == 0 {
-                    rt.active_break = None;
-                    rt.current_session_seconds = 0;
-                    rt.snoozed_until = None;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(Local::now());
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(Local::now());
                     completed_breaks.push(rule_id.clone());
                 }
             }
@@ -1050,10 +1044,7 @@ impl Engine {
                     && enforcer::is_fullscreen_or_presentation_active()
                 {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                        rt.current_session_seconds = 0;
-                        rt.warned_current_cycle = false;
-                        rt.last_completed_at = Some(now);
-                        rt.action_executed_today = true;
+                        rt.complete_cycle(now);
                     }
                     enforcer::send_system_notification(&rule.name, &ctx.interpolate(&rule.message));
                     return;
@@ -1068,6 +1059,7 @@ impl Engine {
 
                 let break_secs = rule.break_duration.to_seconds().max(1);
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                    rt.prev_completed_at = rt.last_completed_at;
                     rt.active_break = Some((break_secs, break_secs));
                     rt.action_executed_today = true;
                 }
@@ -1089,10 +1081,7 @@ impl Engine {
             }
             RuleAction::ShowNotification => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 match rule.notification_method {
                     NotificationMethod::Windows => {
@@ -1120,28 +1109,19 @@ impl Engine {
             }
             RuleAction::ShowStatistics => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 self.display_stats_overlay(false).await;
             }
             RuleAction::LockWorkstation => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 enforcer::lock_workstation();
             }
             RuleAction::CloseTab => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 let title_re = (rule.monitor_selection == MonitorSelection::Titles)
                     .then_some(compiled_re)
@@ -1154,10 +1134,7 @@ impl Engine {
             }
             RuleAction::CloseWindow => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_target_windows::<&str>(&[], compiled_re);
@@ -1169,10 +1146,7 @@ impl Engine {
             }
             RuleAction::KillProcess => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_session_seconds = 0;
-                    rt.warned_current_cycle = false;
-                    rt.last_completed_at = Some(now);
-                    rt.action_executed_today = true;
+                    rt.complete_cycle(now);
                 }
                 enforcer::kill_target_processes(&rule.target_executables);
             }
@@ -1773,15 +1747,16 @@ mod tests {
         let rule_id = cfg.rules[0].id.clone();
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
-        // 1. First-cycle SnoozeBreak (when last_completed_at is None) initializes last_completed_at and resets action_executed_today
+        // 1. First-cycle SnoozeBreak (when last_completed_at is None) preserves last_completed_at as None and resets action_executed_today
         if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
             rt.active_break = Some((300, 300));
             rt.last_completed_at = None;
+            rt.prev_completed_at = None;
             rt.action_executed_today = true;
         }
         engine.handle_command(DaemonCommand::SnoozeBreak { rule_id: rule_id.clone(), minutes: 5 }).await;
         let rt = engine.runtimes.get(&rule_id).unwrap();
-        assert!(rt.last_completed_at.is_some());
+        assert_eq!(rt.last_completed_at, None);
         assert!(!rt.action_executed_today);
         assert!(rt.active_break.is_none());
         assert!(rt.snoozed_until.is_some());
@@ -1790,6 +1765,8 @@ mod tests {
         let prev_completed = Local.with_ymd_and_hms(2026, 10, 29, 10, 0, 0).unwrap();
         if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
             rt.last_completed_at = Some(prev_completed);
+            rt.prev_completed_at = Some(prev_completed);
+            rt.action_executed_today = true;
         }
         engine.handle_command(DaemonCommand::SnoozeBreak { rule_id: rule_id.clone(), minutes: 5 }).await;
         assert_eq!(engine.runtimes.get(&rule_id).unwrap().last_completed_at, Some(prev_completed));
