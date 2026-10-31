@@ -12,8 +12,13 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     TrayIconBuilder,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, SetEvent, WaitForSingleObject,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 mod autostart;
 mod aw_client;
@@ -38,22 +43,62 @@ thread_local! {
     static OVERLAY_ACTION_HANDLER: RefCell<Option<Box<dyn Fn(OverlayAction)>>> = const { RefCell::new(None) };
 }
 
-/// Ensures only a single instance of AW-Enforcer runs at any time.
-fn check_single_instance() -> bool {
-    let mutex_name: Vec<u16> = "Global\\AW_Enforcer_SingleInstance_Mutex\0"
-        .encode_utf16()
-        .collect();
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
-        if handle.is_null() {
-            return false;
-        }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            CloseHandle(handle);
-            return false;
+/// RAII guard keeping the single-instance mutex and named activation event handles alive
+/// for the entire lifetime of the process.
+struct SingleInstanceLock {
+    _mutex: HANDLE,
+    activate_event: HANDLE,
+}
+
+impl Drop for SingleInstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.activate_event.is_null() {
+                CloseHandle(self.activate_event);
+            }
+            if !self._mutex.is_null() {
+                CloseHandle(self._mutex);
+            }
         }
     }
-    true
+}
+
+/// Ensures only a single instance of AW-Enforcer runs at any time.
+/// If another instance is running and this instance is launched interactively (without `--autostart` or `--minimized`),
+/// signals the named activation event so the existing instance opens and focuses the SettingsWindow.
+fn acquire_single_instance(is_background_launch: bool) -> Option<SingleInstanceLock> {
+    let mutex_name: Vec<u16> = "Local\\AW_Enforcer_SingleInstance_Mutex\0"
+        .encode_utf16()
+        .collect();
+    let event_name: Vec<u16> = "Local\\AW_Enforcer_Activate_Event\0"
+        .encode_utf16()
+        .collect();
+
+    unsafe {
+        let mutex = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
+        if mutex.is_null() {
+            return None;
+        }
+
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if !is_background_launch {
+                let ev = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
+                if !ev.is_null() {
+                    SetEvent(ev);
+                    CloseHandle(ev);
+                }
+            }
+            CloseHandle(mutex);
+            return None;
+        }
+
+        let activate_event = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
+
+        Some(SingleInstanceLock {
+            _mutex: mutex,
+            activate_event,
+        })
+    }
 }
 
 /// Loads the official Fluent ClockPause 32x32 RGBA system tray icon.
@@ -514,6 +559,12 @@ fn open_settings_window(
     if let Some(ref existing) = *settings_slot.borrow() {
         if show {
             existing.show()?;
+            if let Some(hwnd) = OverlayManager::extract_window_hwnd(existing.window()) {
+                unsafe {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
+            }
         }
         return Ok(());
     }
@@ -1091,6 +1142,12 @@ fn open_settings_window(
 
     if show {
         settings_win.show()?;
+        if let Some(hwnd) = OverlayManager::extract_window_hwnd(settings_win.window()) {
+            unsafe {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
     }
     *settings_slot.borrow_mut() = Some(settings_win);
     Ok(())
@@ -1101,11 +1158,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize logging
     tracing_subscriber::fmt::init();
 
-    // 2. Enforce single-instance mutex
-    if !check_single_instance() {
-        tracing::warn!("Another instance of AW-Enforcer is already running. Exiting.");
-        return Ok(());
-    }
+    // 2. Parse launch arguments & enforce single-instance lock
+    let args: Vec<String> = std::env::args().collect();
+    let start_minimized = args
+        .iter()
+        .any(|a| a == "--minimized" || a == "--autostart");
+
+    let _instance_lock = match acquire_single_instance(start_minimized) {
+        Some(lock) => lock,
+        None => {
+            tracing::info!("Another instance of AW-Enforcer is already running. Exiting.");
+            return Ok(());
+        }
+    };
+    let activate_event_val = _instance_lock.activate_event as isize;
 
     // 3. Load application configuration & sync Windows autostart registry key
     let config = AppConfig::load();
@@ -1359,6 +1425,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Poll named activation event from a second instance
+                if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
+                    if let Err(e) = open_settings_window(
+                        &settings_slot_ref,
+                        &rules_model_ref,
+                        &cfg_cell,
+                        &ui_client_cell,
+                        &live_state_ref,
+                        &aw_connected_flag_ref,
+                        &cmd_tx,
+                        &handle,
+                        &item_pause,
+                        &overlay_mgr,
+                        true,
+                    ) {
+                        tracing::error!("Failed to open SettingsWindow on activation event: {e}");
+                    }
+                }
+
                 // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
                 overlay_mgr.borrow_mut().apply_pending_win32_styles();
 
@@ -1451,10 +1536,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Show Settings Window unless launched with --minimized / --autostart
-    let args: Vec<String> = std::env::args().collect();
-    let start_minimized = args
-        .iter()
-        .any(|a| a == "--minimized" || a == "--autostart");
     if !start_minimized {
         if let Err(e) = open_settings_window(
             &settings_slot,

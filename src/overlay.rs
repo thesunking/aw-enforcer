@@ -447,15 +447,20 @@ impl OverlayManager {
         monitors
     }
 
-    /// Extracts the underlying Win32 `HWND` from a Slint `OverlayWindow`.
-    pub fn extract_hwnd(window: &OverlayWindow) -> Option<HWND> {
-        let handle = window.window().window_handle();
+    /// Extracts the underlying Win32 `HWND` from any Slint window.
+    pub fn extract_window_hwnd(window: &slint::Window) -> Option<HWND> {
+        let handle = window.window_handle();
         if let Ok(raw_handle) = handle.window_handle() {
             if let RawWindowHandle::Win32(win32) = raw_handle.as_raw() {
                 return Some(win32.hwnd.get() as HWND);
             }
         }
         None
+    }
+
+    /// Extracts the underlying Win32 `HWND` from a Slint `OverlayWindow`.
+    pub fn extract_hwnd(window: &OverlayWindow) -> Option<HWND> {
+        Self::extract_window_hwnd(window.window())
     }
 
     /// Lazily instantiates Slint `OverlayWindow` instances and wires UI callbacks until `self.windows.len() >= required`.
