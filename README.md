@@ -7,16 +7,16 @@
 ## Key Features
 
 - **Orthogonal Rule Engine (`Monitor` × `Trigger` × `Action`):**
-  - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or browser tab URL regular expressions (`Urls` via `aw-watcher-web`).
+  - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or active browser tab URL regular expressions (`Urls` via `aw-watcher-web`).
   - **2 Trigger Types:**
-    - **`Period`:** Triggers after a continuous active session duration (with configurable AFK reset threshold).
+    - **`Period`:** Triggers after a continuous active session duration (with interval coalescing and configurable AFK reset threshold).
     - **`Limit`:** Triggers when cumulative daily active usage reaches a quota (anchored to a configurable logical day-start hour, e.g., `04:00 AM`).
   - **7 Enforcement Actions:**
     - **`Show Overlay`:** Displays a full-screen break overlay across all connected monitors that counts down only while you are physically idle.
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card (with configurable duration, optional countdown timer, and snooze buttons) or a native `Windows` Action Center toast.
     - **`Show Statistics`:** Opens the draggable 24-Hour Screen Time Summary HUD with an hourly activity histogram that live-updates on every poll tick while open without extra ActivityWatch requests.
-    - **`Lock Workstation`:** Immediately locks the Windows session (`LockWorkStation`).
-    - **`Close Tab`:** Sends `Ctrl+W` to close the active tab of the matching foreground window.
+    - **`Lock Workstation`:** Immediately locks the Windows session (`LockWorkStation`), with idle detection to avoid repeated lock calls while already away.
+    - **`Close Tab`:** Sends `Ctrl+W` to close the active tab of the matching foreground window without closing the entire browser window if focus shifts.
     - **`Close Window`:** Gracefully closes matching visible, non-minimized windows via `WM_CLOSE`.
     - **`Kill Process`:** Terminates matching background and foreground processes (restricted to rules targeting specific `.exe` names).
 
@@ -25,18 +25,21 @@
   2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work.
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
 
-- **Ergonomic & Anti-Bypass Safeguards:**
+- **Ergonomic, Shell & Anti-Bypass Safeguards:**
   - **Idle-Aware Break Timer:** Full-screen breaks wait for a natural 1.5-second pause in typing/mouse movement before appearing and pause their countdown (`⏸ Input detected — timer paused until you step away`) whenever physical input is detected.
   - **Fullscreen / D3D Presentation Suppression:** Optionally detects fullscreen Direct3D games, presentations, or Windows Focus Assist (`SHQueryUserNotificationState`) and downgrades intrusive overlays to passive notifications.
-  - **Strict Mode & 15-Second Lockout Delay:** When enabled on a `Show Overlay` rule, hides Skip/Snooze buttons on the break screen, disables system tray bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
+  - **Strict Mode & Top-Priority Break Lockout:** When enabled on a `Show Overlay` rule, gives `BreakEnforcer` the highest overlay priority (preventing grace timers or test cards from replacing it), hides Skip/Snooze buttons on the break screen, disables system tray and command bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
+  - **Protected Process & Windows Shell Guards:** Automatically excludes the `aw-enforcer` process and Windows shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) from wildcard window closing, tab closing, and process termination.
   - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
-  - **Performance & Idle Memory Optimization:**
-    - **Slint Rendering Backend (`slint_renderer`):** Switch between OpenGL hardware acceleration (`renderer-femtovg`, default) and lightweight CPU software rendering (`renderer-software`) directly from the Settings **Performance** section. CPU rendering significantly reduces GPU VRAM and overall memory footprint in resource-constrained or virtualized environments (requires application restart).
-    - **Destroy Windows when Hidden (`destroy_windows_on_hide`):** Frees full-screen OpenGL/GPU surfaces and Slint textures when overlay alerts or the Settings window are closed or hidden (`destroy_windows_on_hide = true`, default); when disabled, windows remain cached in memory for instant display without cold-start initialization.
-    - **Zero-Allocation Win32 Process Resolution:** Uses `QueryFullProcessImageNameW` directly on target window PIDs with stack buffers, eliminating machine-wide process snapshot overhead. Process management and known app scanning use lightweight Win32 ToolHelp snapshots with zero external process-enumeration crates.
-    - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
-    - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
+
+- **Performance & Idle Memory Optimization:**
+  - **Slint Rendering Backend (`slint_renderer`):** Switch between OpenGL hardware acceleration (`renderer-femtovg`, default) and lightweight CPU software rendering (`renderer-software`) directly from the Settings **Performance** section. CPU rendering significantly reduces GPU VRAM and overall memory footprint in resource-constrained or virtualized environments (requires application restart).
+  - **Destroy Windows when Hidden (`destroy_windows_on_hide`):** Frees full-screen OpenGL/GPU surfaces and Slint textures when overlay alerts or the Settings window are closed or hidden (`destroy_windows_on_hide = true`, default); when disabled, windows remain cached in memory for instant display without cold-start initialization.
+  - **Event-Driven UI Dispatch & Smart Polling:** `OverlayAction` updates are pushed from the Tokio engine directly onto the Slint event loop via `slint::invoke_from_event_loop` without busy-polling. Daily quota usage is cached per poll tick (`daily_usage_seconds`), and `/api/0/info` connection checks pause automatically when the Settings window is closed.
+  - **Zero-Allocation Win32 Process Resolution & Matching:** Uses `QueryFullProcessImageNameW` on stack buffers and zero-allocation `.exe` stem matching (`exe_name_matches_targets`). Process termination and running-app discovery share a single lightweight Win32 ToolHelp snapshot iterator (`for_each_process`) with zero external process-enumeration crates.
+  - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
+  - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
 
 - **Rich Message Editor & Live Preview:**
   - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
@@ -51,7 +54,7 @@
 1. **Windows 10 or Windows 11** (64-bit).
 2. **[ActivityWatch](https://activitywatch.net/)** running locally (default port `5600`):
    - `aw-watcher-window` and `aw-watcher-afk` (installed by default with ActivityWatch) are required for `Executables` and `Titles` rules.
-   - `aw-watcher-web` browser extension is required if you create rules using the `Urls` selection mode.
+   - `aw-watcher-web` browser extension is required if you create rules using the `Urls` selection mode (dynamically discovered even if the browser starts after `aw-enforcer`).
 3. **Rust Toolchain** (1.75+ recommended, `x86_64-pc-windows-msvc`) to build from source.
 
 ---
@@ -66,18 +69,21 @@ cargo run
 
 # Build optimized release binary
 cargo build --release
+
 ```
 
 The compiled executable will be located at `target\release\aw-enforcer.exe`.
 
 ### Command-Line Arguments
 
-- `--autostart`: Launches AW-Enforcer silently in the system tray without opening the Settings window on startup (automatically configured in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` when **Launch AW-Enforcer on Windows startup** is enabled).
+* `--autostart` / `--minimized`: Launches AW-Enforcer silently in the system tray without opening the Settings window on startup (`--autostart` is automatically configured in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` when **Start on Windows Login** is enabled).
+* `--test-break`: Immediately triggers a sample full-screen break overlay on launch for visual testing.
 
 ### Running Tests
 
 ```powershell
 cargo test
+
 ```
 
 ---
@@ -88,6 +94,7 @@ AW-Enforcer automatically loads and saves its configuration to:
 
 ```text
 %LOCALAPPDATA%\aw-enforcer\config.toml
+
 ```
 
 ### Example `config.toml`
@@ -149,6 +156,7 @@ thu = "000000001111111111000000"
 fri = "000000001111111111000000"
 sat = "000000000000000000000000"
 sun = "000000000000000000000000"
+
 ```
 
 ---
@@ -156,23 +164,24 @@ sun = "000000000000000000000000"
 ## Project Structure
 
 | File | Responsibility |
-| :--- | :--- |
-| `src/main.rs` | Single-instance mutex, system tray menu, Slint UI state synchronization, and Tokio runtime setup |
-| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and rule safety sanitization |
-| `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` discovery and `filter_period_intersect` queries) |
-| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, session duration/quota calculation, and 3-stage rule evaluation |
-| `src/enforcer.rs` | Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, process termination, and workstation lock |
-| `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
+| --- | --- |
+| `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
+| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and `Rule::sanitize()` safety invariants |
+| `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery and `filter_period_intersect` queries) |
+| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, interval-coalesced session/quota calculation, and 3-stage rule evaluation |
+| `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |
+| `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, priority hierarchy, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
 | `src/formatter.rs` | Message template placeholder interpolation and line-level attribute/heading parser |
 | `src/autostart.rs` | Windows Registry (`HKCU\...\Run`) startup registration |
 | `ui/settings.slint` | Settings window, sidebar navigation, 5-section rule editor, and interactive 7×24 schedule matrix |
 | `ui/overlay.slint` | Full-screen break enforcer, HUD toast, HUD grace countdown timer, and 24-hour screen time histogram cards |
 | `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component |
+| `ui/executable_selector.slint` | Executable chip list, file browser trigger, and running process selector |
+| `ui/duration_input.slint` | Reusable numeric value + `Hr`/`Min`/`Sec` unit selector |
+| `ui/schedule_grid.slint` | Interactive 7×24 weekly schedule matrix with click-and-drag painting and presets |
 
 ---
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
-
-
+This project is licensed under the [MIT License](https://opensource.org/license/mit).

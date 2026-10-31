@@ -14,29 +14,31 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
      - **Stage 1 (Warn Before Action):** Fires when `warn_before > 0` and `remaining <= warn_before`.
      - **Stage 2 (Grace Countdown):** Displays a top-right `HudTimer` countdown when `grace_duration > 0` before executing the configured action.
      - **Stage 3 (Action Execution):** Executes `Show Overlay`, `Show Notification` (`HUD` or `Windows`), `Show Statistics`, `Lock Workstation`, `Close Tab`, `Close Window`, or `Kill Process`.
+   - Centralizes cycle state transitions on `RuleRuntime` (`reset_active_timers()`, `complete_cycle(now)`, and `snooze(until)` with `prev_completed_at` tracking) so snoozing on any cycle pauses enforcement for `minutes` and then re-evaluates without losing pre-snooze session progress.
 3. **Five-Section Rule Editor (`ui/settings.slint`):**
    - Each rule's configuration page is organized into five clean sections with headers placed outside their cards: **1. General Settings**, **2. Monitor Target**, **3. Trigger**, **4. Action**, and **5. Active Hours Schedule** (each enclosed in a dedicated `SectionCard`).
-   - The Message Template & Formatting Toolbar section is hosted in a dedicated sub-card within the **4. Action** card.
-4. **Ergonomic & Anti-Bypass Safeguards:**
+   - The Message Template & Formatting Toolbar section is hosted in a dedicated sub-card within the **4. Action** card and live-updates its preview whenever rule names, targets, monitor modes, triggers, or durations change.
+4. **Ergonomic, Shell & Anti-Bypass Safeguards:**
    - **Logical Day-Start Hour Offset (`day_start_hour`, default `4` = `04:00 AM`):** Prevents midnight rollover from resetting daily quotas during late-night sessions.
    - **1.5s Natural Break Delay & Visual Idle Feedback:** Waits for a 1.5s pause in user input before launching a full-screen `Show Overlay` break (when `grace_duration == 0`), and displays `"⏸ Input detected — timer paused until you step away"` when mouse/keyboard activity occurs during a break.
    - **Fullscreen / Presentation DND (`SHQueryUserNotificationState`):** Automatically downgrades `Show Overlay` breaks to passive Windows notifications during fullscreen D3D games, presentations, or Focus Assist.
    - **Pause All Rules Indefinitely (`pause_all_rules`):** Synchronized between the General Settings checkbox and the system tray menu item (`"Pause All Rules"` / `"Resume All Rules"`), pausing all rule alerts and enforcement until resumed.
-   - **Strict Mode Lockout with 15-Second Confirmation Delay:** Available when `Action == "Show Overlay"`; hides Skip/Snooze buttons on the overlay, disables tray bypass items, and locks rule/settings edits behind a 15-second confirmation timer while actively enforcing.
+   - **Strict Mode Lockout & Overlay Priority Hierarchy:** `OverlayMode::priority()` enforces `BreakEnforcer (4) > HudTimer (3) > HudToast (2) > HudStatus (1) > Hidden (0)`. When `Strict Mode` is enabled on a `Show Overlay` rule, it hides Skip/Snooze buttons on the overlay, disables tray bypass items, blocks `SnoozeBreak`/`SkipBreak`/`CloseOverlay`/`TriggerTestOverlay` commands in the engine, and locks rule/settings edits (including `Pause All Rules` and `Test Overlays` buttons) behind a 15-second confirmation timer while actively enforcing.
+   - **Protected Window & Shell Guards (`enforcer::is_protected_window`):** Excludes the `aw-enforcer` process (`GetCurrentProcessId()`) and Windows shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) from window enumeration, wildcard `WM_CLOSE`, `Ctrl+W` synthesis, and process termination.
 5. **Performance, Renderer & GPU Memory Management:**
-   - **Rendering Backend Toggle (`slint_renderer`, default `"femtovg"`):** Allows switching between OpenGL hardware acceleration (`renderer-femtovg`) and CPU software rendering (`renderer-software`) directly from the General Settings **Performance** card. CPU rendering avoids allocating GPU OpenGL swapchains and VRAM textures, significantly lowering baseline memory consumption in virtualized, remote, or memory-constrained environments.
-   - **Full-Screen Overlay Surface Cleanup (`destroy_windows_on_hide`, default `true`):** Calling `OverlayManager::hide_all` (or `hide`) clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
-   - **Lazy-Instantiation & Teardown of Settings UI:** `SettingsWindow` is not allocated at startup when launched silently (`--autostart` / `--minimized`). It is instantiated on demand when clicking "Open Settings" in the tray, and dropped on close (`'X'`) via a zero-delay UI timer.
-   - **User-Configurable Performance Toggle:** Configured in General Settings under **Performance** (`destroy_windows_on_hide`). When disabled, windows are pre-instantiated and kept hidden in memory for instantaneous zero-latency display without cold-start initialization.
-   - **Zero-Allocation Win32 Process Resolution:** Uses `QueryFullProcessImageNameW` directly on target window PIDs with stack buffers, eliminating machine-wide process snapshot overhead. Process management (`kill_target_processes`) and known app scanning use lightweight Win32 ToolHelp snapshots with zero external process-enumeration crates.
-   - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
-   - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
+   - **Rendering Backend Toggle (`slint_renderer`, default `"femtovg"`):** Allows switching between OpenGL hardware acceleration (`renderer-femtovg`) and CPU software rendering (`renderer-software`) directly from the General Settings **Performance** card.
+   - **Full-Screen Overlay Surface Cleanup (`destroy_windows_on_hide`, default `true`):** Calling `OverlayManager::hide_all` clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
+   - **Lazy-Instantiation & Teardown of Settings UI:** `SettingsWindow` is not allocated at startup when launched silently (`--autostart` / `--minimized`). It is instantiated on demand when clicking "Open Settings" in the tray, and dropped on close (`'X'`) via a zero-delay UI timer when `destroy_windows_on_hide` is enabled.
+   - **Event-Driven UI Dispatch & Idle-Quiet Connection Polling:** `OverlayAction` updates from the Tokio engine are dispatched directly onto the Slint UI thread via `slint::invoke_from_event_loop` (`OVERLAY_ACTION_HANDLER`), while tray/countdown maintenance runs on a lightweight `250ms` timer that only polls `/api/0/info` connection health when `SettingsWindow` is open.
+   - **Per-Tick Usage Caching (`RuleRuntime::daily_usage_seconds`):** Caches daily quota calculations during `evaluate_rule` so `poll_tick` reuses the cached value when formatting Live Status badges instead of scanning events twice.
+   - **Zero-Allocation Win32 Process Resolution & Shared Snapshot Iterator:** Uses `QueryFullProcessImageNameW` on stack buffers and zero-allocation `.exe` stem matching (`enforcer::exe_name_matches_targets`). Process termination (`kill_target_processes`) and known-app discovery (`scan_and_update_known_apps`) share `enforcer::for_each_process` over Win32 ToolHelp snapshots.
+   - **Typed Event Schema (`AwEventData`) & Optimized Release Profile:** Deserializes ActivityWatch event payloads into strongly-typed Rust structs and compiles release binaries with `lto = true`, `codegen-units = 1`, `strip = true`, and `opt-level = "s"`.
 
 ---
 
 ## 2. Configuration Schema (`src/config.rs`)
 
-Store configuration at `%LOCALAPPDATA%\aw-enforcer\config.toml`.
+Store configuration at `%LOCALAPPDATA%\aw-enforcer\config.toml`. Note that saving an empty `rules = []` list is preserved across restarts; default rules are only generated when creating a new `config.toml` or falling back from a corrupted file.
 
 ### A. Time Units & Duration Struct
 ```rust
@@ -58,9 +60,11 @@ pub struct DurationConfig {
     pub value: u32,
     pub unit: TimeUnit,
 }
+
 ```
 
-### B. Strongly-Typed `Rule` Enums & Struct
+### B. Strongly-Typed `Rule` Enums, Struct & Sanitization
+
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MonitorSelection {
@@ -157,9 +161,13 @@ pub struct Rule {
     #[serde(default)]
     pub schedule: RuleSchedule,              // 7x24 bitmask matrix
 }
+
 ```
 
+`Rule::sanitize(&mut self)` enforces safety invariants on both config load (`Config::sanitize_rules`) and UI save (`view_to_rule`), automatically downgrading `RuleAction::KillProcess` to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard `.exe` target is configured.
+
 ### C. Example `config.toml` (v1.0.0)
+
 ```toml
 [general]
 aw_port = 5600
@@ -206,6 +214,8 @@ break_duration = { value = 10, unit = "Min" }
 click_through = false
 strict_mode = false
 notification_method = "HUD"
+notification_duration = { value = 10, unit = "Sec" }
+show_remaining_time = false
 message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
 
 [rules.schedule]
@@ -227,7 +237,7 @@ target_executables = ["steam.exe", "discord.exe"]
 title_regex = ""
 url_regex = ""
 trigger = "Limit"
-period = { value = 60, unit = "Min" }
+period = { value = 50, unit = "Min" }
 reset_after_afk = { value = 5, unit = "Min" }
 limit = { value = 1, unit = "Hr" }
 action = "Close Window"
@@ -237,6 +247,8 @@ break_duration = { value = 10, unit = "Min" }
 click_through = false
 strict_mode = false
 notification_method = "HUD"
+notification_duration = { value = 10, unit = "Sec" }
+show_remaining_time = false
 message = "## Quota Warning: {app}\n[color=#f59e0b bold] {remaining} remaining out of your {limit} daily limit.\nPlease wrap up and save your work."
 
 [rules.schedule]
@@ -247,6 +259,7 @@ thu = "000000000111111111111100"
 fri = "000000000111111111111100"
 sat = "000000000000000000000000"
 sun = "000000000000000000000000"
+
 ```
 
 ---
@@ -254,84 +267,104 @@ sun = "000000000000000000000000"
 ## 3. UI Navigation & Settings Screens (`ui/settings.slint`)
 
 ### A. Tab 0: General Settings (`active-tab == 0`)
+
 The General Settings tab organizes application-wide preferences into four structured `SectionCard` panels:
-1. **General Settings:** ActivityWatch Port (`aw_port`), Polling Interval in seconds (`poll_interval_seconds`), Start on Windows Login (`autostart`), API Key (`api_key`), Logical Day Start Hour (`day_start_hour`), Fullscreen/Presentation DND (`suppress_fullscreen_d3d`), and Pause All Rules (`pause_all_rules`).
+
+1. **General Settings:** ActivityWatch Port (`aw_port`), Polling Interval in seconds (`poll_interval_seconds`), Start on Windows Login (`autostart`), API Key (`api_key`), Logical Day Start Hour (`day_start_hour`), Fullscreen/Presentation DND (`suppress_fullscreen_d3d`), and Pause All Rules (`pause_all_rules`, disabled when `ui-locked-by-strict` is active).
 2. **Performance:**
-   - **Slint Renderer (`slint-renderer`):** ComboBox selecting between OpenGL (`OpenGL (renderer-femtovg)`) and CPU Software (`CPU Software (renderer-software)`). Includes an interactive `InfoTip` on hover: explains that OpenGL is faster via GPU acceleration but uses more memory, whereas CPU rendering saves memory but may be slightly slower (requires application restart).
-   - **Destroy Windows when Hidden (`destroy-windows-on-hide`):** Checkbox controlling whether `OverlayWindow` and `SettingsWindow` instances and their OpenGL/GPU contexts are destroyed when hidden or closed (`true`), or kept resident in memory for instantaneous zero-latency display (`false`). Includes an interactive `InfoTip` on hover: explains that keeping windows alive makes them appear faster with zero latency but uses more memory, while destroying them frees surfaces and textures to minimize idle memory usage.
-3. **Overlay Theme & Appearance:** Overlay Opacity slider (`overlay_opacity`), Accent Color hex input (`accent_color_hex`), and test overlay trigger buttons (`Test Break Screen`, `Test HUD Toast`, `Test HUD Timer`, `Test 24h Stats HUD`).
+* **Slint Renderer (`slint-renderer`):** ComboBox selecting between OpenGL (`OpenGL (renderer-femtovg)`) and CPU Software (`CPU Software (renderer-software)`). Includes an interactive `InfoBadge` tooltip on hover/click (requires application restart).
+* **Destroy Windows when Hidden (`destroy-windows-on-hide`):** Checkbox controlling whether `OverlayWindow` and `SettingsWindow` instances and their OpenGL/GPU contexts are destroyed when hidden or closed (`true`), or kept resident in memory for instantaneous zero-latency display (`false`).
+
+
+3. **Overlay Theme & Appearance:** Overlay Opacity slider (`overlay_opacity`), Accent Color hex input (`accent_color_hex`), and test overlay trigger buttons (`Test Break Screen`, `Test HUD Toast`, `Test HUD Timer`, `Test 24h Stats HUD` — all disabled when `ui-locked-by-strict` is active).
 4. **Activity Statistics & 24h HUD Configuration:** Daily Target Screen Time (`daily_screentime_target_minutes`), Excessive Threshold (`threshold_excessive_minutes`), and Histogram Strftime Code (`histogram_time_format`) with live preview validation.
 
 ### B. Tab 1: Rule Child Tab Sections & Conditional Visibility Matrix (`active-tab == 1 && selected-rule-idx >= 0`)
 
-When `active-tab == 1 && selected-rule-idx >= 0`, `child_rule_view` binds reactive properties for the selected rule (`cur-monitor`, `cur-trigger`, `cur-action`) and renders five structured `SectionCard` groups:
+Adding a rule (`on_add_rule`) scans existing rules in `rules_model` to generate the lowest unused `rule-{n}` ID so deleting and adding rules never produces ID collisions. When `active-tab == 1 && selected-rule-idx >= 0`, `child_rule_view` binds reactive properties for the selected rule (`cur-monitor`, `cur-trigger`, `cur-action`, `has-target-executables`) and renders five structured `SectionCard` groups:
 
 ### Section 1: General
+
 | Control | Type | Visibility Condition | Description |
-| :--- | :--- | :--- | :--- |
+| --- | --- | --- | --- |
 | **Rule Enabled** | `CheckBox` | **Always Visible** | Enables or disables evaluation of this rule during active schedule hours. |
 | **Rule Name** | `LineEdit` | **Always Visible** | Human-readable name displayed in tabs, notifications, and `{rule_name}`. |
 
 ### Section 2: Monitor
+
 | Control | Type | Visibility Condition | Description |
-| :--- | :--- | :--- | :--- |
-| **Selection Mode** | `ComboBox` (`["Executables", "Titles", "Urls"]`) | **Always Visible** | Determines whether the rule matches process executables, window titles, or browser URLs. Close Tab and Close Window remain available across all Selection Modes; switching to Titles or Urls automatically sanitizes Kill Process to Close Window, and switching to Executables downgrades Kill Process to Close Window if no specific .exe target is configured. |
-| **Monitored Executables** | `ExecutableSelector` | **`cur-monitor == "Executables"`** | Chip list of `.exe` names, `"Browse .exe..."` file dialog, and running apps dropdown. Empty UI list serializes as `["*"]`. |
+| --- | --- | --- | --- |
+| **Selection Mode** | `ComboBox` (`["Executables", "Titles", "Urls"]`) | **Always Visible** | Determines whether the rule matches process executables, window titles, or browser URLs. Switching modes sanitizes `Kill Process` to `Close Window` if no specific `.exe` target applies and refreshes the live message preview. |
+| **Monitored Executables** | `ExecutableSelector` | **`cur-monitor == "Executables"`** | Chip list of `.exe` names, `"Browse .exe..."` file dialog, and running apps dropdown (which resets to placeholder after each selection). Empty UI list serializes as `["*"]`. |
 | **Window Title Regex** | `LineEdit` | **`cur-monitor == "Titles"`** | Regular expression matched against `event.data.title` and visible window titles. |
 | **Browser URL Regex** | `LineEdit` | **`cur-monitor == "Urls"`** | Regular expression matched against `event.data.url` from `aw-watcher-web`. |
 
 ### Section 3: Trigger
+
 | Control | Type | Visibility Condition | Description |
-| :--- | :--- | :--- | :--- |
+| --- | --- | --- | --- |
 | **Trigger:** | `ComboBox` (`["Period", "Limit"]`) | **Always Visible** | Selects continuous active session duration (`Period`) vs. cumulative daily usage quota (`Limit`). |
 | **Period:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Period"`** | Continuous active session time before triggering the configured action. |
 | **Reset Session after AFK:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Period"`** | AFK gap required to reset the continuous session counter to `0`. |
 | **Daily Limit (0 = immediate):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Limit"`** | Maximum cumulative daily active duration allowed (`0` = immediate enforcement during scheduled hours). |
 
 ### Section 4: Action
+
 | Control | Type | Visibility Condition | Description |
-| :--- | :--- | :--- | :--- |
-| **Action:** | `ComboBox` | **Always Visible** | Options adapt dynamically: Close Tab and Close Window are available across all Selection Modes (`Executables`, `Titles`, `Urls`). When Selection Mode == `"Executables"` and at least one specific `.exe` target is configured, all 7 actions (`["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]`) are available. Otherwise (Titles, Urls, or Executables with wildcard/all screen time), `Kill Process` is omitted: `["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window"]`. |
-| **Notification Method:** | Segmented Toggle (`["HUD", "Windows"]`) | **`cur-action == "Show Notification"`** | Selects interactive top-right `HudToast` card (`HUD`) vs. native Windows Action Center toast (`Windows`). Positioned directly after the Action dropdown. |
+| --- | --- | --- | --- |
+| **Action:** | `ComboBox` | **Always Visible** | When `cur-monitor == "Executables"` and `has-target-executables` is true, all 7 actions (`["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]`) are selectable; otherwise `Kill Process` is omitted. |
+| **Notification Method:** | Segmented Toggle (`["HUD", "Windows"]`) | **`cur-action == "Show Notification"`** | Selects interactive top-right `HudToast` card (`HUD`) vs. native Windows Action Center toast (`Windows`). |
 | **Duration:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-action == "Show Notification" && notification-method == "HUD"`** | Controls the duration the HUD notification remains visible on screen before auto-dismissing. |
 | **Show Time Remaining:** | `CheckBox` | **`cur-action == "Show Notification" && notification-method == "HUD"`** | Displays a real-time countdown timer in the top-right HUD notification header showing remaining display time. |
 | **Warn Before Action (0 = disabled):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **Always Visible** | Lead time before threshold to display a pre-action warning (`0` = disabled). |
 | **Grace Countdown (0 = disabled):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **Always Visible** | Displays a top-right `HudTimer` final countdown before executing the action (`0` = immediate execution). |
 | **Break Duration:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-action == "Show Overlay"`** | Required physical idle duration to complete the full-screen break overlay. |
-| **Click-through Overlay:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Applies `WS_EX_TRANSPARENT \| WS_EX_NOACTIVATE` so mouse/keyboard pass through the overlay. |
+| **Click-through Overlay:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Applies `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` so mouse/keyboard pass through the overlay. |
 | **Strict Mode:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Hides Skip/Snooze buttons on the overlay and locks tray bypasses & settings edits behind a 15s confirmation delay while enforcing. |
-| **Message Template & Formatting Toolbar** | `TextEdit` + Gutter + Toolbar + `FormattedText` Preview | **`cur-action == "Show Overlay" \|\| cur-action == "Show Notification"`** | Hosted in a dedicated sub-card inside Section 4 with rich formatted message editor, toolbar, line gutter, and live formatted preview. |
+| **Message Template & Formatting Toolbar** | `TextEdit` + Gutter + Toolbar + `FormattedText` Preview | **`cur-action == "Show Overlay" || cur-action == "Show Notification"`** | Hosted in a dedicated sub-card inside Section 4 with rich formatted message editor, toolbar, line gutter, and live formatted preview. |
 
 ### Section 5: Active Hours Schedule
+
 | Control | Type | Visibility Condition | Description |
-| :--- | :--- | :--- | :--- |
+| --- | --- | --- | --- |
 | **Active Hours Schedule** | `ScheduleGrid` (7×24 Matrix) | **Always Visible** | Enclosed in a dedicated `SectionCard` with click-and-drag hourly grid with `Work Hours`, `Evenings`, `Select All`, and `Clear All` presets. |
 
 ---
 
 ## 4. Unified Rule Evaluation Pipeline (`src/engine.rs` & `src/enforcer.rs`)
 
-### A. Event Stream Separation (`poll_tick`)
-- `poll_tick()` queries window events (`aw-watcher-window_`) into `all_events` and browser tab events (`aw-watcher-web`) into a separate `web_events` vector.
-- Rules with `MonitorSelection::Urls` evaluate exclusively against `web_events`, preventing double-counting of browser screen time in `total_today_secs` or wildcard `"*"` executable rules.
+### A. Event Stream Separation & Dynamic Web Bucket Discovery (`poll_tick`, `src/aw_client.rs`)
+
+* `poll_tick()` queries window events (`aw-watcher-window_`) into `all_events` and browser tab events (`aw-watcher-web`) into a separate `web_events` vector.
+* `AwClient::query_web_events()` dynamically re-verifies `/api/0/buckets/` whenever `has_web_bucket` is `false` so browsers launched after daemon startup are automatically detected.
+* Rules with `MonitorSelection::Urls` evaluate exclusively against `web_events`, preventing double-counting of browser screen time in `total_today_secs` or wildcard `"*"` executable rules.
 
 ### B. Three-Stage Evaluation (`evaluate_rule`)
+
 For each enabled rule active in the current `(day_index, hour_index)` schedule slot:
+
 1. **Progress Calculation:**
-   - **`TriggerType::Period`:** Computes continuous active session duration (`session_duration`) via `calculate_continuous_session_for_rule` (resetting to `0` on any AFK gap $\ge$ `reset_after_afk`). Threshold is `rule.period.to_seconds()`.
-   - **`TriggerType::Limit`:** Computes cumulative active duration since `logical_day_start` (`day_start_hour`) via `calculate_usage_for_rule`. Threshold is `rule.limit.to_seconds()`.
+* **`TriggerType::Period`:** Computes continuous active session duration (`session_duration`) via `calculate_continuous_session_for_rule` by clipping matching events against `last_completed_at`, sorting and coalescing overlapping or nested intervals, and walking backward until an AFK gap $\ge$ `reset_after_afk` is encountered. Threshold is `rule.period.to_seconds()`.
+* **`TriggerType::Limit`:** Computes cumulative active duration since `logical_day_start` (`day_start_hour`) via `calculate_usage_for_rule` and caches the result in `rt.daily_usage_seconds` for reuse in Step 5 status badges. Threshold is `rule.limit.to_seconds()`.
+* **Active Window / URL Verification (`find_matching_window_for_rule`):** Confirms a matching visible, non-minimized, non-protected window is currently open. For `MonitorSelection::Urls`, requires both a visible browser window (`enforcer::BROWSER_EXES`) and a matching `aw-watcher-web` event within the active recency window (`2 * poll_interval + 5s`), extracting the URL hostname for `{app}`.
+
+
 2. **Stage 1 — Pre-Action Warning (`warn_before > 0`):**
-   - When `threshold > 0 && warn_before > 0 && elapsed >= threshold - warn_before && elapsed < threshold` and a matching non-minimized window is open (`find_matching_window_for_rule`):
-   - Fires a pre-action warning once per cycle/day (`warned_current_cycle = true`).
+* When `threshold > 0 && warn_secs > 0 && warn_secs < threshold && elapsed >= threshold - warn_secs && elapsed < threshold`:
+* Fires a pre-action warning once per cycle/day (`warned_current_cycle = true`).
+
+
 3. **Stage 2 — Grace Countdown (`grace_duration > 0`):**
-   - When `elapsed >= threshold` and a matching window is open:
-   - If `effective_grace > 0`, starts `rt.grace_countdown = Some((effective_grace, effective_grace))` and displays `OverlayMode::HudTimer` counting down every second in `realtime_tick()`.
+* When `elapsed >= threshold`:
+* If `effective_grace > 0`, starts `rt.grace_countdown = Some((effective_grace, effective_grace))` and displays `OverlayMode::HudTimer` counting down every second in `realtime_tick()`.
+
+
 4. **Stage 3 — Action Execution (`execute_rule_action`):**
-   - Executes when `grace_countdown` reaches `0` (or immediately when `grace_duration == 0`):
-     - **`Show Overlay`:** Launches full-screen `OverlayMode::BreakEnforcer` across all monitors for `break_duration` (with 1.5s natural idle pause if `grace_duration == 0`, fullscreen D3D downgrade to Windows toast if `suppress_fullscreen_d3d` is enabled, and amber pause banner when physical input is detected).
-     - **`Show Notification`:** Dispatches either `OverlayMode::HudToast` (`NotificationMethod::Hud`) or a WinRT system toast (`NotificationMethod::Windows`) using the rule's formatted `message`. HUD notifications remain visible for `notification_duration` before auto-dismissing, and display an optional countdown timer in the header when `show_remaining_time` is enabled.
-     - **`Show Statistics`:** Opens the 24-Hour Screen Time Summary (`OverlayMode::HudStatus`). Upon opening, the 24 hourly bins are fetched once and cached (`StatsHudCache`); while the HUD remains open, it live-updates on every `poll_tick` by recomputing only the active bin (and rolling bins forward across hour boundaries) from the already-fetched `poll_tick` events—without showing the `"Loading..."` spinner or making additional ActivityWatch HTTP requests.
-     - **`Lock Workstation`:** Calls `enforcer::lock_workstation()`.
-     - **`Close Tab`:** Sends `Ctrl+W` (`enforcer::close_active_browser_tab`) to the matching foreground window (falling back to `close_target_windows`).
-     - **`Close Window`:** Posts `WM_CLOSE` (`enforcer::close_target_windows`) to matching visible non-minimized windows.
-     - **`Kill Process`:** Terminates matching processes via Win32 ToolHelp snapshots (`enforcer::kill_target_processes`).
+* Executes when `grace_countdown` reaches `0` (or immediately when `grace_duration == 0`):
+* **`Show Overlay`:** Launches full-screen `OverlayMode::BreakEnforcer` across all monitors for `break_duration` (with 1.5s natural idle pause if `grace_duration == 0`, fullscreen D3D downgrade to Windows toast if `suppress_fullscreen_d3d` is enabled, and amber pause banner when physical input is detected). Records `prev_completed_at = last_completed_at` so snoozing restores the pre-break completion timestamp.
+* **`Show Notification`:** Marks the cycle complete (`rt.complete_cycle(now)`) and dispatches either `OverlayMode::HudToast` (`NotificationMethod::Hud`) or a WinRT system toast (`NotificationMethod::Windows`) using the rule's formatted `message`. If the user clicks **Snooze** on the HUD toast, `rt.snooze(until)` restores `last_completed_at = prev_completed_at` so the notification re-triggers after the snooze expires.
+* **`Show Statistics`:** Marks the cycle complete and opens the 24-Hour Screen Time Summary (`OverlayMode::HudStatus`), which caches historical hourly bins in `StatsHudCache` and live-updates on subsequent `poll_tick`s without extra ActivityWatch HTTP queries.
+* **`Lock Workstation`:** Marks the cycle complete and calls `enforcer::lock_workstation()` (suppressing repeated lock calls on `Limit` rules when user idle time exceeds the poll interval).
+* **`Close Tab`:** Marks the cycle complete and sends `Ctrl+W` (`enforcer::close_active_browser_tab`) to the matching foreground window (passing `compiled_re` only when `MonitorSelection::Titles` is active, without falling back to closing entire windows).
+* **`Close Window`:** Marks the cycle complete and posts `WM_CLOSE` (`enforcer::close_target_windows`) to matching visible non-minimized windows (excluding protected shell windows and the `aw-enforcer` process).
+* **`Kill Process`:** Marks the cycle complete and terminates matching processes via `enforcer::kill_target_processes` (excluding the `aw-enforcer` process).
