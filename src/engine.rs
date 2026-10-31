@@ -131,6 +131,7 @@ pub struct RuleRuntime {
     pub daily_usage_seconds: u32,
     pub last_completed_at: Option<DateTime<Local>>,
     pub prev_completed_at: Option<DateTime<Local>>,
+    pub can_rollback_completion: bool,
     pub warned_current_cycle: bool,
     pub pending_break_since: Option<DateTime<Local>>,
     pub active_break: Option<(u32, u32)>,    // (remaining_secs, total_secs)
@@ -149,6 +150,7 @@ impl RuleRuntime {
             daily_usage_seconds: 0,
             last_completed_at: None,
             prev_completed_at: None,
+            can_rollback_completion: false,
             warned_current_cycle: false,
             pending_break_since: None,
             active_break: None,
@@ -174,6 +176,7 @@ impl RuleRuntime {
         self.snoozed_until = None;
         self.prev_completed_at = self.last_completed_at;
         self.last_completed_at = Some(now);
+        self.can_rollback_completion = true;
         self.action_executed_today = true;
     }
 
@@ -183,9 +186,10 @@ impl RuleRuntime {
     pub fn snooze(&mut self, until: DateTime<Local>) {
         self.reset_active_timers();
         self.snoozed_until = Some(until);
-        if self.action_executed_today {
+        if self.can_rollback_completion {
             self.last_completed_at = self.prev_completed_at;
         }
+        self.can_rollback_completion = false;
         self.action_executed_today = false;
     }
 
@@ -290,6 +294,23 @@ impl Engine {
         false
     }
 
+    /// Returns the elapsed evaluation duration for a rule: current continuous session for `Period`
+    /// or accumulated daily usage for `Limit`.
+    pub fn rule_elapsed_seconds(&self, rule: &Rule) -> u32 {
+        match rule.trigger {
+            TriggerType::Period => self
+                .runtimes
+                .get(&rule.id)
+                .map(|rt| rt.current_session_seconds)
+                .unwrap_or(0),
+            TriggerType::Limit => self
+                .runtimes
+                .get(&rule.id)
+                .map(|rt| rt.daily_usage_seconds)
+                .unwrap_or(0),
+        }
+    }
+
     /// Handles asynchronous daemon commands from tray or UI.
     pub async fn handle_command(&mut self, cmd: DaemonCommand) {
         match cmd {
@@ -310,9 +331,7 @@ impl Engine {
                 }
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
-                if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.warned_current_cycle = true;
-                }
+                tracing::debug!("Acknowledged app warning for rule {rule_id}");
                 if !self.any_countdown_active() {
                     self.hide_overlay();
                 }
@@ -340,7 +359,7 @@ impl Engine {
                 for rt in self.runtimes.values_mut() {
                     if rt.active_break.is_some() {
                         rt.complete_cycle(now);
-                    } else {
+                    } else if rt.pending_break_since.is_some() {
                         rt.warned_current_cycle = false;
                         rt.pending_break_since = None;
                     }
@@ -456,7 +475,7 @@ impl Engine {
                     )
                 }
                 .unwrap_or_else(|| "Active Application".to_string());
-                let elapsed = self.runtimes.get(&rule.id).map(|rt| rt.current_session_seconds).unwrap_or(0);
+                let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
                     TriggerType::Limit => rule.limit.to_seconds(),
@@ -465,6 +484,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.prev_completed_at = rt.last_completed_at;
                     rt.active_break = Some((break_secs, break_secs));
+                    rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
                 let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
@@ -551,7 +571,7 @@ impl Engine {
                     )
                 }
                 .unwrap_or_else(|| "Active Application".to_string());
-                let elapsed = self.runtimes.get(&rule.id).map(|r| r.current_session_seconds).unwrap_or(0);
+                let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
                     TriggerType::Limit => rule.limit.to_seconds(),
@@ -642,6 +662,7 @@ impl Engine {
                 rt.snoozed_until = None;
                 rt.pending_break_since = None;
                 rt.daily_usage_seconds = 0;
+                rt.can_rollback_completion = false;
             }
         }
 
@@ -987,6 +1008,7 @@ impl Engine {
             if !already_warned {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.warned_current_cycle = true;
+                    rt.can_rollback_completion = false;
                 }
                 let rem_secs = threshold_secs.saturating_sub(elapsed_secs).max(1);
                 let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, rem_secs);
@@ -1104,6 +1126,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.prev_completed_at = rt.last_completed_at;
                     rt.active_break = Some((break_secs, break_secs));
+                    rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
                 let paragraphs = formatter::parse_message(
@@ -1943,5 +1966,107 @@ mod tests {
             }
         }
         assert_eq!(engine.runtimes.get(&rule_id).unwrap().daily_usage_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn test_warning_snooze_preserves_cycle_completion() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let rule = Rule::default_template(0);
+        let rule_id = rule.id.clone();
+        cfg.rules = vec![rule];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let cycle1_time = Local::now() - Duration::minutes(30);
+        let rt = engine.runtimes.get_mut(&rule_id).unwrap();
+        rt.complete_cycle(cycle1_time);
+        assert_eq!(rt.last_completed_at, Some(cycle1_time));
+        assert!(rt.can_rollback_completion);
+
+        // Simulate cycle 2 Stage 1 warning dispatch
+        rt.warned_current_cycle = true;
+        rt.can_rollback_completion = false;
+
+        // User snoozes from warning toast
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: rule_id.clone(),
+                minutes: 10,
+            })
+            .await;
+
+        let rt = engine.runtimes.get(&rule_id).unwrap();
+        assert_eq!(rt.last_completed_at, Some(cycle1_time));
+        assert!(rt.snoozed_until.is_some());
+        assert!(!rt.can_rollback_completion);
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_app_warning_does_not_suppress_next_cycle() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule1 = Rule::default_template(0);
+        rule1.id = "rule-1".to_string();
+        let mut rule2 = Rule::default_template(1);
+        rule2.id = "rule-2".to_string();
+        cfg.rules = vec![rule1, rule2];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Ensure warned_current_cycle is false initially
+        assert!(!engine.runtimes.get("rule-1").unwrap().warned_current_cycle);
+
+        // Clicking "OK" on a notification or warning toast
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-1".to_string(),
+            })
+            .await;
+
+        // Must still be false so the next cycle is not suppressed
+        assert!(!engine.runtimes.get("rule-1").unwrap().warned_current_cycle);
+
+        // Test DismissBreakOverlay only touching active or pending break rules
+        engine.runtimes.get_mut("rule-1").unwrap().warned_current_cycle = true;
+        engine.runtimes.get_mut("rule-2").unwrap().active_break = Some((10, 10));
+
+        engine.handle_command(DaemonCommand::DismissBreakOverlay).await;
+
+        // rule-2's break was completed
+        assert!(engine.runtimes.get("rule-2").unwrap().active_break.is_none());
+        assert!(engine.runtimes.get("rule-2").unwrap().last_completed_at.is_some());
+
+        // rule-1 was neither active nor pending break, so its warned_current_cycle was untouched
+        assert!(engine.runtimes.get("rule-1").unwrap().warned_current_cycle);
+    }
+
+    #[test]
+    fn test_rule_elapsed_seconds_limit_vs_period() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut period_rule = Rule::default_template(0);
+        period_rule.id = "period-rule".to_string();
+        period_rule.trigger = TriggerType::Period;
+
+        let mut limit_rule = Rule::default_template(1);
+        limit_rule.id = "limit-rule".to_string();
+        limit_rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![period_rule.clone(), limit_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let rt_period = engine.runtimes.get_mut("period-rule").unwrap();
+        rt_period.current_session_seconds = 1800;
+        rt_period.daily_usage_seconds = 4500;
+
+        let rt_limit = engine.runtimes.get_mut("limit-rule").unwrap();
+        rt_limit.current_session_seconds = 0;
+        rt_limit.daily_usage_seconds = 7200;
+
+        assert_eq!(engine.rule_elapsed_seconds(&period_rule), 1800);
+        assert_eq!(engine.rule_elapsed_seconds(&limit_rule), 7200);
     }
 }
