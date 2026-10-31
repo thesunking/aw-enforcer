@@ -531,6 +531,14 @@ pub fn validate_strftime_format(code: &str) -> (bool, String) {
     }
 }
 
+/// Validates a regular expression pattern using `regex::Regex::new` and returns `(is_valid, error_message)`.
+pub fn validate_regex_pattern(pattern: &str) -> (bool, String) {
+    match regex::Regex::new(pattern) {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, e.to_string()),
+    }
+}
+
 /// Top-level application configuration persisted to `%LOCALAPPDATA%\aw-enforcer\config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -776,6 +784,22 @@ mod tests {
         let (valid_ok, preview) = validate_strftime_format("%H:%M");
         assert!(valid_ok);
         assert!(!preview.is_empty());
+    }
+
+    /// Verifies `validate_regex_pattern` validates patterns via `regex::Regex::new`.
+    #[test]
+    fn test_validate_regex_pattern() {
+        let (valid_empty, err_empty) = validate_regex_pattern("");
+        assert!(valid_empty);
+        assert!(err_empty.is_empty());
+
+        let (valid_ok, err_ok) = validate_regex_pattern(r"(?i)(youtube|twitch)");
+        assert!(valid_ok);
+        assert!(err_ok.is_empty());
+
+        let (valid_bad, err_bad) = validate_regex_pattern(r"[a-z");
+        assert!(!valid_bad);
+        assert!(!err_bad.is_empty());
     }
 
     /// Verifies `Config::sanitize_rules` downgrades `KillProcess` to `CloseWindow` unless specific executables are targeted.

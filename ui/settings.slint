@@ -249,6 +249,8 @@ export component SettingsWindow inherits Window {
     in-out property <string> rule-monitor-selection: "Executables";
     in-out property <string> rule-title-regex: "";
     in-out property <string> rule-url-regex: "";
+    in property <bool> rule-regex-valid: true;
+    in property <string> rule-regex-error: "";
     in-out property <string> rule-trigger: "Period";
     in-out property <int> rule-period-val: 20;
     in-out property <string> rule-period-unit: "Min";
@@ -469,22 +471,22 @@ export component SettingsWindow inherits Window {
                 // Save & Apply Button
                 Rectangle {
                     height: 38px;
-                    background: (!root.time-format-valid || root.ui-locked-by-strict) ? #1e293b.darker(0.3) :
+                    background: (!root.time-format-valid || !root.rule-regex-valid || root.ui-locked-by-strict) ? #1e293b.darker(0.3) :
                                 root.has-unsaved-changes ? (save_touch.pressed ? #1d4ed8 : (save_touch.has-hover ? #3b82f6 : #2563eb)) :
                                 (save_touch.pressed ? #0f172a : (save_touch.has-hover ? #334155 : #1e293b));
                     border-radius: 6px;
                     border-width: 1px;
-                    border-color: (!root.time-format-valid || root.ui-locked-by-strict) ? #334155 :
+                    border-color: (!root.time-format-valid || !root.rule-regex-valid || root.ui-locked-by-strict) ? #334155 :
                                  root.has-unsaved-changes ? #60a5fa :
                                  (save_touch.has-hover ? #64748b : #475569);
                     animate background { duration: 150ms; }
                     animate border-color { duration: 150ms; }
 
                     save_touch := TouchArea {
-                        enabled: root.time-format-valid && !root.ui-locked-by-strict;
-                        mouse-cursor: (root.time-format-valid && !root.ui-locked-by-strict) ? pointer : not-allowed;
+                        enabled: root.time-format-valid && root.rule-regex-valid && !root.ui-locked-by-strict;
+                        mouse-cursor: (root.time-format-valid && root.rule-regex-valid && !root.ui-locked-by-strict) ? pointer : not-allowed;
                         clicked => {
-                            if !root.ui-locked-by-strict {
+                            if !root.ui-locked-by-strict && root.time-format-valid && root.rule-regex-valid {
                                 root.has-unsaved-changes = false;
                                 root.save-config();
                             }
@@ -506,7 +508,7 @@ export component SettingsWindow inherits Window {
                             text: "Save & Apply Changes";
                             font-size: 13px;
                             font-weight: root.has-unsaved-changes ? 700 : 500;
-                            color: (!root.time-format-valid || root.ui-locked-by-strict) ? #64748b :
+                            color: (!root.time-format-valid || !root.rule-regex-valid || root.ui-locked-by-strict) ? #64748b :
                                    root.has-unsaved-changes ? #ffffff : #cbd5e1;
                             vertical-alignment: center;
                         }
@@ -1148,22 +1150,42 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-monitor == "Titles" : FormRow {
                                 label: "Window Title Regex:";
-                                LineEdit {
-                                    text <=> root.rule-title-regex;
-                                    placeholder-text: "(?i)(youtube|twitch|reddit)";
-                                    edited(val) => {
-                                        root.active-rule-edited();
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    LineEdit {
+                                        text <=> root.rule-title-regex;
+                                        placeholder-text: "(?i)(youtube|twitch|reddit)";
+                                        edited(val) => {
+                                            root.active-rule-edited();
+                                        }
+                                    }
+                                    Text {
+                                        text: root.rule-regex-valid ? "✓ Valid regular expression" : root.rule-regex-error;
+                                        color: root.rule-regex-valid ? #10b981 : #ef4444;
+                                        font-size: 12px;
+                                        font-weight: 500;
+                                        wrap: word-wrap;
                                     }
                                 }
                             }
 
                             if child_rule_view.cur-monitor == "Urls" : FormRow {
                                 label: "Browser URL Regex:";
-                                LineEdit {
-                                    text <=> root.rule-url-regex;
-                                    placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
-                                    edited(val) => {
-                                        root.active-rule-edited();
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    LineEdit {
+                                        text <=> root.rule-url-regex;
+                                        placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
+                                        edited(val) => {
+                                            root.active-rule-edited();
+                                        }
+                                    }
+                                    Text {
+                                        text: root.rule-regex-valid ? "✓ Valid regular expression" : root.rule-regex-error;
+                                        color: root.rule-regex-valid ? #10b981 : #ef4444;
+                                        font-size: 12px;
+                                        font-weight: 500;
+                                        wrap: word-wrap;
                                     }
                                 }
                             }

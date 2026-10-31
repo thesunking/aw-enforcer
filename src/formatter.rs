@@ -179,24 +179,24 @@ pub fn parse_message(
             continue;
         }
 
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            paragraphs.push(make_para(rest.trim_start(), 20.0, 700, false, false, default_color));
-            continue;
-        }
+        let (heading_prefix, default_size, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
+            ("## ", 20.0, r.trim_start())
+        } else if let Some(r) = trimmed.strip_prefix("# ") {
+            ("# ", 26.0, r.trim_start())
+        } else {
+            ("", 15.0, trimmed)
+        };
 
-        if let Some(rest) = trimmed.strip_prefix("# ") {
-            paragraphs.push(make_para(rest.trim_start(), 26.0, 700, false, false, default_color));
-            continue;
-        }
+        let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
 
         // Check for attribute prefix: [attr1 attr2 ...]
-        if trimmed.starts_with('[') {
-            if let Some(close_idx) = trimmed.find(']') {
-                let inner = &trimmed[1..close_idx];
+        if rest.starts_with('[') {
+            if let Some(close_idx) = rest.find(']') {
+                let inner = &rest[1..close_idx];
                 if is_valid_attr_block(inner) {
                     let tokens: Vec<&str> = inner.split_whitespace().collect();
-                    let mut font_size: f32 = 15.0;
-                    let mut font_weight: i32 = 400;
+                    let mut font_size: f32 = default_size;
+                    let mut font_weight: i32 = default_weight;
                     let mut italic = false;
                     let mut underline = false;
                     let mut text_color = default_color;
@@ -219,15 +219,15 @@ pub fn parse_message(
                         }
                     }
 
-                    let content = trimmed[close_idx + 1..].trim_start();
+                    let content = rest[close_idx + 1..].trim_start();
                     paragraphs.push(make_para(content, font_size, font_weight, italic, underline, text_color));
                     continue;
                 }
             }
         }
 
-        // Plain line fallback (preserves unrecognized brackets literally)
-        paragraphs.push(make_para(trimmed, 15.0, 400, false, false, default_color));
+        // Plain line fallback (or plain heading fallback)
+        paragraphs.push(make_para(rest, default_size, default_weight, false, false, default_color));
     }
 
     if paragraphs.is_empty() {
@@ -291,18 +291,19 @@ pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormatting
     let line = lines[line_idx].trim();
     let mut status = LineFormattingStatus::default();
 
-    if line.starts_with("# ") {
-        status.is_h1 = true;
-        return status;
-    }
-    if line.starts_with("## ") {
+    let rest = if let Some(r) = line.strip_prefix("## ") {
         status.is_h2 = true;
-        return status;
-    }
+        r.trim_start()
+    } else if let Some(r) = line.strip_prefix("# ") {
+        status.is_h1 = true;
+        r.trim_start()
+    } else {
+        line
+    };
 
-    if line.starts_with('[') {
-        if let Some(close_idx) = line.find(']') {
-            let inner = &line[1..close_idx];
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
             if is_valid_attr_block(inner) {
                 for token in inner.split_whitespace() {
                     match token {
@@ -380,7 +381,7 @@ pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) ->
     })
 }
 
-/// Strips any existing `# `, `## `, or valid `[attr ...]` prefix from `line` and returns the inner content.
+/// Strips any existing `# ` or `## ` prefix from `line` and returns the inner content.
 fn strip_existing_prefix(line: &str) -> &str {
     let trimmed = line.trim();
     if let Some(rest) = trimmed.strip_prefix("## ") {
@@ -389,34 +390,35 @@ fn strip_existing_prefix(line: &str) -> &str {
     if let Some(rest) = trimmed.strip_prefix("# ") {
         return rest.trim_start();
     }
-    if trimmed.starts_with('[') {
-        if let Some(close_idx) = trimmed.find(']') {
-            let inner = &trimmed[1..close_idx];
-            if is_valid_attr_block(inner) {
-                return trimmed[close_idx + 1..].trim_start();
-            }
-        }
-    }
     trimmed
 }
 
-/// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block.
+/// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block,
+/// preserving any leading `# ` or `## ` heading prefix.
 fn strip_attr_prefix(line: &str, prefix: &str) -> String {
     let trimmed = line.trim();
-    if trimmed.starts_with('[') {
-        if let Some(close_idx) = trimmed.find(']') {
-            let inner = &trimmed[1..close_idx];
+    let (header_prefix, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
+        ("## ", r.trim_start())
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("# ", r.trim_start())
+    } else {
+        ("", trimmed)
+    };
+
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
             if is_valid_attr_block(inner) {
                 let tokens: Vec<String> = inner
                     .split_whitespace()
                     .filter(|t| !t.starts_with(prefix))
                     .map(|s| s.to_string())
                     .collect();
-                let content = trimmed[close_idx + 1..].trim_start();
+                let content = rest[close_idx + 1..].trim_start();
                 if tokens.is_empty() {
-                    return content.to_string();
+                    return format!("{}{}", header_prefix, content);
                 } else {
-                    return format!("[{}] {}", tokens.join(" "), content);
+                    return format!("{}[{}] {}", header_prefix, tokens.join(" "), content);
                 }
             }
         }
@@ -424,24 +426,25 @@ fn strip_attr_prefix(line: &str, prefix: &str) -> String {
     line.to_string()
 }
 
-/// Toggles or replaces a single attribute token inside a line's leading `[...]` attribute block.
+/// Toggles or replaces a single attribute token inside a line's leading `[...]` attribute block,
+/// preserving any leading `# ` or `## ` heading prefix.
 fn toggle_attr(line: &str, attr: &str) -> String {
     let trimmed = line.trim();
-    let stripped_headers = if let Some(rest) = trimmed.strip_prefix("## ") {
-        rest.trim_start()
-    } else if let Some(rest) = trimmed.strip_prefix("# ") {
-        rest.trim_start()
+    let (header_prefix, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
+        ("## ", r.trim_start())
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("# ", r.trim_start())
     } else {
-        trimmed
+        ("", trimmed)
     };
 
-    if stripped_headers.starts_with('[') {
-        if let Some(close_idx) = stripped_headers.find(']') {
-            let inner = &stripped_headers[1..close_idx];
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
             if is_valid_attr_block(inner) {
                 let mut tokens: Vec<String> =
                     inner.split_whitespace().map(|s| s.to_string()).collect();
-                let content = stripped_headers[close_idx + 1..].trim_start();
+                let content = rest[close_idx + 1..].trim_start();
 
                 if let Some(pos) = tokens.iter().position(|t| t == attr) {
                     tokens.remove(pos);
@@ -455,15 +458,15 @@ fn toggle_attr(line: &str, attr: &str) -> String {
                 }
 
                 if tokens.is_empty() {
-                    return content.to_string();
+                    return format!("{}{}", header_prefix, content);
                 } else {
-                    return format!("[{}] {}", tokens.join(" "), content);
+                    return format!("{}[{}] {}", header_prefix, tokens.join(" "), content);
                 }
             }
         }
     }
 
-    format!("[{}] {}", attr, stripped_headers)
+    format!("{}[{}] {}", header_prefix, attr, rest)
 }
 
 #[cfg(test)]
@@ -622,5 +625,34 @@ mod tests {
         assert_eq!(paras[0].font_size, 26.0);
         assert_eq!(paras[1].text.as_str(), "\u{00A0}");
         assert_eq!(paras[2].text.as_str(), "Active for 50m");
+    }
+
+    /// Verifies that applying inline styles (`Color: Sky Blue`, `italic`) to an H1 heading preserves
+    /// the `# ` prefix and `is_h1 == true`, and correctly parses into a styled heading paragraph.
+    #[test]
+    fn test_heading_with_inline_styles() {
+        let text = "# Heading";
+        let with_color = apply_line_style(text, 0, "Color: Sky Blue");
+        assert_eq!(with_color, "# [color=#38bdf8] Heading");
+        let st1 = detect_line_formatting(&with_color, 0);
+        assert!(st1.is_h1);
+        assert_eq!(st1.color_code, "#38bdf8");
+
+        let with_italic = apply_line_style(&with_color, 0, "italic");
+        assert!(with_italic.starts_with("# [") && with_italic.contains("color=#38bdf8") && with_italic.contains("italic") && with_italic.ends_with("] Heading"));
+        let st2 = detect_line_formatting(&with_italic, 0);
+        assert!(st2.is_h1);
+        assert!(st2.is_italic);
+        assert_eq!(st2.color_code, "#38bdf8");
+
+        let ctx = MessageContext::sample();
+        let default_color = Color::from_rgb_u8(248, 250, 252);
+        let paras = parse_message(&with_italic, &ctx, default_color, TextHorizontalAlignment::Center);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text.as_str(), "Heading");
+        assert_eq!(paras[0].font_size, 26.0);
+        assert_eq!(paras[0].font_weight, 700);
+        assert!(paras[0].italic);
+        assert_eq!(paras[0].color, parse_hex_color("#38bdf8").unwrap());
     }
 }

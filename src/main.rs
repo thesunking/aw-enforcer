@@ -276,6 +276,31 @@ fn refresh_message_editor_state(
     }
 }
 
+/// Validates the active rule's regular expression if Title or URL monitoring is selected,
+/// updating `rule-regex-valid` and `rule-regex-error` on `win`.
+fn refresh_rule_regex_validation(win: &SettingsWindow) {
+    let idx = win.get_selected_rule_idx();
+    if idx < 0 {
+        win.set_rule_regex_valid(true);
+        win.set_rule_regex_error("".into());
+        return;
+    }
+    let mode = win.get_rule_monitor_selection();
+    let (valid, err) = match mode.as_str() {
+        "Titles" => {
+            let pat = win.get_rule_title_regex();
+            config::validate_regex_pattern(&pat)
+        }
+        "Urls" => {
+            let pat = win.get_rule_url_regex();
+            config::validate_regex_pattern(&pat)
+        }
+        _ => (true, String::new()),
+    };
+    win.set_rule_regex_valid(valid);
+    win.set_rule_regex_error(err.into());
+}
+
 /// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
 fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView) {
     win.set_rule_enabled(rule.enabled);
@@ -305,6 +330,7 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView) {
     win.set_rule_strict_mode(rule.strict_mode);
     win.set_editor_message_text(rule.message.clone());
     refresh_message_editor_state(win, &rule.message, 0, Some(rule));
+    refresh_rule_regex_validation(win);
 }
 
 /// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
@@ -547,6 +573,9 @@ fn open_settings_window(
 
         settings_win.on_save_config(move || {
             if let Some(win) = sw.upgrade() {
+                if !win.get_time_format_valid() || !win.get_rule_regex_valid() {
+                    return;
+                }
                 let mut updated_config = cfg_cell.borrow().clone();
 
                 updated_config.general.aw_port = win.get_aw_port().max(1000) as u16;
@@ -707,6 +736,7 @@ fn open_settings_window(
                         } else {
                             win.set_selected_rule_idx(-1);
                             win.set_editor_message_text("".into());
+                            refresh_rule_regex_validation(&win);
                         }
                     } else if cur > idx {
                         win.set_selected_rule_idx(cur - 1);
@@ -782,6 +812,7 @@ fn open_settings_window(
 
                         let cur_line = win.get_selected_message_line() as usize;
                         refresh_message_editor_state(&win, &rule.message, cur_line, Some(&rule));
+                        refresh_rule_regex_validation(&win);
                         rm.set_row_data(u, rule);
                         win.set_has_unsaved_changes(true);
                     }
