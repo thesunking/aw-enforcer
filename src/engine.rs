@@ -18,6 +18,7 @@ use crate::formatter::{self, MessageContext};
 use crate::overlay::OverlayMode;
 
 /// Computes the overlap duration in seconds between an ActivityWatch event and `[start_utc, end_utc]`.
+#[allow(dead_code)]
 fn event_overlap_seconds(ev: &AwEvent, start_utc: DateTime<Utc>, end_utc: DateTime<Utc>) -> f64 {
     let e_start = ev.timestamp;
     let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
@@ -28,6 +29,62 @@ fn event_overlap_seconds(ev: &AwEvent, start_utc: DateTime<Utc>, end_utc: DateTi
     } else {
         0.0
     }
+}
+
+/// Merges overlapping and adjacent intervals into a minimal sorted list of non-overlapping intervals.
+pub fn merge_overlapping_intervals(
+    mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+
+    intervals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            } else {
+                merged.push((start, end));
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    merged
+}
+
+/// Computes the total non-overlapping duration in seconds between a slice of events and `[start_utc, end_utc]`.
+pub fn compute_coalesced_overlap_seconds(
+    events: &[AwEvent],
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+) -> f64 {
+    let intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
+        .iter()
+        .filter_map(|ev| {
+            let e_start = ev.timestamp;
+            let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+            let start = e_start.max(start_utc);
+            let end = e_end.min(end_utc);
+            if end > start {
+                Some((start, end))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let merged = merge_overlapping_intervals(intervals);
+    merged
+        .iter()
+        .map(|(s, e)| (*e - *s).num_milliseconds() as f64 / 1000.0)
+        .sum()
 }
 
 /// Returns physical user idle duration in milliseconds using GetLastInputInfo.
@@ -940,10 +997,7 @@ impl Engine {
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
         let max_session_secs = self.runtimes.values().map(|rt| rt.current_session_seconds).max().unwrap_or(0);
 
-        let total_today_secs: f64 = all_events
-            .iter()
-            .map(|ev| event_overlap_seconds(ev, start_of_day_utc, now_utc))
-            .sum();
+        let total_today_secs = compute_coalesced_overlap_seconds(&all_events, start_of_day_utc, now_utc);
         let total_today_mins = (total_today_secs / 60.0).round() as u32;
 
         let active_app = all_events
@@ -1522,10 +1576,7 @@ impl Engine {
             let prev_start_utc = cache.current_bin_start.with_timezone(&Utc);
             let prev_end_utc =
                 (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-            let mut prev_secs = 0.0f32;
-            for ev in events {
-                prev_secs += event_overlap_seconds(ev, prev_start_utc, prev_end_utc) as f32;
-            }
+            let prev_secs = compute_coalesced_overlap_seconds(events, prev_start_utc, prev_end_utc) as f32;
             if let Some(last) = cache.bin_seconds.last_mut() {
                 *last = prev_secs;
             }
@@ -1543,10 +1594,7 @@ impl Engine {
         let cur_start_utc = cache.current_bin_start.with_timezone(&Utc);
         let cur_end_utc =
             (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-        let mut cur_secs = 0.0f32;
-        for ev in events {
-            cur_secs += event_overlap_seconds(ev, cur_start_utc, cur_end_utc) as f32;
-        }
+        let cur_secs = compute_coalesced_overlap_seconds(events, cur_start_utc, cur_end_utc) as f32;
         if let Some(last) = cache.bin_seconds.last_mut() {
             *last = cur_secs;
         }
@@ -1600,9 +1648,7 @@ impl Engine {
             let b_start_utc = b_start.with_timezone(&Utc);
             let b_end_utc = b_end.with_timezone(&Utc);
 
-            for ev in &events {
-                bin_seconds[i] += event_overlap_seconds(ev, b_start_utc, b_end_utc) as f32;
-            }
+            bin_seconds[i] = compute_coalesced_overlap_seconds(&events, b_start_utc, b_end_utc) as f32;
         }
 
         self.stats_cache = Some(StatsHudCache {
@@ -1771,7 +1817,7 @@ pub fn calculate_continuous_session_for_rule(
     let reset_gap_sec = reset_gap_secs as i64;
     let min_allowed_utc = last_break_completed_at.map(|dt| dt.with_timezone(&Utc));
 
-    let mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
+    let intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
         .iter()
         .filter(|ev| event_matches_rule(ev, rule, compiled_re))
         .filter_map(|ev| {
@@ -1789,25 +1835,9 @@ pub fn calculate_continuous_session_for_rule(
         })
         .collect();
 
-    if intervals.is_empty() {
+    let merged = merge_overlapping_intervals(intervals);
+    if merged.is_empty() {
         return 0;
-    }
-
-    intervals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::with_capacity(intervals.len());
-    for (start, end) in intervals {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                if end > last.1 {
-                    last.1 = end;
-                }
-            } else {
-                merged.push((start, end));
-            }
-        } else {
-            merged.push((start, end));
-        }
     }
 
     let last_end = merged.last().unwrap().1;
@@ -1840,12 +1870,29 @@ pub fn calculate_usage_for_rule(
     start_of_day_utc: DateTime<Utc>,
     now_utc: DateTime<Utc>,
 ) -> u32 {
-    let total_seconds: f64 = events
+    let intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
         .iter()
         .filter(|ev| event_matches_rule(ev, rule, compiled_regex))
-        .map(|ev| event_overlap_seconds(ev, start_of_day_utc, now_utc))
+        .filter_map(|ev| {
+            let e_start = ev.timestamp;
+            let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+            let start = e_start.max(start_of_day_utc);
+            let end = e_end.min(now_utc);
+            if end > start {
+                Some((start, end))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let merged = merge_overlapping_intervals(intervals);
+    let total_secs: f64 = merged
+        .iter()
+        .map(|(s, e)| (*e - *s).num_milliseconds() as f64 / 1000.0)
         .sum();
-    total_seconds.round() as u32
+
+    total_secs.round() as u32
 }
 
 #[cfg(test)]
@@ -2399,5 +2446,27 @@ mod tests {
     fn test_close_target_windows_empty_targets_returns_zero() {
         let closed = enforcer::close_target_windows::<&str>(&[], None);
         assert_eq!(closed, 0);
+    }
+
+    #[test]
+    fn test_calculate_usage_coalesces_overlapping_events() {
+        let base_time = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let start_of_day = base_time - Duration::hours(4);
+        let now_utc = base_time + Duration::hours(2);
+
+        let mut rule = Rule::default_template(0);
+        rule.target_executables = vec!["code.exe".to_string()];
+
+        // Two overlapping 30-minute events (12:00..12:30 and 12:10..12:40)
+        let ev1 = make_event(base_time, 1800.0, "code.exe", "Project A", "");
+        let ev2 = make_event(base_time + Duration::minutes(10), 1800.0, "code.exe", "Project B", "");
+
+        let usage = calculate_usage_for_rule(&[ev1.clone(), ev2], &rule, None, start_of_day, now_utc);
+        assert_eq!(usage, 2400); // 40 minutes = 2400s (not 3600s)
+
+        // Two identical 30-minute events (12:00..12:30)
+        let ev3 = make_event(base_time, 1800.0, "code.exe", "Project A (Window 2)", "");
+        let usage_identical = calculate_usage_for_rule(&[ev1, ev3], &rule, None, start_of_day, now_utc);
+        assert_eq!(usage_identical, 1800); // exactly 30 minutes (1800s), not 3600s
     }
 }
