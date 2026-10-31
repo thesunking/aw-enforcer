@@ -91,14 +91,13 @@ pub enum OverlayMode {
 
 impl OverlayMode {
     /// Returns the display priority of this overlay mode so lower-priority alerts cannot clobber active enforcement overlays.
-    #[allow(dead_code)]
     pub fn priority(&self) -> u8 {
         match self {
             OverlayMode::Hidden => 0,
             OverlayMode::HudStatus { .. } => 1,
             OverlayMode::HudToast { .. } => 2,
-            OverlayMode::BreakEnforcer { .. } => 3,
-            OverlayMode::HudTimer { .. } => 4,
+            OverlayMode::HudTimer { .. } => 3,
+            OverlayMode::BreakEnforcer { .. } => 4,
         }
     }
 }

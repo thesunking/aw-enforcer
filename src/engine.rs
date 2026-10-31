@@ -104,7 +104,6 @@ pub enum DaemonCommand {
 
 /// Actions dispatched from the engine to the Slint UI thread.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum OverlayAction {
     Show(OverlayMode),
     UpdateCountdown {
@@ -293,24 +292,42 @@ impl Engine {
     pub async fn handle_command(&mut self, cmd: DaemonCommand) {
         match cmd {
             DaemonCommand::SnoozeBreak { rule_id, minutes } => {
+                if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
+                    if rule.action == RuleAction::ShowOverlay && rule.strict_mode {
+                        tracing::warn!("SnoozeBreak ignored: strict break active for rule {}", rule_id);
+                        return;
+                    }
+                }
                 let now = Local::now();
                 let until = now + Duration::minutes(minutes as i64);
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.snooze(until);
                 }
-                self.hide_overlay();
+                if !self.any_countdown_active() {
+                    self.hide_overlay();
+                }
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.warned_current_cycle = true;
                 }
-                self.hide_overlay();
+                if !self.any_countdown_active() {
+                    self.hide_overlay();
+                }
             }
             DaemonCommand::SkipBreak { rule_id } => {
+                if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
+                    if rule.action == RuleAction::ShowOverlay && rule.strict_mode {
+                        tracing::warn!("SkipBreak ignored: strict break active for rule {}", rule_id);
+                        return;
+                    }
+                }
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.complete_cycle(Local::now());
                 }
-                self.hide_overlay();
+                if !self.any_countdown_active() {
+                    self.hide_overlay();
+                }
             }
             DaemonCommand::DismissBreakOverlay => {
                 if self.is_strict_lock_active(Local::now()) {
@@ -358,6 +375,10 @@ impl Engine {
                 self.display_stats_overlay(false).await;
             }
             DaemonCommand::CloseOverlay => {
+                if self.is_strict_lock_active(Local::now()) {
+                    tracing::warn!("CloseOverlay ignored: strict enforcement active");
+                    return;
+                }
                 self.hide_overlay();
             }
             DaemonCommand::ReloadConfig(new_cfg) => {
@@ -386,6 +407,10 @@ impl Engine {
                     .ok();
             }
             DaemonCommand::TriggerTestOverlay { mode } => {
+                if self.is_strict_lock_active(Local::now()) {
+                    tracing::warn!("TriggerTestOverlay ignored: strict enforcement active");
+                    return;
+                }
                 self.trigger_test_overlay(&mode).await;
             }
         }
@@ -1694,7 +1719,7 @@ mod tests {
         let rule_id = cfg.rules[0].id.clone();
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
-        // 1. Higher-priority BreakEnforcer (3) is not overwritten by HudToast (2)
+        // 1. Higher-priority BreakEnforcer (4) is not overwritten by HudToast (2) or HudTimer (3)
         engine.show_overlay(OverlayMode::BreakEnforcer {
             rule_id: rule_id.clone(),
             title: "Break".into(),
@@ -1715,7 +1740,16 @@ mod tests {
         });
         assert!(matches!(engine.active_overlay_mode, OverlayMode::BreakEnforcer { .. }));
 
-        // 2. Strict lock active blocks DismissBreakOverlay, SnoozeAll, and SetPauseAll
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "timer".into(),
+            title: "Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 10,
+            remaining_seconds: 10,
+        });
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::BreakEnforcer { .. }));
+
+        // 2. Strict lock active blocks DismissBreakOverlay, SnoozeAll, SetPauseAll, and TriggerTestOverlay
         if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
             rt.active_break = Some((60, 60));
         }
@@ -1728,6 +1762,9 @@ mod tests {
 
         engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
         assert!(!engine.config.general.pause_all_rules);
+
+        engine.handle_command(DaemonCommand::TriggerTestOverlay { mode: "hud_toast".to_string() }).await;
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::BreakEnforcer { .. }));
 
         // 3. Once strict break finishes, SetPauseAll pauses all rules
         if let Some(rt) = engine.runtimes.get_mut(&rule_id) {

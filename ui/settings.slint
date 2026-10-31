@@ -626,6 +626,7 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 text: "Pause all rule alerts and enforcement indefinitely";
                                 checked <=> root.pause-all-rules;
+                                enabled: !root.ui-locked-by-strict;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -721,10 +722,10 @@ export component SettingsWindow inherits Window {
                         FormRow {
                             label: "Test Overlays:";
                             label-width: 220px;
-                            Button { text: "Test Break Screen"; clicked => { root.test-overlay("break"); } }
-                            Button { text: "Test HUD Toast"; clicked => { root.test-overlay("hud_toast"); } }
-                            Button { text: "Test HUD Timer"; clicked => { root.test-overlay("hud_timer"); } }
-                            Button { text: "Test 24h Stats HUD"; clicked => { root.test-overlay("hud_status"); } }
+                            Button { text: "Test Break Screen"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("break"); } }
+                            Button { text: "Test HUD Toast"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_toast"); } }
+                            Button { text: "Test HUD Timer"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_timer"); } }
+                            Button { text: "Test 24h Stats HUD"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_status"); } }
                         }
                     }
 
