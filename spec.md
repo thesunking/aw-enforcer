@@ -21,6 +21,7 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - **Logical Day-Start Hour Offset (`day_start_hour`, default `4` = `04:00 AM`):** Prevents midnight rollover from resetting daily quotas during late-night sessions.
    - **1.5s Natural Break Delay & Visual Idle Feedback:** Waits for a 1.5s pause in user input before launching a full-screen `Show Overlay` break (when `grace_duration == 0`), and displays `"⏸ Input detected — timer paused until you step away"` when mouse/keyboard activity occurs during a break.
    - **Fullscreen / Presentation DND (`SHQueryUserNotificationState`):** Automatically downgrades `Show Overlay` breaks to passive Windows notifications during fullscreen D3D games, presentations, or Focus Assist.
+   - **Pause All Rules Indefinitely (`pause_all_rules`):** Synchronized between the General Settings checkbox and the system tray menu item (`"Pause All Rules"` / `"Resume All Rules"`), pausing all rule alerts and enforcement until resumed.
    - **Strict Mode Lockout with 15-Second Confirmation Delay:** Available when `Action == "Show Overlay"`; hides Skip/Snooze buttons on the overlay, disables tray bypass items, and locks rule/settings edits behind a 15-second confirmation timer while actively enforcing.
 
 ---
@@ -159,6 +160,7 @@ autostart = true
 api_key = ""
 day_start_hour = 4
 suppress_fullscreen_d3d = true
+pause_all_rules = false
 
 [overlay]
 opacity = 0.90

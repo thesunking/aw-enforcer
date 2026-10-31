@@ -29,6 +29,7 @@
   - **Idle-Aware Break Timer:** Full-screen breaks wait for a natural 1.5-second pause in typing/mouse movement before appearing and pause their countdown (`⏸ Input detected — timer paused until you step away`) whenever physical input is detected.
   - **Fullscreen / D3D Presentation Suppression:** Optionally detects fullscreen Direct3D games, presentations, or Windows Focus Assist (`SHQueryUserNotificationState`) and downgrades intrusive overlays to passive notifications.
   - **Strict Mode & 15-Second Lockout Delay:** When enabled on a `Show Overlay` rule, hides Skip/Snooze buttons on the break screen, disables system tray bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
+  - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
 
 - **Rich Message Editor & Live Preview:**
@@ -93,6 +94,7 @@ autostart = true
 api_key = ""
 day_start_hour = 4
 suppress_fullscreen_d3d = true
+pause_all_rules = false
 
 [overlay]
 opacity = 0.90

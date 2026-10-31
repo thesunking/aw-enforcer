@@ -146,6 +146,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> api-key: "";
     in-out property <int> day-start-hour: 4;
     in-out property <bool> suppress-fullscreen-d3d: true;
+    in-out property <bool> pause-all-rules: false;
     in-out property <bool> strict-lock-active: false;
     in-out property <bool> strict-unlocked: false;
     in-out property <int> strict-unlock-countdown: 0;
@@ -536,6 +537,16 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 text: "Downgrade breaks during fullscreen apps & presentations";
                                 checked <=> root.suppress-fullscreen-d3d;
+                                toggled => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Pause All Rules:";
+                            label-width: 220px;
+                            CheckBox {
+                                text: "Pause all rule alerts and enforcement indefinitely";
+                                checked <=> root.pause-all-rules;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }

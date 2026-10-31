@@ -70,6 +70,7 @@ pub enum DaemonCommand {
     SkipBreak { rule_id: String },
     DismissBreakOverlay,
     SnoozeAll { minutes: u32 },
+    SetPauseAll { paused: bool },
     ShowStatsOverlay,
     CloseOverlay,
     TriggerTestOverlay { mode: String },
@@ -303,6 +304,23 @@ impl Engine {
                 }
                 self.hide_overlay();
             }
+            DaemonCommand::SetPauseAll { paused } => {
+                if paused && self.is_strict_lock_active(Local::now()) {
+                    tracing::warn!("SetPauseAll ignored: strict enforcement active");
+                    return;
+                }
+                self.config.general.pause_all_rules = paused;
+                if paused {
+                    for rt in self.runtimes.values_mut() {
+                        rt.current_streak_seconds = 0;
+                        rt.active_break = None;
+                        rt.grace_countdown = None;
+                        rt.warned_current_cycle = false;
+                        rt.pending_break_since = None;
+                    }
+                    self.hide_overlay();
+                }
+            }
             DaemonCommand::ShowStatsOverlay => {
                 self.display_stats_overlay(false).await;
             }
@@ -311,6 +329,7 @@ impl Engine {
             }
             DaemonCommand::ReloadConfig(new_cfg) => {
                 tracing::info!("Engine: Reloading configuration ({} rules)", new_cfg.rules.len());
+                let paused = new_cfg.general.pause_all_rules;
                 self.config = *new_cfg;
                 self.aw_client = Arc::new(AwClient::new(
                     self.config.general.aw_port,
@@ -322,6 +341,16 @@ impl Engine {
                         .entry(rule.id.clone())
                         .and_modify(|rt| rt.update_from_rule(rule))
                         .or_insert_with(|| RuleRuntime::from_rule(rule));
+                }
+                if paused {
+                    for rt in self.runtimes.values_mut() {
+                        rt.current_streak_seconds = 0;
+                        rt.active_break = None;
+                        rt.grace_countdown = None;
+                        rt.warned_current_cycle = false;
+                        rt.pending_break_since = None;
+                    }
+                    self.hide_overlay();
                 }
                 self.overlay_tx
                     .send(OverlayAction::UpdateTheme(self.config.overlay.clone()))
@@ -588,31 +617,37 @@ impl Engine {
             Vec::new()
         };
 
-        // 4. Evaluate Unified Rules
-        for rule in self.config.rules.clone() {
-            if !rule.enabled || !rule.schedule.is_active(day_index, hour_index) {
-                if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.current_streak_seconds = 0;
-                }
-                continue;
+        // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely)
+        if self.config.general.pause_all_rules {
+            for rt in self.runtimes.values_mut() {
+                rt.current_streak_seconds = 0;
             }
+        } else {
+            for rule in self.config.rules.clone() {
+                if !rule.enabled || !rule.schedule.is_active(day_index, hour_index) {
+                    if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                        rt.current_streak_seconds = 0;
+                    }
+                    continue;
+                }
 
-            let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
-                &web_events
-            } else {
-                &all_events
-            };
+                let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
+                    &web_events
+                } else {
+                    &all_events
+                };
 
-            let compiled_re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
-            self.evaluate_rule(
-                &rule,
-                compiled_re.as_ref(),
-                now,
-                events_for_rule,
-                start_of_day_utc,
-                now_utc,
-            )
-            .await;
+                let compiled_re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
+                self.evaluate_rule(
+                    &rule,
+                    compiled_re.as_ref(),
+                    now,
+                    events_for_rule,
+                    start_of_day_utc,
+                    now_utc,
+                )
+                .await;
+            }
         }
 
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
@@ -640,6 +675,8 @@ impl Engine {
             };
             let badge = if !rule.enabled {
                 "Disabled".to_string()
+            } else if self.config.general.pause_all_rules {
+                "Paused".to_string()
             } else if !rule.schedule.is_active(day_index, hour_index) {
                 "Off-schedule".to_string()
             } else if rt.snoozed_until.map(|u| u > now).unwrap_or(false) {
@@ -674,12 +711,20 @@ impl Engine {
         }
 
         let strict_lock_active = self.is_strict_lock_active(now);
-        let tray_tooltip = format!(
-            "AW-Enforcer — Today: {}h {}m | Streak: {}m",
-            total_today_mins / 60,
-            total_today_mins % 60,
-            max_streak_secs / 60
-        );
+        let tray_tooltip = if self.config.general.pause_all_rules {
+            format!(
+                "AW-Enforcer (Paused) — Today: {}h {}m",
+                total_today_mins / 60,
+                total_today_mins % 60
+            )
+        } else {
+            format!(
+                "AW-Enforcer — Today: {}h {}m | Streak: {}m",
+                total_today_mins / 60,
+                total_today_mins % 60,
+                max_streak_secs / 60
+            )
+        };
 
         self.overlay_tx
             .send(OverlayAction::UpdateLiveStatus {
@@ -1513,7 +1558,7 @@ mod tests {
         });
         assert!(matches!(engine.active_overlay_mode, OverlayMode::BreakEnforcer { .. }));
 
-        // 2. Strict lock active blocks DismissBreakOverlay and SnoozeAll
+        // 2. Strict lock active blocks DismissBreakOverlay, SnoozeAll, and SetPauseAll
         if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
             rt.active_break = Some((60, 60));
         }
@@ -1523,6 +1568,16 @@ mod tests {
 
         engine.handle_command(DaemonCommand::SnoozeAll { minutes: 15 }).await;
         assert!(engine.global_snoozed_until.is_none());
+
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+        assert!(!engine.config.general.pause_all_rules);
+
+        // 3. Once strict break finishes, SetPauseAll pauses all rules
+        if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
+            rt.active_break = None;
+        }
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+        assert!(engine.config.general.pause_all_rules);
     }
 
     /// Verifies `SnoozeBreak`, `SkipBreak`, and `DismissBreakOverlay` state transitions on `RuleRuntime`.

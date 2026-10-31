@@ -427,6 +427,8 @@ pub struct GeneralConfig {
     pub day_start_hour: u32,
     #[serde(default = "default_true")]
     pub suppress_fullscreen_d3d: bool,
+    #[serde(default)]
+    pub pause_all_rules: bool,
 }
 
 impl Default for GeneralConfig {
@@ -438,6 +440,7 @@ impl Default for GeneralConfig {
             api_key: String::new(),
             day_start_hour: 4,
             suppress_fullscreen_d3d: true,
+            pause_all_rules: false,
         }
     }
 }

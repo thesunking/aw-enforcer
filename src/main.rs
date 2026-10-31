@@ -290,6 +290,7 @@ fn apply_config_to_ui(
     win.set_api_key(cfg.general.api_key.as_str().into());
     win.set_day_start_hour(cfg.general.day_start_hour as i32);
     win.set_suppress_fullscreen_d3d(cfg.general.suppress_fullscreen_d3d);
+    win.set_pause_all_rules(cfg.general.pause_all_rules);
     win.set_overlay_opacity(cfg.overlay.opacity);
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
@@ -515,6 +516,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
     let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
     let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
+    let initial_pause_label = if config.general.pause_all_rules {
+        "Resume All Rules"
+    } else {
+        "Pause All Rules"
+    };
+    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
     let item_quit = MenuItem::with_id("quit", "Quit", true, None);
 
     let tray_menu = Menu::new();
@@ -522,6 +529,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tray_menu.append(&item_stats)?;
     tray_menu.append(&item_dismiss)?;
     tray_menu.append(&item_snooze)?;
+    tray_menu.append(&item_pause)?;
     tray_menu.append(&PredefinedMenuItem::separator())?;
     tray_menu.append(&item_quit)?;
 
@@ -541,6 +549,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cmd_tx = command_tx.clone();
         let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
+        let item_pause = item_pause.clone();
 
         settings_win.on_save_config(move || {
             if let Some(win) = sw.upgrade() {
@@ -553,6 +562,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 updated_config.general.api_key = win.get_api_key().to_string();
                 updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
                 updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
+                updated_config.general.pause_all_rules = win.get_pause_all_rules();
+                item_pause.set_text(if updated_config.general.pause_all_rules {
+                    "Resume All Rules"
+                } else {
+                    "Pause All Rules"
+                });
 
                 updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
                 updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
@@ -945,11 +960,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let overlay_mgr = overlay_manager.clone();
         let sw = settings_weak.clone();
         let cmd_tx = command_tx.clone();
+        let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
         let handle = rt_handle.clone();
         let tray_icon_ref = tray_icon_cell.clone();
         let item_dismiss = item_dismiss.clone();
         let item_snooze = item_snooze.clone();
+        let item_pause = item_pause.clone();
         let rules_model_ref = rules_model.clone();
 
         let mut conn_check_counter = 0u32;
@@ -995,6 +1012,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             item_dismiss.set_enabled(!strict_lock_active);
                             item_snooze.set_enabled(!strict_lock_active);
+                            item_pause.set_enabled(!strict_lock_active);
 
                             for (rule_id, status_text) in rule_statuses {
                                 for idx in 0..rules_model_ref.row_count() {
@@ -1051,6 +1069,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         "snooze_15m" => {
                             cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
+                        }
+                        "toggle_pause_all" => {
+                            let is_locked = sw
+                                .upgrade()
+                                .map(|w| w.get_strict_lock_active())
+                                .unwrap_or(false);
+                            if is_locked {
+                                continue;
+                            }
+                            let new_paused = {
+                                let mut cfg = cfg_cell.borrow_mut();
+                                cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
+                                if let Err(e) = cfg.save() {
+                                    tracing::error!("Failed to save config on pause toggle: {e}");
+                                }
+                                cfg.general.pause_all_rules
+                            };
+                            item_pause.set_text(if new_paused {
+                                "Resume All Rules"
+                            } else {
+                                "Pause All Rules"
+                            });
+                            if let Some(win) = sw.upgrade() {
+                                win.set_pause_all_rules(new_paused);
+                            }
+                            cmd_tx
+                                .send(DaemonCommand::SetPauseAll { paused: new_paused })
+                                .ok();
                         }
                         "quit" => {
                             slint::quit_event_loop().ok();
