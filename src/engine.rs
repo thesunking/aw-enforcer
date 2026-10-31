@@ -61,6 +61,32 @@ pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<
         .unwrap_or(now)
 }
 
+/// Aligns a timestamp down to the start of its current statistics histogram bin.
+fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
+    let current_minute = now.minute();
+    let bin_size = bin_size_mins.max(1);
+    let aligned_minute = if bin_size >= 60 {
+        0
+    } else {
+        (current_minute / (bin_size as u32)) * (bin_size as u32)
+    };
+
+    now.with_minute(aligned_minute)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now)
+}
+
+/// Cached 24-hour histogram bins used to live-update `OverlayMode::HudStatus` on each `poll_tick`
+/// without re-querying historical ActivityWatch bins.
+#[derive(Debug, Clone)]
+struct StatsHudCache {
+    current_bin_start: DateTime<Local>,
+    bin_size_mins: i64,
+    bin_seconds: Vec<f32>,
+    click_through: bool,
+}
+
 /// Commands sent from the UI/Tray thread to the background daemon engine.
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
@@ -158,6 +184,7 @@ pub struct Engine {
     last_reset_date: NaiveDate,
     overlay_tx: mpsc::UnboundedSender<OverlayAction>,
     active_overlay_mode: OverlayMode,
+    stats_cache: Option<StatsHudCache>,
 }
 
 impl Engine {
@@ -183,6 +210,7 @@ impl Engine {
             last_reset_date,
             overlay_tx,
             active_overlay_mode: OverlayMode::Hidden,
+            stats_cache: None,
         }
     }
 
@@ -199,6 +227,9 @@ impl Engine {
             && !matches!(self.active_overlay_mode, OverlayMode::Hidden)
         {
             return;
+        }
+        if !matches!(mode, OverlayMode::HudStatus { .. }) {
+            self.stats_cache = None;
         }
         self.active_overlay_mode = mode.clone();
         self.overlay_tx.send(OverlayAction::Show(mode)).ok();
@@ -365,6 +396,7 @@ impl Engine {
     /// Hides any active overlay and resets `active_overlay_mode` to `OverlayMode::Hidden`.
     fn hide_overlay(&mut self) {
         self.active_overlay_mode = OverlayMode::Hidden;
+        self.stats_cache = None;
         self.overlay_tx.send(OverlayAction::Hide).ok();
     }
 
@@ -571,36 +603,43 @@ impl Engine {
             }
         }
 
-        // 2. Global snooze check
+        // 2. Global snooze expiration check
         if let Some(until) = self.global_snoozed_until {
-            if now < until {
-                return;
-            } else {
+            if now >= until {
                 self.global_snoozed_until = None;
             }
         }
+        let is_globally_snoozed = self.global_snoozed_until.is_some();
 
         let day_index = now.weekday().num_days_from_monday() as usize;
         let hour_index = now.hour() as usize;
 
-        // 3. Compute earliest required lookback across all enabled active rules
+        // 3. Compute earliest required lookback across all enabled active rules (and open Stats HUD)
         let start_of_day_utc = logical_day_start(now, self.config.general.day_start_hour).with_timezone(&Utc);
         let now_utc = now.with_timezone(&Utc);
 
         let mut min_start_utc = start_of_day_utc;
+        if let Some(ref cache) = self.stats_cache {
+            if matches!(self.active_overlay_mode, OverlayMode::HudStatus { is_loading: false, .. }) {
+                min_start_utc = min_start_utc.min(cache.current_bin_start.with_timezone(&Utc));
+            }
+        }
+
         let mut has_url_rules = false;
 
-        for rule in &self.config.rules {
-            if rule.enabled && rule.schedule.is_active(day_index, hour_index) {
-                if rule.monitor_selection == MonitorSelection::Urls {
-                    has_url_rules = true;
-                }
-                if rule.trigger == TriggerType::Period {
-                    let reset_gap_secs = rule.reset_after_afk.to_seconds().max(1);
-                    let period_secs = rule.period.to_seconds().max(1);
-                    let lookback_secs = (period_secs + reset_gap_secs + 3600) as i64;
-                    let rule_start_utc = (now - Duration::seconds(lookback_secs)).with_timezone(&Utc);
-                    min_start_utc = min_start_utc.min(rule_start_utc);
+        if !self.config.general.pause_all_rules && !is_globally_snoozed {
+            for rule in &self.config.rules {
+                if rule.enabled && rule.schedule.is_active(day_index, hour_index) {
+                    if rule.monitor_selection == MonitorSelection::Urls {
+                        has_url_rules = true;
+                    }
+                    if rule.trigger == TriggerType::Period {
+                        let reset_gap_secs = rule.reset_after_afk.to_seconds().max(1);
+                        let period_secs = rule.period.to_seconds().max(1);
+                        let lookback_secs = (period_secs + reset_gap_secs + 3600) as i64;
+                        let rule_start_utc = (now - Duration::seconds(lookback_secs)).with_timezone(&Utc);
+                        min_start_utc = min_start_utc.min(rule_start_utc);
+                    }
                 }
             }
         }
@@ -617,8 +656,8 @@ impl Engine {
             Vec::new()
         };
 
-        // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely)
-        if self.config.general.pause_all_rules {
+        // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
+        if self.config.general.pause_all_rules || is_globally_snoozed {
             for rt in self.runtimes.values_mut() {
                 rt.current_streak_seconds = 0;
             }
@@ -736,6 +775,9 @@ impl Engine {
                 tray_tooltip,
             })
             .ok();
+
+        // 6. Live-refresh the 24-Hour Statistics HUD if currently open (reusing all_events without extra AW queries)
+        self.refresh_stats_overlay_from_events(now, &all_events);
     }
 
     /// Builds a `MessageContext` populated with formatted streak, usage, limit, and remaining durations for a rule.
@@ -1119,6 +1161,121 @@ impl Engine {
         }
     }
 
+    /// Builds an `OverlayMode::HudStatus` from the current `stats_cache` without showing the loading spinner.
+    fn build_hud_status_from_cache(&self) -> Option<OverlayMode> {
+        let cache = self.stats_cache.as_ref()?;
+        let bin_count = cache.bin_seconds.len().max(1);
+        let bin_size_mins = cache.bin_size_mins.max(1);
+        let start_time =
+            cache.current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+        let time_fmt = &self.config.stats.histogram_time_format;
+
+        let mut bin_labels = Vec::with_capacity(bin_count);
+        for i in 0..bin_count {
+            let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
+            let label = if i % 4 == 0 || i == bin_count - 1 {
+                b_start.format(time_fmt).to_string()
+            } else {
+                String::new()
+            };
+            bin_labels.push(label);
+        }
+
+        let max_bin_capacity = (bin_size_mins * 60) as f32;
+        let bin_values: Vec<f32> = cache
+            .bin_seconds
+            .iter()
+            .map(|&s| (s / max_bin_capacity).clamp(0.0, 1.0))
+            .collect();
+
+        let total_active_seconds: f32 = cache.bin_seconds.iter().sum();
+        let total_active_minutes = (total_active_seconds / 60.0).round() as u32;
+
+        let status_level = if total_active_minutes
+            <= self.config.stats.daily_screentime_target_minutes
+        {
+            "Great"
+        } else if total_active_minutes <= self.config.stats.threshold_excessive_minutes {
+            "Okay"
+        } else {
+            "Excessive"
+        };
+
+        Some(OverlayMode::HudStatus {
+            title: "24-Hour Screen Time Summary".into(),
+            status_level: status_level.into(),
+            total_active_minutes,
+            target_minutes: self.config.stats.daily_screentime_target_minutes,
+            bin_values,
+            bin_labels,
+            is_loading: false,
+            click_through: cache.click_through,
+        })
+    }
+
+    /// Incrementally updates the open 24-Hour Statistics HUD using the `events` already fetched by `poll_tick`.
+    fn refresh_stats_overlay_from_events(&mut self, now: DateTime<Local>, events: &[AwEvent]) {
+        if !matches!(
+            self.active_overlay_mode,
+            OverlayMode::HudStatus {
+                is_loading: false,
+                ..
+            }
+        ) {
+            return;
+        }
+
+        let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
+        let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
+        let new_bin_start = align_stats_bin_start(now, bin_size_mins);
+
+        let Some(ref mut cache) = self.stats_cache else {
+            return;
+        };
+
+        if cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins {
+            cache.bin_seconds.resize(bin_count, 0.0);
+            cache.bin_size_mins = bin_size_mins;
+            cache.current_bin_start = new_bin_start;
+        } else if new_bin_start > cache.current_bin_start {
+            // Finalize the previous active bin before shifting
+            let prev_start_utc = cache.current_bin_start.with_timezone(&Utc);
+            let prev_end_utc =
+                (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
+            let mut prev_secs = 0.0f32;
+            for ev in events {
+                prev_secs += event_overlap_seconds(ev, prev_start_utc, prev_end_utc) as f32;
+            }
+            if let Some(last) = cache.bin_seconds.last_mut() {
+                *last = prev_secs;
+            }
+
+            let elapsed_bins =
+                ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0)
+                    as usize;
+            let shift = elapsed_bins.min(bin_count);
+            cache.bin_seconds.drain(0..shift);
+            cache.bin_seconds.resize(bin_count, 0.0);
+            cache.current_bin_start = new_bin_start;
+        }
+
+        // Recompute only the current (latest) bin from poll_tick's events
+        let cur_start_utc = cache.current_bin_start.with_timezone(&Utc);
+        let cur_end_utc =
+            (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
+        let mut cur_secs = 0.0f32;
+        for ev in events {
+            cur_secs += event_overlap_seconds(ev, cur_start_utc, cur_end_utc) as f32;
+        }
+        if let Some(last) = cache.bin_seconds.last_mut() {
+            *last = cur_secs;
+        }
+
+        if let Some(mode) = self.build_hud_status_from_cache() {
+            self.show_overlay(mode);
+        }
+    }
+
     /// Prepares and displays the 24-hour activity status overlay.
     pub async fn display_stats_overlay(&mut self, click_through: bool) {
         // Immediately pop up the HUD window in loading state so the user gets instant feedback
@@ -1137,25 +1294,11 @@ impl Engine {
         let now = Local::now();
         let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
         let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
+        let current_bin_start = align_stats_bin_start(now, bin_size_mins);
 
-        // Align bins to the start of the current hour
-        let current_minute = now.minute();
-        let bin_size = bin_size_mins.max(1);
-        let aligned_minute = if bin_size >= 60 {
-            0
-        } else {
-            (current_minute / (bin_size as u32)) * (bin_size as u32)
-        };
-
-        let current_bin_start = now
-            .with_minute(aligned_minute)
-            .and_then(|t| t.with_second(0))
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(now);
-
-        let start_time = current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size);
+        let start_time = current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
         let start_utc = start_time.with_timezone(&Utc);
-        let end_utc = (current_bin_start + Duration::minutes(bin_size)).with_timezone(&Utc);
+        let end_utc = (current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
 
         let events = self
             .aw_client
@@ -1169,19 +1312,10 @@ impl Engine {
         }
 
         let mut bin_seconds = vec![0.0f32; bin_count];
-        let mut bin_labels = Vec::with_capacity(bin_count);
-        let time_fmt = &self.config.stats.histogram_time_format;
 
         for i in 0..bin_count {
             let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
             let b_end = b_start + Duration::minutes(bin_size_mins);
-
-            let label = if i % 4 == 0 || i == bin_count - 1 {
-                b_start.format(time_fmt).to_string()
-            } else {
-                String::new()
-            };
-            bin_labels.push(label);
 
             let b_start_utc = b_start.with_timezone(&Utc);
             let b_end_utc = b_end.with_timezone(&Utc);
@@ -1191,37 +1325,16 @@ impl Engine {
             }
         }
 
-        let max_bin_capacity = (bin_size_mins * 60) as f32;
-        let bin_values: Vec<f32> = bin_seconds
-            .iter()
-            .map(|&s| (s / max_bin_capacity).clamp(0.0, 1.0))
-            .collect();
-
-        let total_active_seconds: f32 = bin_seconds.iter().sum();
-        let total_active_minutes = (total_active_seconds / 60.0).round() as u32;
-
-        let status_level = if total_active_minutes
-            <= self.config.stats.daily_screentime_target_minutes
-        {
-            "Great"
-        } else if total_active_minutes <= self.config.stats.threshold_excessive_minutes {
-            "Okay"
-        } else {
-            "Excessive"
-        };
-
-        let mode = OverlayMode::HudStatus {
-            title: "24-Hour Screen Time Summary".into(),
-            status_level: status_level.into(),
-            total_active_minutes,
-            target_minutes: self.config.stats.daily_screentime_target_minutes,
-            bin_values,
-            bin_labels,
-            is_loading: false,
+        self.stats_cache = Some(StatsHudCache {
+            current_bin_start,
+            bin_size_mins,
+            bin_seconds,
             click_through,
-        };
+        });
 
-        self.show_overlay(mode);
+        if let Some(mode) = self.build_hud_status_from_cache() {
+            self.show_overlay(mode);
+        }
     }
 
     /// Triggers a test overlay for UI verification using Option 3 structured paragraph syntax.
@@ -1626,5 +1739,63 @@ mod tests {
         let rt3 = engine.runtimes.get(&rule_id).unwrap();
         assert!(rt3.action_executed_today);
         assert!(rt3.active_break.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_live_stats_hud_refresh_and_bin_rollover() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let cfg = AppConfig::default();
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let bin_start = Local.with_ymd_and_hms(2026, 10, 30, 14, 0, 0).unwrap();
+        let mut bin_seconds = vec![0.0f32; 24];
+        bin_seconds[22] = 1200.0; // 13:00-14:00 had 20 mins
+        bin_seconds[23] = 300.0;  // 14:00-15:00 initially had 5 mins
+
+        engine.stats_cache = Some(StatsHudCache {
+            current_bin_start: bin_start,
+            bin_size_mins: 60,
+            bin_seconds,
+            click_through: false,
+        });
+        let initial_mode = engine.build_hud_status_from_cache().unwrap();
+        engine.show_overlay(initial_mode);
+        let _ = overlay_rx.try_recv();
+
+        // 1. Same-bin live update at 14:15:00 with 600s of activity in 14:00..14:15
+        let now1 = Local.with_ymd_and_hms(2026, 10, 30, 14, 15, 0).unwrap();
+        let ev1 = vec![make_event(bin_start.with_timezone(&Utc), 600.0, "code.exe", "VS Code", "")];
+        engine.refresh_stats_overlay_from_events(now1, &ev1);
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
+                assert!(!is_loading);
+                assert_eq!(*total_active_minutes, 30); // 20m + 10m
+                assert!((bin_values[22] - (1200.0 / 3600.0)).abs() < 1e-4);
+                assert!((bin_values[23] - (600.0 / 3600.0)).abs() < 1e-4);
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
+
+        // 2. Rollover into next hour bin (15:05:00) with 1800s in 14:00..15:00 and 180s in 15:00..15:05
+        let next_bin_start = Local.with_ymd_and_hms(2026, 10, 30, 15, 0, 0).unwrap();
+        let now2 = Local.with_ymd_and_hms(2026, 10, 30, 15, 5, 0).unwrap();
+        let ev2 = vec![
+            make_event(bin_start.with_timezone(&Utc), 1800.0, "code.exe", "VS Code", ""),
+            make_event(next_bin_start.with_timezone(&Utc), 180.0, "code.exe", "VS Code", ""),
+        ];
+        engine.refresh_stats_overlay_from_events(now2, &ev2);
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
+                assert!(!is_loading);
+                assert_eq!(*total_active_minutes, 53); // 20m + 30m + 3m
+                assert!((bin_values[21] - (1200.0 / 3600.0)).abs() < 1e-4); // shifted left from index 22
+                assert!((bin_values[22] - (1800.0 / 3600.0)).abs() < 1e-4); // finalized 14:00-15:00 bin (1800s = 30m)
+                assert!((bin_values[23] - (180.0 / 3600.0)).abs() < 1e-4);  // new active 15:00-16:00 bin (180s = 3m)
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
     }
 }

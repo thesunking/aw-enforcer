@@ -309,7 +309,7 @@ For each enabled rule active in the current `(day_index, hour_index)` schedule s
    - Executes when `grace_countdown` reaches `0` (or immediately when `grace_duration == 0`):
      - **`Show Overlay`:** Launches full-screen `OverlayMode::BreakEnforcer` across all monitors for `break_duration` (with 1.5s natural idle pause if `grace_duration == 0`, fullscreen D3D downgrade to Windows toast if `suppress_fullscreen_d3d` is enabled, and amber pause banner when physical input is detected).
      - **`Show Notification`:** Dispatches either `OverlayMode::HudToast` (`NotificationMethod::Hud`) or a WinRT system toast (`NotificationMethod::Windows`) using the rule's formatted `message`. HUD notifications remain visible for `notification_duration` before auto-dismissing, and display an optional countdown timer in the header when `show_remaining_time` is enabled.
-     - **`Show Statistics`:** Opens the 24-Hour Screen Time Summary (`OverlayMode::HudStatus`).
+     - **`Show Statistics`:** Opens the 24-Hour Screen Time Summary (`OverlayMode::HudStatus`). Upon opening, the 24 hourly bins are fetched once and cached (`StatsHudCache`); while the HUD remains open, it live-updates on every `poll_tick` by recomputing only the active bin (and rolling bins forward across hour boundaries) from the already-fetched `poll_tick` events—without showing the `"Loading..."` spinner or making additional ActivityWatch HTTP requests.
      - **`Lock Workstation`:** Calls `enforcer::lock_workstation()`.
      - **`Close Tab`:** Sends `Ctrl+W` (`enforcer::close_active_browser_tab`) to the matching foreground window (falling back to `close_target_windows`).
      - **`Close Window`:** Posts `WM_CLOSE` (`enforcer::close_target_windows`) to matching visible non-minimized windows.

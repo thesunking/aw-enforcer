@@ -14,7 +14,7 @@
   - **7 Enforcement Actions:**
     - **`Show Overlay`:** Displays a full-screen break overlay across all connected monitors that counts down only while you are physically idle.
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card (with configurable duration, optional countdown timer, and snooze buttons) or a native `Windows` Action Center toast.
-    - **`Show Statistics`:** Opens the draggable 24-Hour Screen Time Summary HUD with an hourly activity histogram.
+    - **`Show Statistics`:** Opens the draggable 24-Hour Screen Time Summary HUD with an hourly activity histogram that live-updates on every poll tick while open without extra ActivityWatch requests.
     - **`Lock Workstation`:** Immediately locks the Windows session (`LockWorkStation`).
     - **`Close Tab`:** Sends `Ctrl+W` to close the active tab of the matching foreground window.
     - **`Close Window`:** Gracefully closes matching visible, non-minimized windows via `WM_CLOSE`.
