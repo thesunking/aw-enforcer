@@ -140,6 +140,7 @@ pub struct RuleRuntime {
     pub snoozed_until: Option<DateTime<Local>>,
     pub live_status_badge: String,
     pub last_matched_app: Option<String>,
+    pub last_matched_title: Option<String>,
 }
 
 impl RuleRuntime {
@@ -160,6 +161,7 @@ impl RuleRuntime {
             snoozed_until: None,
             live_status_badge: String::new(),
             last_matched_app: None,
+            last_matched_title: None,
         }
     }
 
@@ -181,6 +183,7 @@ impl RuleRuntime {
         self.can_rollback_completion = true;
         self.action_executed_today = true;
         self.last_matched_app = None;
+        self.last_matched_title = None;
     }
 
     /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
@@ -838,6 +841,7 @@ impl Engine {
                 rt.daily_usage_seconds = 0;
                 rt.can_rollback_completion = false;
                 rt.last_matched_app = None;
+                rt.last_matched_title = None;
             }
         }
 
@@ -1167,6 +1171,28 @@ impl Engine {
 
         if let Some(rt) = self.runtimes.get_mut(&rule.id) {
             rt.last_matched_app = Some(matched_app_name.clone());
+
+            let recency_cutoff = now_utc
+                - Duration::seconds(
+                    (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
+                );
+            let matching_ev = events
+                .iter()
+                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                .find(|ev| {
+                    let ev_end =
+                        ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                    ev_end >= recency_cutoff
+                })
+                .or_else(|| events.iter().rfind(|ev| event_matches_rule(ev, rule, compiled_re)));
+
+            if let Some(ev) = matching_ev {
+                if let Some(ref title) = ev.data.title {
+                    if !title.trim().is_empty() {
+                        rt.last_matched_title = Some(title.clone());
+                    }
+                }
+            }
         }
 
         let warn_secs = rule.warn_before.to_seconds();
@@ -1365,26 +1391,43 @@ impl Engine {
                 enforcer::lock_workstation();
             }
             RuleAction::CloseTab => {
+                let last_title = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|r| r.last_matched_title.clone());
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.complete_cycle(now);
                 }
-                let title_re = (rule.monitor_selection == MonitorSelection::Titles)
-                    .then_some(compiled_re)
-                    .flatten();
-                if rule.monitor_selection == MonitorSelection::Executables {
-                    enforcer::close_active_browser_tab(&rule.target_executables, title_re);
+                if rule.monitor_selection == MonitorSelection::Titles {
+                    enforcer::close_active_browser_tab::<&str>(&[], compiled_re);
+                } else if rule.monitor_selection == MonitorSelection::Urls {
+                    if let Some(ref title) = last_title {
+                        let title_re = Regex::new(&regex::escape(title)).ok();
+                        enforcer::close_active_browser_tab::<&str>(&[], title_re.as_ref());
+                    } else {
+                        enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, None);
+                    }
                 } else {
-                    enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re);
+                    enforcer::close_active_browser_tab(&rule.target_executables, None);
                 }
             }
             RuleAction::CloseWindow => {
+                let last_title = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|r| r.last_matched_title.clone());
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.complete_cycle(now);
                 }
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_target_windows::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
+                    if let Some(ref title) = last_title {
+                        let title_re = Regex::new(&regex::escape(title)).ok();
+                        enforcer::close_target_windows::<&str>(&[], title_re.as_ref());
+                    } else {
+                        enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
+                    }
                 } else {
                     enforcer::close_target_windows(&rule.target_executables, None);
                 }
@@ -2350,5 +2393,11 @@ mod tests {
             None
         );
         assert!(engine.runtimes.get("rule-grace").unwrap().action_executed_today);
+    }
+
+    #[test]
+    fn test_close_target_windows_empty_targets_returns_zero() {
+        let closed = enforcer::close_target_windows::<&str>(&[], None);
+        assert_eq!(closed, 0);
     }
 }

@@ -288,8 +288,7 @@ pub fn close_target_windows<S: AsRef<str>>(
     compiled_regex: Option<&Regex>,
 ) -> usize {
     let is_wildcard = compiled_regex.is_none()
-        && (target_executables.is_empty()
-            || target_executables.iter().any(|t| t.as_ref().trim() == "*"));
+        && target_executables.iter().any(|t| t.as_ref().trim() == "*");
     if is_wildcard {
         unsafe {
             let hwnd = GetForegroundWindow();
@@ -421,4 +420,16 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_close_target_windows_empty_targets_no_wildcard() {
+        // Must return 0 and not close foreground window
+        let closed = close_target_windows::<&str>(&[], None);
+        assert_eq!(closed, 0);
+    }
 }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Typed payload for ActivityWatch window, web, and afk events.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub struct AwClient {
     client: reqwest::Client,
     buckets_verified: Arc<AtomicBool>,
     has_web_bucket: Arc<AtomicBool>,
+    pub window_bucket_id: Arc<RwLock<Option<String>>>,
+    pub afk_bucket_id: Arc<RwLock<Option<String>>>,
+    pub web_bucket_ids: Arc<RwLock<Vec<String>>>,
 }
 
 impl AwClient {
@@ -57,6 +61,9 @@ impl AwClient {
             client,
             buckets_verified: Arc::new(AtomicBool::new(false)),
             has_web_bucket: Arc::new(AtomicBool::new(false)),
+            window_bucket_id: Arc::new(RwLock::new(None)),
+            afk_bucket_id: Arc::new(RwLock::new(None)),
+            web_bucket_ids: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -83,9 +90,23 @@ impl AwClient {
         };
 
         if let Ok(Value::Object(map)) = resp.json::<Value>().await {
-            let has_window = map.keys().any(|k| k.starts_with("aw-watcher-window_"));
-            let has_afk = map.keys().any(|k| k.starts_with("aw-watcher-afk_"));
-            let has_web = map.keys().any(|k| k.starts_with("aw-watcher-web"));
+            let window_bucket = map.keys().find(|k| k.starts_with("aw-watcher-window_")).cloned();
+            let afk_bucket = map.keys().find(|k| k.starts_with("aw-watcher-afk_")).cloned();
+            let mut web_buckets: Vec<String> = map
+                .keys()
+                .filter(|k| k.starts_with("aw-watcher-web"))
+                .cloned()
+                .collect();
+            web_buckets.sort();
+
+            let has_window = window_bucket.is_some();
+            let has_afk = afk_bucket.is_some();
+            let has_web = !web_buckets.is_empty();
+
+            *self.window_bucket_id.write().await = window_bucket;
+            *self.afk_bucket_id.write().await = afk_bucket;
+            *self.web_bucket_ids.write().await = web_buckets;
+
             self.has_web_bucket.store(has_web, Ordering::Relaxed);
             if !has_window || !has_afk {
                 tracing::warn!(
@@ -118,11 +139,23 @@ impl AwClient {
         let url = format!("{}/api/0/query/", self.base_url);
         let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
 
+        let window_bucket = self.window_bucket_id.read().await.clone();
+        let afk_bucket = self.afk_bucket_id.read().await.clone();
+
+        let window_line = match window_bucket {
+            Some(ref id) => format!("events = flood(query_bucket(\"{id}\"));"),
+            None => "events = flood(query_bucket(find_bucket(\"aw-watcher-window_\")));".to_string(),
+        };
+        let afk_line = match afk_bucket {
+            Some(ref id) => format!("not_afk = flood(query_bucket(\"{id}\"));"),
+            None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
+        };
+
         let query_body = serde_json::json!({
             "timeperiods": [timeperiod],
             "query": [
-                "events = flood(query_bucket(find_bucket(\"aw-watcher-window_\")));",
-                "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));",
+                window_line,
+                afk_line,
                 "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
                 "events = filter_period_intersect(events, not_afk);",
                 "RETURN = events;"
@@ -160,7 +193,7 @@ impl AwClient {
         Ok(Vec::new())
     }
 
-    /// Queries browser tab events from aw-watcher-web intersected with not-afk status.
+    /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
         if !self.buckets_verified.load(Ordering::Relaxed) || !self.has_web_bucket.load(Ordering::Relaxed) {
             self.buckets_verified.store(false, Ordering::Relaxed);
@@ -171,14 +204,37 @@ impl AwClient {
             return Vec::new();
         }
 
+        let web_buckets = self.web_bucket_ids.read().await.clone();
+        if web_buckets.is_empty() {
+            return Vec::new();
+        }
+
         let url = format!("{}/api/0/query/", self.base_url);
         let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
+
+        let web_expr = if web_buckets.len() == 1 {
+            format!("query_bucket(\"{}\")", web_buckets[0])
+        } else {
+            let concat_args = web_buckets
+                .iter()
+                .map(|b| format!("query_bucket(\"{b}\")"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("sort_by_timestamp(concat({concat_args}))")
+        };
+        let web_line = format!("web = flood({web_expr});");
+
+        let afk_bucket = self.afk_bucket_id.read().await.clone();
+        let afk_line = match afk_bucket {
+            Some(ref id) => format!("not_afk = flood(query_bucket(\"{id}\"));"),
+            None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
+        };
 
         let query_body = serde_json::json!({
             "timeperiods": [timeperiod],
             "query": [
-                "web = flood(query_bucket(find_bucket(\"aw-watcher-web\")));",
-                "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));",
+                web_line,
+                afk_line,
                 "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
                 "events = filter_period_intersect(web, not_afk);",
                 "RETURN = events;"
