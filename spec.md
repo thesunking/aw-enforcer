@@ -28,6 +28,9 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - **Full-Screen Overlay Surface Cleanup (`destroy_windows_on_hide`, default `true`):** Calling `OverlayManager::hide_all` (or `hide`) clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
    - **Lazy-Instantiation & Teardown of Settings UI:** `SettingsWindow` is not allocated at startup when launched silently (`--autostart` / `--minimized`). It is instantiated on demand when clicking "Open Settings" in the tray, and dropped on close (`'X'`) via a zero-delay UI timer.
    - **User-Configurable Performance Toggle:** Configured in General Settings under **Performance** (`destroy_windows_on_hide`). When disabled, windows are pre-instantiated and kept hidden in memory for instantaneous zero-latency display without cold-start initialization.
+   - **Zero-Allocation Win32 Process Resolution:** Uses `QueryFullProcessImageNameW` directly on target window PIDs with stack buffers, eliminating machine-wide process snapshot overhead. Process management (`kill_target_processes`) and known app scanning use lightweight Win32 ToolHelp snapshots with zero external process-enumeration crates.
+   - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
+   - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
 
 ---
 
@@ -274,8 +277,8 @@ When `active-tab == 1 && selected-rule-idx >= 0`, `child_rule_view` binds reacti
 | :--- | :--- | :--- | :--- |
 | **Selection Mode** | `ComboBox` (`["Executables", "Titles", "Urls"]`) | **Always Visible** | Determines whether the rule matches process executables, window titles, or browser URLs. Close Tab and Close Window remain available across all Selection Modes; switching to Titles or Urls automatically sanitizes Kill Process to Close Window, and switching to Executables downgrades Kill Process to Close Window if no specific .exe target is configured. |
 | **Monitored Executables** | `ExecutableSelector` | **`cur-monitor == "Executables"`** | Chip list of `.exe` names, `"Browse .exe..."` file dialog, and running apps dropdown. Empty UI list serializes as `["*"]`. |
-| **Window Title Regex** | `LineEdit` | **`cur-monitor == "Titles"`** | Regular expression matched against `event.data["title"]` and visible window titles. |
-| **Browser URL Regex** | `LineEdit` | **`cur-monitor == "Urls"`** | Regular expression matched against `event.data["url"]` from `aw-watcher-web`. |
+| **Window Title Regex** | `LineEdit` | **`cur-monitor == "Titles"`** | Regular expression matched against `event.data.title` and visible window titles. |
+| **Browser URL Regex** | `LineEdit` | **`cur-monitor == "Urls"`** | Regular expression matched against `event.data.url` from `aw-watcher-web`. |
 
 ### Section 3: Trigger
 | Control | Type | Visibility Condition | Description |
@@ -331,4 +334,4 @@ For each enabled rule active in the current `(day_index, hour_index)` schedule s
      - **`Lock Workstation`:** Calls `enforcer::lock_workstation()`.
      - **`Close Tab`:** Sends `Ctrl+W` (`enforcer::close_active_browser_tab`) to the matching foreground window (falling back to `close_target_windows`).
      - **`Close Window`:** Posts `WM_CLOSE` (`enforcer::close_target_windows`) to matching visible non-minimized windows.
-     - **`Kill Process`:** Terminates matching processes via `sysinfo` (`enforcer::kill_target_processes`).
+     - **`Kill Process`:** Terminates matching processes via Win32 ToolHelp snapshots (`enforcer::kill_target_processes`).

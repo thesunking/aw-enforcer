@@ -701,8 +701,7 @@ impl Engine {
         let active_app = all_events
             .iter()
             .max_by_key(|e| e.timestamp)
-            .and_then(|e| e.data.get("app"))
-            .and_then(|a| a.as_str())
+            .and_then(|e| e.data.app.as_deref())
             .unwrap_or("None")
             .to_string();
 
@@ -1393,7 +1392,7 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
     match rule.monitor_selection {
         MonitorSelection::Titles => {
             if let Some(re) = compiled_re {
-                if let Some(title) = ev.data.get("title").and_then(|v| v.as_str()) {
+                if let Some(title) = ev.data.title.as_deref() {
                     return !title.is_empty() && re.is_match(title);
                 }
             }
@@ -1401,7 +1400,7 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
         }
         MonitorSelection::Urls => {
             if let Some(re) = compiled_re {
-                if let Some(url) = ev.data.get("url").and_then(|v| v.as_str()) {
+                if let Some(url) = ev.data.url.as_deref() {
                     return !url.is_empty() && re.is_match(url);
                 }
             }
@@ -1413,7 +1412,7 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
             {
                 return true;
             }
-            if let Some(app) = ev.data.get("app").and_then(|v| v.as_str()) {
+            if let Some(app) = ev.data.app.as_deref() {
                 for target in &rule.target_executables {
                     let trimmed = target.trim();
                     if trimmed.is_empty() {
@@ -1545,19 +1544,20 @@ pub fn calculate_usage_for_rule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aw_client::AwEventData;
     use chrono::TimeZone;
-    use serde_json::json;
 
     /// Helper to construct a synthetic `AwEvent` with `app`, `title`, and `url` fields.
     fn make_event(start_utc: DateTime<Utc>, duration_secs: f64, app: &str, title: &str, url: &str) -> AwEvent {
         AwEvent {
             timestamp: start_utc,
             duration: duration_secs,
-            data: json!({
-                "app": app,
-                "title": title,
-                "url": url,
-            }),
+            data: AwEventData {
+                app: if app.is_empty() { None } else { Some(app.to_string()) },
+                title: if title.is_empty() { None } else { Some(title.to_string()) },
+                url: if url.is_empty() { None } else { Some(url.to_string()) },
+                status: None,
+            },
         }
     }
 

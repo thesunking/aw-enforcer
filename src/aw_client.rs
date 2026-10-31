@@ -5,13 +5,26 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Typed payload for ActivityWatch window, web, and afk events.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AwEventData {
+    #[serde(default)]
+    pub app: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 /// Represents a single time-series event returned from an ActivityWatch bucket query.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwEvent {
     pub timestamp: DateTime<Utc>,
     pub duration: f64, // seconds
     #[serde(default)]
-    pub data: Value,
+    pub data: AwEventData,
 }
 
 /// Asynchronous HTTP client for querying the local ActivityWatch REST API (`/api/0`).

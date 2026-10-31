@@ -43,3 +43,9 @@ features = [
 [build-dependencies]
 slint-build = "1.8"
 winres = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

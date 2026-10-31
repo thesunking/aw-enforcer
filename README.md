@@ -34,6 +34,9 @@
   - **Performance & Idle Memory Optimization:**
     - **Slint Rendering Backend (`slint_renderer`):** Switch between OpenGL hardware acceleration (`renderer-femtovg`, default) and lightweight CPU software rendering (`renderer-software`) directly from the Settings **Performance** section. CPU rendering significantly reduces GPU VRAM and overall memory footprint in resource-constrained or virtualized environments (requires application restart).
     - **Destroy Windows when Hidden (`destroy_windows_on_hide`):** Frees full-screen OpenGL/GPU surfaces and Slint textures when overlay alerts or the Settings window are closed or hidden (`destroy_windows_on_hide = true`, default); when disabled, windows remain cached in memory for instant display without cold-start initialization.
+    - **Zero-Allocation Win32 Process Resolution:** Uses `QueryFullProcessImageNameW` directly on target window PIDs with stack buffers, eliminating machine-wide process snapshot overhead. Process management and known app scanning use lightweight Win32 ToolHelp snapshots with zero external process-enumeration crates.
+    - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
+    - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
 
 - **Rich Message Editor & Live Preview:**
   - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
