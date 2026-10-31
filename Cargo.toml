@@ -15,7 +15,6 @@ toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 rfd = "0.15"
-sysinfo = "0.31"
 raw-window-handle = "0.6"
 tray-icon = "0.19"
 winrt-notification = "0.5"
@@ -37,6 +36,7 @@ features = [
   "Win32_System_SystemInformation",
   "Win32_System_Shutdown",
   "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_Security"
 ]
 

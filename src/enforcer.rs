@@ -1,6 +1,14 @@
 use regex::Regex;
-use sysinfo::ProcessesToUpdate;
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
 };
@@ -13,20 +21,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, PostMessageW, WM_CLOSE,
 };
 
-/// Shared helper to check if a `sysinfo::Process` matches any target executable name.
-fn process_matches_targets(
-    proc: &sysinfo::Process,
+/// Helper to check if an executable name matches any target executable name.
+fn exe_name_matches_targets(
+    exe_name: &str,
     target_executables: &[String],
 ) -> bool {
     if target_executables.is_empty() {
         return false;
     }
-
-    let proc_name = proc.name().to_string_lossy();
-    let exe_filename = proc
-        .exe()
-        .and_then(|p| p.file_name())
-        .map(|f| f.to_string_lossy().to_string());
 
     for target in target_executables {
         let trimmed = target.trim();
@@ -34,21 +36,43 @@ fn process_matches_targets(
             continue;
         }
         let target_with_ext = format!("{trimmed}.exe");
-        if proc_name.eq_ignore_ascii_case(trimmed)
-            || proc_name.eq_ignore_ascii_case(&target_with_ext)
+        if exe_name.eq_ignore_ascii_case(trimmed)
+            || exe_name.eq_ignore_ascii_case(&target_with_ext)
         {
             return true;
-        }
-        if let Some(ref fname) = exe_filename {
-            if fname.eq_ignore_ascii_case(trimmed)
-                || fname.eq_ignore_ascii_case(&target_with_ext)
-            {
-                return true;
-            }
         }
     }
 
     false
+}
+
+/// Retrieves the executable file name for a process ID using `QueryFullProcessImageNameW` on a stack buffer.
+pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut buf = [0u16; 260];
+        let mut size = buf.len() as u32;
+        let success = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+
+        if success != 0 && size > 0 {
+            let full_path = String::from_utf16_lossy(&buf[..size as usize]);
+            let exe_name = full_path
+                .rsplit_once('\\')
+                .map(|(_, name)| name)
+                .unwrap_or(&full_path);
+            Some(exe_name.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// Returns true if Windows reports a fullscreen D3D app, presentation mode, busy fullscreen app, or Focus Assist quiet time.
@@ -89,7 +113,7 @@ pub fn lock_workstation() -> bool {
 struct EnumMatchContext<'a> {
     target_executables: &'a [String],
     compiled_regex: Option<&'a Regex>,
-    system: Option<&'a sysinfo::System>,
+    has_exe_targets: bool,
     close_matched: bool,
     matched_count: usize,
     matched_name: Option<String>,
@@ -122,16 +146,14 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
         }
     }
 
-    if !matches {
-        if let Some(system) = ctx.system {
-            let mut pid: u32 = 0;
-            GetWindowThreadProcessId(hwnd, &mut pid);
-            if let Some(proc) = system.process(sysinfo::Pid::from_u32(pid)) {
-                if process_matches_targets(proc, ctx.target_executables) {
-                    matches = true;
-                    if ctx.matched_name.is_none() {
-                        ctx.matched_name = Some(proc.name().to_string_lossy().to_string());
-                    }
+    if !matches && ctx.has_exe_targets {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if let Some(exe_name) = get_process_name_by_pid(pid) {
+            if exe_name_matches_targets(&exe_name, ctx.target_executables) {
+                matches = true;
+                if ctx.matched_name.is_none() {
+                    ctx.matched_name = Some(exe_name);
                 }
             }
         }
@@ -164,16 +186,10 @@ fn scan_windows(
         .iter()
         .any(|t| !t.trim().is_empty() && t.trim() != "*");
 
-    let system = has_exe_targets.then(|| {
-        let mut s = sysinfo::System::new();
-        s.refresh_processes(ProcessesToUpdate::All);
-        s
-    });
-
     let mut ctx = EnumMatchContext {
         target_executables,
         compiled_regex,
-        system: system.as_ref(),
+        has_exe_targets,
         close_matched,
         matched_count: 0,
         matched_name: None,
@@ -219,29 +235,62 @@ pub fn find_matching_window(
     scan_windows(target_executables, compiled_regex, false).1
 }
 
-/// Terminates processes matching target executables via sysinfo.
+/// Terminates processes matching target executables via Win32 ToolHelp snapshot.
 pub fn kill_target_processes(target_executables: &[String]) -> usize {
     if target_executables.is_empty() {
         return 0;
     }
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(ProcessesToUpdate::All);
+    let has_specific_target = target_executables
+        .iter()
+        .any(|t| !t.trim().is_empty() && t.trim() != "*");
+    if !has_specific_target {
+        return 0;
+    }
 
-    let mut killed_count = 0;
-    for (_pid, process) in system.processes() {
-        // Never allow wildcard "*" to terminate all system processes
-        if process_matches_targets(process, target_executables) {
-            tracing::info!(
-                "Terminating target process: {} (PID: {})",
-                process.name().to_string_lossy(),
-                process.pid()
-            );
-            if process.kill() {
-                killed_count += 1;
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return 0;
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut killed_count = 0;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+
+                // Never allow wildcard "*" to terminate all system processes
+                if exe_name_matches_targets(&exe_name, target_executables) {
+                    tracing::info!(
+                        "Terminating target process: {} (PID: {})",
+                        exe_name,
+                        entry.th32ProcessID
+                    );
+                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
+                    if !h_proc.is_null() {
+                        if TerminateProcess(h_proc, 1) != 0 {
+                            killed_count += 1;
+                        }
+                        CloseHandle(h_proc);
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
             }
         }
+
+        CloseHandle(snapshot);
+        killed_count
     }
-    killed_count
 }
 
 /// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
@@ -273,12 +322,10 @@ pub fn close_active_browser_tab(
             if target_executables.iter().any(|t| t.trim() == "*") {
                 matches = true;
             } else {
-                let mut sys = sysinfo::System::new();
-                sys.refresh_processes(ProcessesToUpdate::All);
                 let mut pid: u32 = 0;
                 GetWindowThreadProcessId(hwnd, &mut pid);
-                if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                    matches = process_matches_targets(proc, target_executables);
+                if let Some(exe_name) = get_process_name_by_pid(pid) {
+                    matches = exe_name_matches_targets(&exe_name, target_executables);
                 }
             }
         }

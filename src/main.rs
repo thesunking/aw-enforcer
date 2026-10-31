@@ -398,14 +398,38 @@ fn scan_and_update_known_apps(
     handle: tokio::runtime::Handle,
 ) {
     handle.spawn(async move {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All);
-
         let mut app_set = std::collections::BTreeSet::new();
-        for proc in sys.processes().values() {
-            let name = proc.name().to_string_lossy().to_string();
-            if name.ends_with(".exe") {
-                app_set.insert(name);
+
+        unsafe {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            };
+
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if !snapshot.is_null() && snapshot != INVALID_HANDLE_VALUE {
+                let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+                if Process32FirstW(snapshot, &mut entry) != 0 {
+                    loop {
+                        let len = entry
+                            .szExeFile
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(entry.szExeFile.len());
+                        let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                        if name.ends_with(".exe") {
+                            app_set.insert(name);
+                        }
+
+                        if Process32NextW(snapshot, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snapshot);
             }
         }
 
