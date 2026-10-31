@@ -9,6 +9,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Serde default helper returning `"femtovg"`.
+fn default_slint_renderer() -> String {
+    "femtovg".to_string()
+}
+
 /// Serde default helper for the logical day boundary hour (04:00 AM).
 fn default_day_start_hour() -> u32 {
     4
@@ -431,6 +436,8 @@ pub struct GeneralConfig {
     pub pause_all_rules: bool,
     #[serde(default = "default_true")]
     pub destroy_windows_on_hide: bool,
+    #[serde(default = "default_slint_renderer")]
+    pub slint_renderer: String,
 }
 
 impl Default for GeneralConfig {
@@ -444,6 +451,7 @@ impl Default for GeneralConfig {
             suppress_fullscreen_d3d: true,
             pause_all_rules: false,
             destroy_windows_on_hide: true,
+            slint_renderer: "femtovg".to_string(),
         }
     }
 }
@@ -848,5 +856,29 @@ mod tests {
         "#;
         let parsed_disabled: GeneralConfig = toml::from_str(toml_disabled).expect("Must parse disabled config");
         assert!(!parsed_disabled.destroy_windows_on_hide);
+    }
+
+    /// Verifies `slint_renderer` defaults to `"femtovg"` and roundtrips `"software"` correctly.
+    #[test]
+    fn test_slint_renderer_config() {
+        let default_cfg = GeneralConfig::default();
+        assert_eq!(default_cfg.slint_renderer, "femtovg");
+
+        let toml_str = r#"
+            aw_port = 5600
+            poll_interval_seconds = 10
+            autostart = true
+        "#;
+        let parsed: GeneralConfig = toml::from_str(toml_str).expect("Must parse legacy config");
+        assert_eq!(parsed.slint_renderer, "femtovg");
+
+        let toml_software = r#"
+            aw_port = 5600
+            poll_interval_seconds = 10
+            autostart = true
+            slint_renderer = "software"
+        "#;
+        let parsed_software: GeneralConfig = toml::from_str(toml_software).expect("Must parse software config");
+        assert_eq!(parsed_software.slint_renderer, "software");
     }
 }

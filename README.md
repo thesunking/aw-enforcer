@@ -31,7 +31,9 @@
   - **Strict Mode & 15-Second Lockout Delay:** When enabled on a `Show Overlay` rule, hides Skip/Snooze buttons on the break screen, disables system tray bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
   - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
-  - **Performance & Idle Memory Optimization (`Destroy Windows when Hidden`):** Frees full-screen OpenGL/GPU surfaces and Slint textures when overlay alerts or the Settings window are closed or hidden. Configurable in the General Settings **Performance** section (`destroy_windows_on_hide = true`); when disabled, windows remain cached in memory for instant display without cold-start initialization.
+  - **Performance & Idle Memory Optimization:**
+    - **Slint Rendering Backend (`slint_renderer`):** Switch between OpenGL hardware acceleration (`renderer-femtovg`, default) and lightweight CPU software rendering (`renderer-software`) directly from the Settings **Performance** section. CPU rendering significantly reduces GPU VRAM and overall memory footprint in resource-constrained or virtualized environments (requires application restart).
+    - **Destroy Windows when Hidden (`destroy_windows_on_hide`):** Frees full-screen OpenGL/GPU surfaces and Slint textures when overlay alerts or the Settings window are closed or hidden (`destroy_windows_on_hide = true`, default); when disabled, windows remain cached in memory for instant display without cold-start initialization.
 
 - **Rich Message Editor & Live Preview:**
   - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
@@ -97,6 +99,7 @@ day_start_hour = 4
 suppress_fullscreen_d3d = true
 pause_all_rules = false
 destroy_windows_on_hide = true
+slint_renderer = "femtovg"
 
 [overlay]
 opacity = 0.90

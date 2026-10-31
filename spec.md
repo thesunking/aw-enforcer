@@ -23,8 +23,9 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - **Fullscreen / Presentation DND (`SHQueryUserNotificationState`):** Automatically downgrades `Show Overlay` breaks to passive Windows notifications during fullscreen D3D games, presentations, or Focus Assist.
    - **Pause All Rules Indefinitely (`pause_all_rules`):** Synchronized between the General Settings checkbox and the system tray menu item (`"Pause All Rules"` / `"Resume All Rules"`), pausing all rule alerts and enforcement until resumed.
    - **Strict Mode Lockout with 15-Second Confirmation Delay:** Available when `Action == "Show Overlay"`; hides Skip/Snooze buttons on the overlay, disables tray bypass items, and locks rule/settings edits behind a 15-second confirmation timer while actively enforcing.
-5. **Performance & GPU Memory Management (`destroy_windows_on_hide`, default `true`):**
-   - **Full-Screen Overlay Surface Cleanup:** Calling `OverlayManager::hide_all` (or `hide`) clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor OpenGL swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
+5. **Performance, Renderer & GPU Memory Management:**
+   - **Rendering Backend Toggle (`slint_renderer`, default `"femtovg"`):** Allows switching between OpenGL hardware acceleration (`renderer-femtovg`) and CPU software rendering (`renderer-software`) directly from the General Settings **Performance** card. CPU rendering avoids allocating GPU OpenGL swapchains and VRAM textures, significantly lowering baseline memory consumption in virtualized, remote, or memory-constrained environments.
+   - **Full-Screen Overlay Surface Cleanup (`destroy_windows_on_hide`, default `true`):** Calling `OverlayManager::hide_all` (or `hide`) clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
    - **Lazy-Instantiation & Teardown of Settings UI:** `SettingsWindow` is not allocated at startup when launched silently (`--autostart` / `--minimized`). It is instantiated on demand when clicking "Open Settings" in the tray, and dropped on close (`'X'`) via a zero-delay UI timer.
    - **User-Configurable Performance Toggle:** Configured in General Settings under **Performance** (`destroy_windows_on_hide`). When disabled, windows are pre-instantiated and kept hidden in memory for instantaneous zero-latency display without cold-start initialization.
 
@@ -166,6 +167,7 @@ day_start_hour = 4
 suppress_fullscreen_d3d = true
 pause_all_rules = false
 destroy_windows_on_hide = true
+slint_renderer = "femtovg"
 
 [overlay]
 opacity = 0.90
@@ -252,6 +254,7 @@ sun = "000000000000000000000000"
 The General Settings tab organizes application-wide preferences into four structured `SectionCard` panels:
 1. **General Settings:** ActivityWatch Port (`aw_port`), Polling Interval in seconds (`poll_interval_seconds`), Start on Windows Login (`autostart`), API Key (`api_key`), Logical Day Start Hour (`day_start_hour`), Fullscreen/Presentation DND (`suppress_fullscreen_d3d`), and Pause All Rules (`pause_all_rules`).
 2. **Performance:**
+   - **Slint Renderer (`slint-renderer`):** ComboBox selecting between OpenGL (`OpenGL (renderer-femtovg)`) and CPU Software (`CPU Software (renderer-software)`). CPU software rendering reduces GPU/VRAM consumption in virtualized or memory-constrained environments (requires application restart).
    - **Destroy Windows when Hidden (`destroy-windows-on-hide`):** Checkbox controlling whether `OverlayWindow` and `SettingsWindow` instances and their OpenGL/GPU contexts are destroyed when hidden or closed (`true`), or kept resident in memory for instantaneous zero-latency display (`false`).
 3. **Overlay Theme & Appearance:** Overlay Opacity slider (`overlay_opacity`), Accent Color hex input (`accent_color_hex`), and test overlay trigger buttons (`Test Break Screen`, `Test HUD Toast`, `Test HUD Timer`, `Test 24h Stats HUD`).
 4. **Activity Statistics & 24h HUD Configuration:** Daily Target Screen Time (`daily_screentime_target_minutes`), Excessive Threshold (`threshold_excessive_minutes`), and Histogram Strftime Code (`histogram_time_format`) with live preview validation.

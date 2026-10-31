@@ -292,6 +292,7 @@ fn apply_config_to_ui(
     win.set_suppress_fullscreen_d3d(cfg.general.suppress_fullscreen_d3d);
     win.set_pause_all_rules(cfg.general.pause_all_rules);
     win.set_destroy_windows_on_hide(cfg.general.destroy_windows_on_hide);
+    win.set_slint_renderer(cfg.general.slint_renderer.as_str().into());
     win.set_overlay_opacity(cfg.overlay.opacity);
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
@@ -535,6 +536,7 @@ fn open_settings_window(
                 if was_destroy != new_destroy {
                     overlay_mgr_cell.borrow_mut().set_destroy_windows_on_hide(new_destroy);
                 }
+                updated_config.general.slint_renderer = win.get_slint_renderer().to_string();
                 item_pause.set_text(if updated_config.general.pause_all_rules {
                     "Resume All Rules"
                 } else {
@@ -967,6 +969,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Load application configuration & sync Windows autostart registry key
     let config = AppConfig::load();
+    if std::env::var("SLINT_BACKEND").is_err() {
+        if config.general.slint_renderer.eq_ignore_ascii_case("software") {
+            unsafe {
+                std::env::set_var("SLINT_BACKEND", "winit-software");
+            }
+            tracing::info!("Configured Slint renderer: CPU Software (renderer-software)");
+        } else {
+            unsafe {
+                std::env::set_var("SLINT_BACKEND", "winit-femtovg");
+            }
+            tracing::info!("Configured Slint renderer: OpenGL (renderer-femtovg)");
+        }
+    }
     if let Err(e) = autostart::set_autostart(config.general.autostart) {
         tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
     }

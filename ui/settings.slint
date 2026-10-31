@@ -148,6 +148,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> suppress-fullscreen-d3d: true;
     in-out property <bool> pause-all-rules: false;
     in-out property <bool> destroy-windows-on-hide: true;
+    in-out property <string> slint-renderer: "femtovg";
     in-out property <bool> strict-lock-active: false;
     in-out property <bool> strict-unlocked: false;
     in-out property <int> strict-unlock-countdown: 0;
@@ -563,6 +564,34 @@ export component SettingsWindow inherits Window {
                     SectionCard {
                         card-padding: 20px;
                         card-spacing: 16px;
+
+                        FormRow {
+                            label: "Slint Renderer:";
+                            label-width: 220px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                alignment: start;
+                                ComboBox {
+                                    width: 280px;
+                                    model: ["OpenGL (renderer-femtovg)", "CPU Software (renderer-software)"];
+                                    current-value: root.slint-renderer == "software" ? "CPU Software (renderer-software)" : "OpenGL (renderer-femtovg)";
+                                    selected(val) => {
+                                        if val == "CPU Software (renderer-software)" {
+                                            root.slint-renderer = "software";
+                                        } else {
+                                            root.slint-renderer = "femtovg";
+                                        }
+                                        root.has-unsaved-changes = true;
+                                    }
+                                }
+                                Text {
+                                    text: "(Requires restart to apply)";
+                                    font-size: 13px;
+                                    color: #94a3b8;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
 
                         FormRow {
                             label: "Destroy Windows when Hidden:";

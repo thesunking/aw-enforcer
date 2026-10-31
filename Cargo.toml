@@ -6,7 +6,7 @@ license = "MIT"
 build = "build.rs"
 
 [dependencies]
-slint = { version = "1.8", features = ["backend-winit", "renderer-femtovg", "raw-window-handle-06"] }
+slint = { version = "1.8", features = ["backend-winit", "renderer-femtovg", "renderer-software", "raw-window-handle-06"] }
 tokio = { version = "1.40", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
