@@ -147,6 +147,7 @@ export component SettingsWindow inherits Window {
     in-out property <int> day-start-hour: 4;
     in-out property <bool> suppress-fullscreen-d3d: true;
     in-out property <bool> pause-all-rules: false;
+    in-out property <bool> destroy-windows-on-hide: true;
     in-out property <bool> strict-lock-active: false;
     in-out property <bool> strict-unlocked: false;
     in-out property <int> strict-unlock-countdown: 0;
@@ -547,6 +548,28 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 text: "Pause all rule alerts and enforcement indefinitely";
                                 checked <=> root.pause-all-rules;
+                                toggled => { root.has-unsaved-changes = true; }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Performance";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 16px;
+
+                        FormRow {
+                            label: "Destroy Windows when Hidden:";
+                            label-width: 220px;
+                            CheckBox {
+                                text: "Release GPU surfaces and memory when windows are closed or hidden";
+                                checked <=> root.destroy-windows-on-hide;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }

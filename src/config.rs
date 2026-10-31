@@ -429,6 +429,8 @@ pub struct GeneralConfig {
     pub suppress_fullscreen_d3d: bool,
     #[serde(default)]
     pub pause_all_rules: bool,
+    #[serde(default = "default_true")]
+    pub destroy_windows_on_hide: bool,
 }
 
 impl Default for GeneralConfig {
@@ -441,6 +443,7 @@ impl Default for GeneralConfig {
             day_start_hour: 4,
             suppress_fullscreen_d3d: true,
             pause_all_rules: false,
+            destroy_windows_on_hide: true,
         }
     }
 }
@@ -821,5 +824,29 @@ mod tests {
         assert_eq!(deserialized.period.value, rule.period.value);
         assert_eq!(deserialized.action, rule.action);
         assert_eq!(deserialized.trigger, rule.trigger);
+    }
+
+    /// Verifies `destroy_windows_on_hide` defaults to `true` and roundtrips `false` correctly.
+    #[test]
+    fn test_destroy_windows_on_hide_config() {
+        let default_cfg = GeneralConfig::default();
+        assert!(default_cfg.destroy_windows_on_hide);
+
+        let toml_str = r#"
+            aw_port = 5600
+            poll_interval_seconds = 10
+            autostart = true
+        "#;
+        let parsed: GeneralConfig = toml::from_str(toml_str).expect("Must parse legacy config");
+        assert!(parsed.destroy_windows_on_hide);
+
+        let toml_disabled = r#"
+            aw_port = 5600
+            poll_interval_seconds = 10
+            autostart = true
+            destroy_windows_on_hide = false
+        "#;
+        let parsed_disabled: GeneralConfig = toml::from_str(toml_disabled).expect("Must parse disabled config");
+        assert!(!parsed_disabled.destroy_windows_on_hide);
     }
 }

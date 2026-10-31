@@ -291,6 +291,7 @@ fn apply_config_to_ui(
     win.set_day_start_hour(cfg.general.day_start_hour as i32);
     win.set_suppress_fullscreen_d3d(cfg.general.suppress_fullscreen_d3d);
     win.set_pause_all_rules(cfg.general.pause_all_rules);
+    win.set_destroy_windows_on_hide(cfg.general.destroy_windows_on_hide);
     win.set_overlay_opacity(cfg.overlay.opacity);
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
@@ -418,131 +419,95 @@ fn scan_and_update_known_apps(
     });
 }
 
-/// Application entry point: initializes single-instance lock, config, Tokio engine task, system tray icon, and Slint event loop.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize logging
-    tracing_subscriber::fmt::init();
+/// Cached live telemetry state so a newly created `SettingsWindow` immediately displays current daemon status.
+struct LiveUiState {
+    session_duration_text: String,
+    screentime_text: String,
+    active_app: String,
+    strict_lock_active: bool,
+    rule_statuses: Vec<(String, String)>,
+}
 
-    // 2. Enforce single-instance mutex
-    if !check_single_instance() {
-        tracing::warn!("Another instance of AW-Enforcer is already running. Exiting.");
+impl Default for LiveUiState {
+    fn default() -> Self {
+        Self {
+            session_duration_text: "0m".to_string(),
+            screentime_text: "0h 0m".to_string(),
+            active_app: "None".to_string(),
+            strict_lock_active: false,
+            rule_statuses: Vec::new(),
+        }
+    }
+}
+
+/// Lazily instantiates, populates, wires, and displays the `SettingsWindow` (or focuses it if already open).
+/// When closed via the window's `'X'` button, the `SettingsWindow` instance and its GPU surface are dropped
+/// if `destroy_windows_on_hide` is enabled in configuration; otherwise, it is kept hidden in memory.
+#[allow(clippy::too_many_arguments)]
+fn open_settings_window(
+    settings_slot: &Rc<RefCell<Option<SettingsWindow>>>,
+    rules_model: &Rc<VecModel<RuleView>>,
+    current_config: &Rc<RefCell<AppConfig>>,
+    ui_aw_client: &Rc<RefCell<Arc<AwClient>>>,
+    live_state: &Rc<RefCell<LiveUiState>>,
+    aw_connected_flag: &Arc<std::sync::atomic::AtomicBool>,
+    command_tx: &mpsc::UnboundedSender<DaemonCommand>,
+    rt_handle: &tokio::runtime::Handle,
+    item_pause: &MenuItem,
+    overlay_manager: &Rc<RefCell<OverlayManager>>,
+    show: bool,
+) -> Result<(), slint::PlatformError> {
+    if let Some(ref existing) = *settings_slot.borrow() {
+        if show {
+            existing.show()?;
+        }
         return Ok(());
     }
 
-    // 3. Load application configuration & sync Windows autostart registry key
-    let config = AppConfig::load();
-    if let Err(e) = autostart::set_autostart(config.general.autostart) {
-        tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
-    }
-    let current_config = Rc::new(RefCell::new(config.clone()));
-
-    // 4. Initialize ActivityWatch REST Client
-    let aw_client = Arc::new(AwClient::new(
-        config.general.aw_port,
-        &config.general.api_key,
-    ));
-    let ui_aw_client = Rc::new(RefCell::new(aw_client.clone()));
-
-    // 5. Establish Tokio communication channels
-    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
-    let (overlay_action_tx, mut overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
-
-    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
-    let tokio_rt = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build Tokio runtime"),
-    );
-    let rt_handle = tokio_rt.handle().clone();
-
-    let worker_config = config.clone();
-    let worker_client = aw_client.clone();
-    let initial_poll_secs = config.general.poll_interval_seconds.max(2);
-    let bg_rt = tokio_rt.clone();
-
-    std::thread::spawn(move || {
-        bg_rt.block_on(async move {
-            let mut engine = Engine::new(worker_config, worker_client, overlay_action_tx);
-            let mut cmd_rx = command_rx;
-
-            let mut ticker_1s = tokio::time::interval(Duration::from_secs(1));
-            let mut ticker_poll =
-                tokio::time::interval(Duration::from_secs(initial_poll_secs));
-
-            loop {
-                tokio::select! {
-                    Some(cmd) = cmd_rx.recv() => {
-                        if let DaemonCommand::ReloadConfig(ref new_cfg) = cmd {
-                            let new_secs = new_cfg.general.poll_interval_seconds.max(2);
-                            ticker_poll = tokio::time::interval(Duration::from_secs(new_secs));
-                        }
-                        engine.handle_command(cmd).await;
-                    }
-                    _ = ticker_1s.tick() => {
-                        engine.realtime_tick().await;
-                    }
-                    _ = ticker_poll.tick() => {
-                        engine.poll_tick().await;
-                    }
-                }
-            }
-        });
-    });
-
-    // 7. Initialize OverlayManager with theme configuration
-    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
-        config.overlay.clone(),
-        Some(command_tx.clone()),
-    )));
-
-    // 8. Instantiate Settings Window
     let settings_win = SettingsWindow::new()?;
     let settings_weak = settings_win.as_weak();
 
-    // Populate initial configuration values
-    let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
+    // Populate initial configuration and cached live telemetry values
     settings_win.set_rules(ModelRc::from(rules_model.clone()));
-    apply_config_to_ui(&settings_win, &config, &rules_model);
+    apply_config_to_ui(&settings_win, &current_config.borrow(), rules_model);
+    settings_win.set_aw_connected(aw_connected_flag.load(std::sync::atomic::Ordering::Relaxed));
+    {
+        let ls = live_state.borrow();
+        settings_win.set_current_session_duration_text(ls.session_duration_text.as_str().into());
+        settings_win.set_today_screentime_text(ls.screentime_text.as_str().into());
+        settings_win.set_current_active_app(ls.active_app.as_str().into());
+        settings_win.set_strict_lock_active(ls.strict_lock_active);
+        for (rule_id, status_text) in &ls.rule_statuses {
+            for idx in 0..rules_model.row_count() {
+                if let Some(mut r) = rules_model.row_data(idx) {
+                    if &r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                        r.status_text = status_text.as_str().into();
+                        rules_model.set_row_data(idx, r);
+                    }
+                }
+            }
+        }
+    }
 
-    // Warm known apps asynchronously on startup
-    scan_and_update_known_apps(
-        settings_weak.clone(),
-        rt_handle.clone(),
-    );
+    // Warm known apps and check ActivityWatch connection asynchronously on window open
+    scan_and_update_known_apps(settings_weak.clone(), rt_handle.clone());
+    {
+        let sw = settings_weak.clone();
+        let conn_flag = aw_connected_flag.clone();
+        let client = ui_aw_client.borrow().clone();
+        rt_handle.spawn(async move {
+            let connected = client.check_connection().await;
+            conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
+            slint::invoke_from_event_loop(move || {
+                if let Some(win) = sw.upgrade() {
+                    win.set_aw_connected(connected);
+                }
+            })
+            .ok();
+        });
+    }
 
-    // 9. Build System Tray Menu
-    let item_settings = MenuItem::with_id("open_settings", "Open Settings", true, None);
-    let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
-    let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
-    let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
-    let initial_pause_label = if config.general.pause_all_rules {
-        "Resume All Rules"
-    } else {
-        "Pause All Rules"
-    };
-    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
-    let item_quit = MenuItem::with_id("quit", "Quit", true, None);
-
-    let tray_menu = Menu::new();
-    tray_menu.append(&item_settings)?;
-    tray_menu.append(&item_stats)?;
-    tray_menu.append(&item_dismiss)?;
-    tray_menu.append(&item_snooze)?;
-    tray_menu.append(&item_pause)?;
-    tray_menu.append(&PredefinedMenuItem::separator())?;
-    tray_menu.append(&item_quit)?;
-
-    let _tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("AW-Enforcer")
-        .with_icon(create_default_tray_icon())
-        .build()
-        .ok();
-    let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
-
-    // 10. Wire Slint UI Callbacks
-
+    // Wire Slint UI Callbacks
     // Save configuration
     {
         let sw = settings_weak.clone();
@@ -550,6 +515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
         let item_pause = item_pause.clone();
+        let overlay_mgr_cell = overlay_manager.clone();
 
         settings_win.on_save_config(move || {
             if let Some(win) = sw.upgrade() {
@@ -563,6 +529,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
                 updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
                 updated_config.general.pause_all_rules = win.get_pause_all_rules();
+                let was_destroy = updated_config.general.destroy_windows_on_hide;
+                let new_destroy = win.get_destroy_windows_on_hide();
+                updated_config.general.destroy_windows_on_hide = new_destroy;
+                if was_destroy != new_destroy {
+                    overlay_mgr_cell.borrow_mut().set_destroy_windows_on_hide(new_destroy);
+                }
                 item_pause.set_text(if updated_config.general.pause_all_rules {
                     "Resume All Rules"
                 } else {
@@ -954,11 +926,157 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 11. Main Thread UI Loop Timer (processes overlay actions, tray events, and live status)
+    // Destroy or hide SettingsWindow instance on 'X' close
+    {
+        let slot_for_close = settings_slot.clone();
+        let rm_for_close = rules_model.clone();
+        let cfg_for_close = current_config.clone();
+        settings_win.window().on_close_requested(move || {
+            let slot_inner = slot_for_close.clone();
+            let rm_inner = rm_for_close.clone();
+            if cfg_for_close.borrow().general.destroy_windows_on_hide {
+                slint::Timer::single_shot(Duration::from_millis(0), move || {
+                    if let Some(win) = slot_inner.borrow_mut().take() {
+                        win.hide().ok();
+                        drop(win);
+                    }
+                    rm_inner.set_vec(Vec::new());
+                });
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    if show {
+        settings_win.show()?;
+    }
+    *settings_slot.borrow_mut() = Some(settings_win);
+    Ok(())
+}
+
+/// Application entry point: initializes single-instance lock, config, Tokio engine task, system tray icon, and Slint event loop.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize logging
+    tracing_subscriber::fmt::init();
+
+    // 2. Enforce single-instance mutex
+    if !check_single_instance() {
+        tracing::warn!("Another instance of AW-Enforcer is already running. Exiting.");
+        return Ok(());
+    }
+
+    // 3. Load application configuration & sync Windows autostart registry key
+    let config = AppConfig::load();
+    if let Err(e) = autostart::set_autostart(config.general.autostart) {
+        tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
+    }
+    let current_config = Rc::new(RefCell::new(config.clone()));
+
+    // 4. Initialize ActivityWatch REST Client
+    let aw_client = Arc::new(AwClient::new(
+        config.general.aw_port,
+        &config.general.api_key,
+    ));
+    let ui_aw_client = Rc::new(RefCell::new(aw_client.clone()));
+
+    // 5. Establish Tokio communication channels
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+    let (overlay_action_tx, mut overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
+
+    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
+    let tokio_rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build Tokio runtime"),
+    );
+    let rt_handle = tokio_rt.handle().clone();
+
+    let worker_config = config.clone();
+    let worker_client = aw_client.clone();
+    let initial_poll_secs = config.general.poll_interval_seconds.max(2);
+    let bg_rt = tokio_rt.clone();
+
+    std::thread::spawn(move || {
+        bg_rt.block_on(async move {
+            let mut engine = Engine::new(worker_config, worker_client, overlay_action_tx);
+            let mut cmd_rx = command_rx;
+
+            let mut ticker_1s = tokio::time::interval(Duration::from_secs(1));
+            let mut ticker_poll =
+                tokio::time::interval(Duration::from_secs(initial_poll_secs));
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let DaemonCommand::ReloadConfig(ref new_cfg) = cmd {
+                            let new_secs = new_cfg.general.poll_interval_seconds.max(2);
+                            ticker_poll = tokio::time::interval(Duration::from_secs(new_secs));
+                        }
+                        engine.handle_command(cmd).await;
+                    }
+                    _ = ticker_1s.tick() => {
+                        engine.realtime_tick().await;
+                    }
+                    _ = ticker_poll.tick() => {
+                        engine.poll_tick().await;
+                    }
+                }
+            }
+        });
+    });
+
+    // 7. Initialize OverlayManager with theme configuration
+    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
+        config.overlay.clone(),
+        Some(command_tx.clone()),
+        config.general.destroy_windows_on_hide,
+    )));
+
+    // 8. Shared UI state for lazy SettingsWindow instantiation
+    let settings_slot: Rc<RefCell<Option<SettingsWindow>>> = Rc::new(RefCell::new(None));
+    let live_ui_state: Rc<RefCell<LiveUiState>> = Rc::new(RefCell::new(LiveUiState::default()));
+    let aw_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
+
+    // 9. Build System Tray Menu
+    let item_settings = MenuItem::with_id("open_settings", "Open Settings", true, None);
+    let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
+    let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
+    let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
+    let initial_pause_label = if config.general.pause_all_rules {
+        "Resume All Rules"
+    } else {
+        "Pause All Rules"
+    };
+    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
+    let item_quit = MenuItem::with_id("quit", "Quit", true, None);
+
+    let tray_menu = Menu::new();
+    tray_menu.append(&item_settings)?;
+    tray_menu.append(&item_stats)?;
+    tray_menu.append(&item_dismiss)?;
+    tray_menu.append(&item_snooze)?;
+    tray_menu.append(&item_pause)?;
+    tray_menu.append(&PredefinedMenuItem::separator())?;
+    tray_menu.append(&item_quit)?;
+
+    let _tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("AW-Enforcer")
+        .with_icon(create_default_tray_icon())
+        .build()
+        .ok();
+    let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
+
+    // 10. Main Thread UI Loop Timer (processes overlay actions, tray events, and live status)
     let main_timer = slint::Timer::default();
     {
         let overlay_mgr = overlay_manager.clone();
-        let sw = settings_weak.clone();
+        let settings_slot_ref = settings_slot.clone();
+        let rules_model_ref = rules_model.clone();
+        let live_state_ref = live_ui_state.clone();
+        let aw_connected_flag_ref = aw_connected_flag.clone();
         let cmd_tx = command_tx.clone();
         let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
@@ -967,7 +1085,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let item_dismiss = item_dismiss.clone();
         let item_snooze = item_snooze.clone();
         let item_pause = item_pause.clone();
-        let rules_model_ref = rules_model.clone();
 
         let mut conn_check_counter = 0u32;
         let mut unlock_counter = 0u32;
@@ -999,7 +1116,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             rule_statuses,
                             tray_tooltip,
                         } => {
-                            if let Some(win) = sw.upgrade() {
+                            {
+                                let mut ls = live_state_ref.borrow_mut();
+                                ls.session_duration_text = session_duration_text.clone();
+                                ls.screentime_text = screentime_text.clone();
+                                ls.active_app = active_app.clone();
+                                ls.strict_lock_active = strict_lock_active;
+                                ls.rule_statuses = rule_statuses.clone();
+                            }
+
+                            if let Some(ref win) = *settings_slot_ref.borrow() {
                                 win.set_current_session_duration_text(session_duration_text.as_str().into());
                                 win.set_today_screentime_text(screentime_text.as_str().into());
                                 win.set_current_active_app(active_app.as_str().into());
@@ -1014,12 +1140,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             item_snooze.set_enabled(!strict_lock_active);
                             item_pause.set_enabled(!strict_lock_active);
 
-                            for (rule_id, status_text) in rule_statuses {
-                                for idx in 0..rules_model_ref.row_count() {
-                                    if let Some(mut r) = rules_model_ref.row_data(idx) {
-                                        if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
-                                            r.status_text = status_text.as_str().into();
-                                            rules_model_ref.set_row_data(idx, r);
+                            if settings_slot_ref.borrow().is_some() {
+                                for (rule_id, status_text) in rule_statuses {
+                                    for idx in 0..rules_model_ref.row_count() {
+                                        if let Some(mut r) = rules_model_ref.row_data(idx) {
+                                            if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                                                r.status_text = status_text.as_str().into();
+                                                rules_model_ref.set_row_data(idx, r);
+                                            }
                                         }
                                     }
                                 }
@@ -1037,7 +1165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unlock_counter += 1;
                 if unlock_counter >= 28 {
                     unlock_counter = 0;
-                    if let Some(win) = sw.upgrade() {
+                    if let Some(ref win) = *settings_slot_ref.borrow() {
                         let cd = win.get_strict_unlock_countdown();
                         if cd > 0 {
                             let next_cd = cd - 1;
@@ -1057,8 +1185,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("Received system tray menu event: {}", event.id.0);
                     match event.id.0.as_str() {
                         "open_settings" => {
-                            if let Some(win) = sw.upgrade() {
-                                win.show().ok();
+                            if let Err(e) = open_settings_window(
+                                &settings_slot_ref,
+                                &rules_model_ref,
+                                &cfg_cell,
+                                &ui_client_cell,
+                                &live_state_ref,
+                                &aw_connected_flag_ref,
+                                &cmd_tx,
+                                &handle,
+                                &item_pause,
+                                &overlay_mgr,
+                                true,
+                            ) {
+                                tracing::error!("Failed to open SettingsWindow: {e}");
                             }
                         }
                         "show_stats" => {
@@ -1071,10 +1211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
                         }
                         "toggle_pause_all" => {
-                            let is_locked = sw
-                                .upgrade()
-                                .map(|w| w.get_strict_lock_active())
-                                .unwrap_or(false);
+                            let is_locked = live_state_ref.borrow().strict_lock_active;
                             if is_locked {
                                 continue;
                             }
@@ -1091,7 +1228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 "Pause All Rules"
                             });
-                            if let Some(win) = sw.upgrade() {
+                            if let Some(ref win) = *settings_slot_ref.borrow() {
                                 win.set_pause_all_rules(new_paused);
                             }
                             cmd_tx
@@ -1109,28 +1246,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 conn_check_counter += 1;
                 if conn_check_counter >= 85 {
                     conn_check_counter = 0;
-                    let sw = sw.clone();
+                    let sw_opt = settings_slot_ref.borrow().as_ref().map(|w| w.as_weak());
+                    let conn_flag = aw_connected_flag_ref.clone();
                     let client = ui_client_cell.borrow().clone();
 
                     handle.spawn(async move {
                         let connected = client.check_connection().await;
+                        conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
 
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(win) = sw.upgrade() {
-                                win.set_aw_connected(connected);
-                            }
-                        })
-                        .ok();
+                        if let Some(sw) = sw_opt {
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(win) = sw.upgrade() {
+                                    win.set_aw_connected(connected);
+                                }
+                            })
+                            .ok();
+                        }
                     });
                 }
             },
         );
     }
-
-    // 12. Hide Settings Window to tray on 'X' close instead of destroying it
-    settings_win.window().on_close_requested(|| {
-        slint::CloseRequestResponse::HideWindow
-    });
 
     // Show Settings Window unless launched with --minimized / --autostart
     let args: Vec<String> = std::env::args().collect();
@@ -1138,14 +1274,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|a| a == "--minimized" || a == "--autostart");
     if !start_minimized {
-        settings_win.show()?;
+        if let Err(e) = open_settings_window(
+            &settings_slot,
+            &rules_model,
+            &current_config,
+            &ui_aw_client,
+            &live_ui_state,
+            &aw_connected_flag,
+            &command_tx,
+            &rt_handle,
+            &item_pause,
+            &overlay_manager,
+            true,
+        ) {
+            tracing::error!("Failed to open SettingsWindow on startup: {e}");
+        }
+    } else if !config.general.destroy_windows_on_hide {
+        if let Err(e) = open_settings_window(
+            &settings_slot,
+            &rules_model,
+            &current_config,
+            &ui_aw_client,
+            &live_ui_state,
+            &aw_connected_flag,
+            &command_tx,
+            &rt_handle,
+            &item_pause,
+            &overlay_manager,
+            false,
+        ) {
+            tracing::error!("Failed to pre-instantiate SettingsWindow on startup: {e}");
+        }
     }
 
     if args.iter().any(|a| a == "--test-break") {
         command_tx.send(DaemonCommand::TriggerTestOverlay { mode: "break".to_string() }).ok();
     }
 
-    // 13. Run Slint Win32 GUI Event Loop until explicit tray Quit
+    // 11. Run Slint Win32 GUI Event Loop until explicit tray Quit
     slint::run_event_loop_until_quit()?;
 
     Ok(())

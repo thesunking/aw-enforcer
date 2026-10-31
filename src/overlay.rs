@@ -124,13 +124,15 @@ pub struct OverlayManager {
     status_pos: Rc<RefCell<Option<(i32, i32)>>>,
     desired_placements: Vec<Option<Win32Placement>>,
     applied_placements: Vec<Option<Win32Placement>>,
+    destroy_windows_on_hide: bool,
 }
 
 impl OverlayManager {
-    /// Creates a new `OverlayManager` with the given visual theme configuration and daemon command sender.
+    /// Creates a new `OverlayManager` with the given visual theme configuration, command sender, and performance setting.
     pub fn new(
         overlay_config: OverlayConfig,
         command_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::engine::DaemonCommand>>,
+        destroy_windows_on_hide: bool,
     ) -> Self {
         Self {
             windows: Vec::new(),
@@ -140,18 +142,37 @@ impl OverlayManager {
             status_pos: Rc::new(RefCell::new(None)),
             desired_placements: Vec::new(),
             applied_placements: Vec::new(),
+            destroy_windows_on_hide,
         }
     }
 
-    /// Ensures at least `active_count` overlay windows exist and hides any surplus windows.
+    /// Sets whether overlay windows are destroyed when hidden or kept in memory.
+    pub fn set_destroy_windows_on_hide(&mut self, destroy: bool) {
+        self.destroy_windows_on_hide = destroy;
+        if destroy && matches!(self.current_mode, OverlayMode::Hidden) {
+            self.windows.clear();
+        }
+    }
+
+    /// Ensures at least `active_count` overlay windows exist and hides or destroys any surplus windows.
     fn prepare_windows(&mut self, active_count: usize) {
         self.ensure_window_count(active_count);
         for i in active_count..self.windows.len() {
+            if let Some(hwnd) = Self::extract_hwnd(&self.windows[i]) {
+                unsafe {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
             self.windows[i].hide().ok();
-            if i < self.desired_placements.len() {
+            if !self.destroy_windows_on_hide && i < self.desired_placements.len() {
                 self.desired_placements[i] = None;
                 self.applied_placements[i] = None;
             }
+        }
+        if self.destroy_windows_on_hide {
+            self.windows.truncate(active_count);
+            self.desired_placements.truncate(active_count);
+            self.applied_placements.truncate(active_count);
         }
     }
 
@@ -490,6 +511,7 @@ impl OverlayManager {
     }
 
     /// Hides all managed overlay windows and resets placement state.
+    /// If `destroy_windows_on_hide` is true, window instances are cleared from memory.
     pub fn hide_all(&mut self) {
         self.current_mode = OverlayMode::Hidden;
         self.desired_placements.clear();
@@ -502,6 +524,15 @@ impl OverlayManager {
             }
             win.hide().ok();
         }
+        if self.destroy_windows_on_hide {
+            self.windows.clear();
+        }
+    }
+
+    /// Alias for `hide_all()` to destroy all overlay windows on demand.
+    #[allow(dead_code)]
+    pub fn hide(&mut self) {
+        self.hide_all();
     }
 
     /// Configures and displays the overlay windows according to the given `OverlayMode`.
