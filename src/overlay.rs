@@ -185,10 +185,10 @@ impl OverlayManager {
         }
     }
 
-    /// Computes top-right coordinates `(x, y)` inset by 20px inside the primary monitor's work area.
-    fn primary_top_right(monitors: &[MonitorBounds], card_w: i32) -> (i32, i32) {
+    /// Computes top-right coordinates `(x, y)` inset by `margin` inside the primary monitor's work area.
+    fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
         let m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
-        (m.work_rect.right - card_w - 20, m.work_rect.top + 20)
+        (m.work_rect.right - card_w - margin, m.work_rect.top + margin)
     }
 
     /// Updates the stored `OverlayConfig` and immediately applies the new colors/opacity to all managed windows.
@@ -346,6 +346,14 @@ impl OverlayManager {
                             cxRightWidth: -1,
                             cyTopHeight: -1,
                             cyBottomHeight: -1,
+                        };
+                        DwmExtendFrameIntoClientArea(hwnd, &margins);
+                    } else {
+                        let margins = MARGINS {
+                            cxLeftWidth: 0,
+                            cxRightWidth: 0,
+                            cyTopHeight: 0,
+                            cyBottomHeight: 0,
                         };
                         DwmExtendFrameIntoClientArea(hwnd, &margins);
                     }
@@ -654,9 +662,11 @@ impl OverlayManager {
                     win.set_snooze_options(ModelRc::from(Rc::new(VecModel::from(snooze_i32))));
                 }
 
-                let card_w = 480;
-                let card_h = 280;
-                let (x, y) = Self::primary_top_right(&monitors, card_w);
+                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let card_w = (480.0 * scale).round() as i32;
+                let card_h = (280.0 * scale).round() as i32;
+                let margin = (20.0 * scale).round() as i32;
+                let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, false, true, false);
             }
@@ -689,9 +699,11 @@ impl OverlayManager {
                     win.set_message_paragraphs(ModelRc::from(para_models));
                 }
 
-                let card_w = 420;
-                let card_h = 180;
-                let (x, y) = Self::primary_top_right(&monitors, card_w);
+                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let card_w = (420.0 * scale).round() as i32;
+                let card_h = (180.0 * scale).round() as i32;
+                let margin = (20.0 * scale).round() as i32;
+                let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, true, true, false);
             }
@@ -707,8 +719,10 @@ impl OverlayManager {
             } => {
                 self.prepare_windows(1);
 
-                let card_w = 540;
-                let card_h = 330;
+                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let card_w = (540.0 * scale).round() as i32;
+                let card_h = (330.0 * scale).round() as i32;
+                let margin = (20.0 * scale).round() as i32;
 
                 let win = &self.windows[0];
                 Self::apply_theme_to_window(win, &self.overlay_config);
@@ -735,7 +749,7 @@ impl OverlayManager {
                 });
                 let (x, y) = visible_pos
                     .or_else(|| *self.status_pos.borrow())
-                    .unwrap_or_else(|| Self::primary_top_right(&monitors, card_w));
+                    .unwrap_or_else(|| Self::primary_top_right(&monitors, card_w, margin));
 
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, *click_through, true, false);
             }
