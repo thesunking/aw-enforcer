@@ -66,6 +66,38 @@ component FormatToggleBtn inherits Rectangle {
     }
 }
 
+component InfoBadge inherits Rectangle {
+    in property <bool> is-active: true;
+    in-out property <bool> is-open: (touch.has-hover || self.clicked-open) && root.is-active;
+    property <bool> clicked-open: false;
+
+    width: root.is-active ? 18px : 0px;
+    height: root.is-active ? 18px : 0px;
+    border-radius: 9px;
+    background: root.is-open ? #2563eb : (touch.has-hover ? #3b82f6 : #334155);
+    border-width: root.is-active ? 1px : 0px;
+    border-color: root.is-open ? #60a5fa : #475569;
+    visible: root.is-active;
+
+    Text {
+        visible: root.is-active;
+        text: "ℹ";
+        font-size: 11px;
+        font-weight: 700;
+        color: root.is-open ? #ffffff : #94a3b8;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.is-active;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked-open = !root.clicked-open;
+        }
+    }
+}
+
 component SectionCard inherits Rectangle {
     in property <length> card-padding: 16px;
     in property <length> card-spacing: 14px;
@@ -79,18 +111,63 @@ component SectionCard inherits Rectangle {
     }
 }
 
-component FormRow inherits HorizontalLayout {
+component FormRow inherits Rectangle {
     in property <string> label;
     in property <length> label-width: 190px;
-    spacing: 12px;
+    in property <string> info-tip: "";
+    in property <length> tip-width: 380px;
+    height: row-content.preferred-height;
+    property <bool> tip-is-open: root.info-tip != "" && tip.is-open;
+    z: root.tip-is-open ? 1000 : 0;
 
-    Text {
-        text: root.label;
-        color: #cbd5e1;
-        vertical-alignment: center;
-        width: root.label-width;
+    row-content := HorizontalLayout {
+        spacing: 12px;
+
+        HorizontalLayout {
+            width: root.label-width;
+            spacing: root.info-tip != "" ? 8px : 0px;
+            alignment: start;
+
+            Text {
+                text: root.label;
+                color: #cbd5e1;
+                vertical-alignment: center;
+            }
+
+            tip := InfoBadge {
+                is-active: root.info-tip != "";
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        @children
     }
-    @children
+
+    if root.tip-is-open : Rectangle {
+        x: root.label-width + 8px;
+        y: -4px;
+        width: root.tip-width;
+        height: tip-layout.preferred-height;
+        background: #020617;
+        border-radius: 8px;
+        border-width: 1.5px;
+        border-color: #3b82f6;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000;
+        z: 2000;
+
+        tip-layout := VerticalLayout {
+            padding: 12px;
+            Text {
+                text: root.info-tip;
+                font-size: 12px;
+                color: #f8fafc;
+                wrap: word-wrap;
+            }
+        }
+
+        card-touch := TouchArea {}
+    }
 }
 
 component SidebarNavItem inherits Rectangle {
@@ -567,7 +644,8 @@ export component SettingsWindow inherits Window {
 
                         FormRow {
                             label: "Slint Renderer:";
-                            label-width: 220px;
+                            label-width: 250px;
+                            info-tip: "The OpenGL renderer (renderer-femtovg) is faster and smoother via GPU acceleration, but requires more memory. The CPU renderer (renderer-software) uses less memory, but may be slightly slower.";
                             HorizontalLayout {
                                 spacing: 12px;
                                 alignment: start;
@@ -595,7 +673,8 @@ export component SettingsWindow inherits Window {
 
                         FormRow {
                             label: "Destroy Windows when Hidden:";
-                            label-width: 220px;
+                            label-width: 250px;
+                            info-tip: "Keeping windows alive but hidden makes them appear faster with zero latency, but uses more memory. Destroying windows when hidden frees GPU surfaces and memory when not in use.";
                             CheckBox {
                                 text: "Release GPU surfaces and memory when windows are closed or hidden";
                                 checked <=> root.destroy-windows-on-hide;
