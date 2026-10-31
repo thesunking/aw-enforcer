@@ -6,8 +6,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE,
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
@@ -17,33 +17,83 @@ use windows_sys::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, PostMessageW, WM_CLOSE,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindowVisible, PostMessageW, WM_CLOSE,
 };
 
-/// Helper to check if an executable name matches any target executable name.
-fn exe_name_matches_targets(
+/// Canonical list of known browser executables used for URL rules and tab-closing actions.
+pub const BROWSER_EXES: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "opera.exe",
+    "vivaldi.exe",
+];
+
+/// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`).
+pub fn exe_name_matches_targets<S: AsRef<str>>(
     exe_name: &str,
-    target_executables: &[String],
+    target_executables: &[S],
 ) -> bool {
-    if target_executables.is_empty() {
+    let exe_trimmed = exe_name.trim();
+    if exe_trimmed.is_empty() || target_executables.is_empty() {
         return false;
     }
+    let exe_stem = exe_trimmed
+        .strip_suffix(".exe")
+        .or_else(|| exe_trimmed.strip_suffix(".EXE"))
+        .unwrap_or_else(|| {
+            if exe_trimmed.len() > 4
+                && exe_trimmed[exe_trimmed.len() - 4..].eq_ignore_ascii_case(".exe")
+            {
+                &exe_trimmed[..exe_trimmed.len() - 4]
+            } else {
+                exe_trimmed
+            }
+        });
 
     for target in target_executables {
-        let trimmed = target.trim();
-        if trimmed.is_empty() || trimmed == "*" {
+        let t = target.as_ref().trim();
+        if t.is_empty() || t == "*" {
             continue;
         }
-        let target_with_ext = format!("{trimmed}.exe");
-        if exe_name.eq_ignore_ascii_case(trimmed)
-            || exe_name.eq_ignore_ascii_case(&target_with_ext)
-        {
+        if exe_trimmed.eq_ignore_ascii_case(t) || exe_stem.eq_ignore_ascii_case(t) {
             return true;
         }
     }
-
     false
+}
+
+/// Iterates over all running processes via a Win32 ToolHelp snapshot, invoking `f(pid, exe_name)`.
+pub fn for_each_process(mut f: impl FnMut(u32, &str)) {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return;
+        }
+
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                f(entry.th32ProcessID, &exe_name);
+
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+
+        CloseHandle(snapshot);
+    }
 }
 
 /// Retrieves the executable file name for a process ID using `QueryFullProcessImageNameW` on a stack buffer.
@@ -76,7 +126,6 @@ pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
 }
 
 /// Returns true if Windows reports a fullscreen D3D app, presentation mode, busy fullscreen app, or Focus Assist quiet time.
-#[allow(dead_code)]
 pub fn is_fullscreen_or_presentation_active() -> bool {
     unsafe {
         let mut state: i32 = 0;
@@ -109,9 +158,34 @@ pub fn lock_workstation() -> bool {
     unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
 }
 
+/// Returns true if the window is invalid, invisible, minimized, owned by current process, or a Windows shell surface.
+unsafe fn is_protected_window(hwnd: HWND) -> bool {
+    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        return true;
+    }
+
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == GetCurrentProcessId() {
+        return true;
+    }
+
+    let mut class_buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+    if len > 0 {
+        let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+        match class_name.as_str() {
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Context passed into the Win32 `EnumWindows` callback to match and optionally close top-level windows.
-struct EnumMatchContext<'a> {
-    target_executables: &'a [String],
+struct EnumMatchContext<'a, S: AsRef<str>> {
+    target_executables: &'a [S],
     compiled_regex: Option<&'a Regex>,
     has_exe_targets: bool,
     close_matched: bool,
@@ -120,11 +194,11 @@ struct EnumMatchContext<'a> {
 }
 
 /// Win32 `EnumWindows` callback that inspects visible, non-minimized windows against title regex or process targets.
-unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &mut *(lparam as *mut EnumMatchContext);
-    if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if is_protected_window(hwnd) {
         return 1;
     }
+    let ctx = &mut *(lparam as *mut EnumMatchContext<'_, S>);
 
     let mut matches = false;
     let mut title = String::new();
@@ -177,14 +251,17 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> B
 }
 
 /// Enumerates top-level windows, optionally sending `WM_CLOSE` to matches, and returns `(matched_count, first_matched_name)`.
-fn scan_windows(
-    target_executables: &[String],
+fn scan_windows<S: AsRef<str>>(
+    target_executables: &[S],
     compiled_regex: Option<&Regex>,
     close_matched: bool,
 ) -> (usize, Option<String>) {
     let has_exe_targets = target_executables
         .iter()
-        .any(|t| !t.trim().is_empty() && t.trim() != "*");
+        .any(|t| {
+            let s = t.as_ref().trim();
+            !s.is_empty() && s != "*"
+        });
 
     let mut ctx = EnumMatchContext {
         target_executables,
@@ -197,8 +274,8 @@ fn scan_windows(
 
     unsafe {
         EnumWindows(
-            Some(enum_windows_callback),
-            &mut ctx as *mut EnumMatchContext as isize,
+            Some(enum_windows_callback::<S>),
+            &mut ctx as *mut EnumMatchContext<'_, S> as isize,
         );
     }
 
@@ -206,17 +283,17 @@ fn scan_windows(
 }
 
 /// Closes top-level visible windows matching target executables or title regex by sending WM_CLOSE.
-pub fn close_target_windows(
-    target_executables: &[String],
+pub fn close_target_windows<S: AsRef<str>>(
+    target_executables: &[S],
     compiled_regex: Option<&Regex>,
 ) -> usize {
     let is_wildcard = compiled_regex.is_none()
         && (target_executables.is_empty()
-            || target_executables.iter().any(|t| t.trim() == "*"));
+            || target_executables.iter().any(|t| t.as_ref().trim() == "*"));
     if is_wildcard {
         unsafe {
             let hwnd = GetForegroundWindow();
-            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+            if !is_protected_window(hwnd) {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 return 1;
             }
@@ -227,82 +304,67 @@ pub fn close_target_windows(
 }
 
 /// Finds the first matching visible, non-minimized window and returns the matched title or process name.
-#[allow(dead_code)]
-pub fn find_matching_window(
-    target_executables: &[String],
+pub fn find_matching_window<S: AsRef<str>>(
+    target_executables: &[S],
     compiled_regex: Option<&Regex>,
 ) -> Option<String> {
     scan_windows(target_executables, compiled_regex, false).1
 }
 
 /// Terminates processes matching target executables via Win32 ToolHelp snapshot.
-pub fn kill_target_processes(target_executables: &[String]) -> usize {
+pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
     if target_executables.is_empty() {
         return 0;
     }
     let has_specific_target = target_executables
         .iter()
-        .any(|t| !t.trim().is_empty() && t.trim() != "*");
+        .any(|t| {
+            let s = t.as_ref().trim();
+            !s.is_empty() && s != "*"
+        });
     if !has_specific_target {
         return 0;
     }
 
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
-            return 0;
+    let my_pid = unsafe { GetCurrentProcessId() };
+    let mut killed_count = 0;
+
+    for_each_process(|pid, exe_name| {
+        if pid == my_pid || pid == 0 {
+            return;
         }
 
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        let mut killed_count = 0;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-
-                // Never allow wildcard "*" to terminate all system processes
-                if exe_name_matches_targets(&exe_name, target_executables) {
-                    tracing::info!(
-                        "Terminating target process: {} (PID: {})",
-                        exe_name,
-                        entry.th32ProcessID
-                    );
-                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
-                    if !h_proc.is_null() {
-                        if TerminateProcess(h_proc, 1) != 0 {
-                            killed_count += 1;
-                        }
-                        CloseHandle(h_proc);
+        // Never allow wildcard "*" to terminate all system processes
+        if exe_name_matches_targets(exe_name, target_executables) {
+            tracing::info!(
+                "Terminating target process: {} (PID: {})",
+                exe_name,
+                pid
+            );
+            unsafe {
+                let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if !h_proc.is_null() {
+                    if TerminateProcess(h_proc, 1) != 0 {
+                        killed_count += 1;
                     }
-                }
-
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
+                    CloseHandle(h_proc);
                 }
             }
         }
+    });
 
-        CloseHandle(snapshot);
-        killed_count
-    }
+    killed_count
 }
 
 /// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
 /// returns true if Ctrl+W was sent.
-#[allow(dead_code)]
-pub fn close_active_browser_tab(
-    target_executables: &[String],
+pub fn close_active_browser_tab<S: AsRef<str>>(
+    target_executables: &[S],
     compiled_regex: Option<&Regex>,
 ) -> bool {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        if is_protected_window(hwnd) {
             return false;
         }
 
@@ -319,7 +381,7 @@ pub fn close_active_browser_tab(
         }
 
         if !matches && !target_executables.is_empty() {
-            if target_executables.iter().any(|t| t.trim() == "*") {
+            if target_executables.iter().any(|t| t.as_ref().trim() == "*") {
                 matches = true;
             } else {
                 let mut pid: u32 = 0;

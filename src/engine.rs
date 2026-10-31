@@ -1108,21 +1108,17 @@ impl Engine {
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
                 }
-                let browser_exes = [
-                    "chrome.exe".to_string(),
-                    "msedge.exe".to_string(),
-                    "firefox.exe".to_string(),
-                    "brave.exe".to_string(),
-                    "opera.exe".to_string(),
-                    "vivaldi.exe".to_string(),
-                ];
-                let exes = if rule.monitor_selection == MonitorSelection::Executables {
-                    &rule.target_executables
+                let tab_closed = if rule.monitor_selection == MonitorSelection::Executables {
+                    enforcer::close_active_browser_tab(&rule.target_executables, compiled_re)
                 } else {
-                    &browser_exes[..]
+                    enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, compiled_re)
                 };
-                if !enforcer::close_active_browser_tab(exes, compiled_re) {
-                    enforcer::close_target_windows(exes, compiled_re);
+                if !tab_closed {
+                    if rule.monitor_selection == MonitorSelection::Executables {
+                        enforcer::close_target_windows(&rule.target_executables, compiled_re);
+                    } else {
+                        enforcer::close_target_windows(enforcer::BROWSER_EXES, compiled_re);
+                    }
                 }
             }
             RuleAction::CloseWindow => {
@@ -1132,18 +1128,10 @@ impl Engine {
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
                 }
-                let browser_exes = [
-                    "chrome.exe".to_string(),
-                    "msedge.exe".to_string(),
-                    "firefox.exe".to_string(),
-                    "brave.exe".to_string(),
-                    "opera.exe".to_string(),
-                    "vivaldi.exe".to_string(),
-                ];
                 if rule.monitor_selection == MonitorSelection::Titles {
-                    enforcer::close_target_windows(&[], compiled_re);
+                    enforcer::close_target_windows::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    enforcer::close_target_windows(&browser_exes, None);
+                    enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
                 } else {
                     enforcer::close_target_windows(&rule.target_executables, None);
                 }
@@ -1413,16 +1401,7 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
                 return true;
             }
             if let Some(app) = ev.data.app.as_deref() {
-                for target in &rule.target_executables {
-                    let trimmed = target.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let with_exe = format!("{trimmed}.exe");
-                    if app.eq_ignore_ascii_case(trimmed) || app.eq_ignore_ascii_case(&with_exe) {
-                        return true;
-                    }
-                }
+                return enforcer::exe_name_matches_targets(app, &rule.target_executables);
             }
             false
         }
@@ -1432,17 +1411,9 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
 /// Helper to check if a visible matching window exists for this rule and return the matched title/process name.
 pub fn find_matching_window_for_rule(rule: &Rule, compiled_re: Option<&Regex>) -> Option<String> {
     match rule.monitor_selection {
-        MonitorSelection::Titles => enforcer::find_matching_window(&[], compiled_re),
+        MonitorSelection::Titles => enforcer::find_matching_window::<&str>(&[], compiled_re),
         MonitorSelection::Urls => {
-            let browser_exes = [
-                "chrome.exe".to_string(),
-                "msedge.exe".to_string(),
-                "firefox.exe".to_string(),
-                "brave.exe".to_string(),
-                "opera.exe".to_string(),
-                "vivaldi.exe".to_string(),
-            ];
-            enforcer::find_matching_window(&browser_exes, None)
+            enforcer::find_matching_window(enforcer::BROWSER_EXES, None)
         }
         MonitorSelection::Executables => {
             if rule.target_executables.is_empty()
