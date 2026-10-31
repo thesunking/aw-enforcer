@@ -419,8 +419,18 @@ impl Engine {
         for rule_id in launched_breaks {
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
-                let matched_app = find_matching_window_for_rule(&rule, re.as_ref())
-                    .unwrap_or_else(|| "Active Application".to_string());
+                let matched_app = if rule.monitor_selection == MonitorSelection::Urls {
+                    enforcer::find_matching_window(enforcer::BROWSER_EXES, None)
+                } else {
+                    find_matching_window_for_rule(
+                        &rule,
+                        re.as_ref(),
+                        &[],
+                        now.with_timezone(&Utc),
+                        self.config.general.poll_interval_seconds,
+                    )
+                }
+                .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.runtimes.get(&rule.id).map(|rt| rt.current_session_seconds).unwrap_or(0);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
@@ -508,8 +518,18 @@ impl Engine {
             }
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
-                let matched_name = find_matching_window_for_rule(&rule, re.as_ref())
-                    .unwrap_or_else(|| "Active Application".to_string());
+                let matched_name = if rule.monitor_selection == MonitorSelection::Urls {
+                    enforcer::find_matching_window(enforcer::BROWSER_EXES, None)
+                } else {
+                    find_matching_window_for_rule(
+                        &rule,
+                        re.as_ref(),
+                        &[],
+                        now.with_timezone(&Utc),
+                        self.config.general.poll_interval_seconds,
+                    )
+                }
+                .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.runtimes.get(&rule.id).map(|r| r.current_session_seconds).unwrap_or(0);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
@@ -903,7 +923,13 @@ impl Engine {
             }
         };
 
-        let matched_window = find_matching_window_for_rule(rule, compiled_re);
+        let matched_window = find_matching_window_for_rule(
+            rule,
+            compiled_re,
+            events,
+            now_utc,
+            self.config.general.poll_interval_seconds,
+        );
         let Some(matched_app_name) = matched_window else {
             return;
         };
@@ -952,6 +978,15 @@ impl Engine {
                 .unwrap_or(false);
 
             if rule.trigger == TriggerType::Limit && !is_destructive && already_executed {
+                return;
+            }
+
+            if rule.trigger == TriggerType::Limit
+                && rule.action == RuleAction::LockWorkstation
+                && already_executed
+                && get_idle_time_millis()
+                    >= (self.config.general.poll_interval_seconds.max(2) as u32) * 1000
+            {
                 return;
             }
 
@@ -1108,17 +1143,13 @@ impl Engine {
                     rt.last_completed_at = Some(now);
                     rt.action_executed_today = true;
                 }
-                let tab_closed = if rule.monitor_selection == MonitorSelection::Executables {
-                    enforcer::close_active_browser_tab(&rule.target_executables, compiled_re)
+                let title_re = (rule.monitor_selection == MonitorSelection::Titles)
+                    .then_some(compiled_re)
+                    .flatten();
+                if rule.monitor_selection == MonitorSelection::Executables {
+                    enforcer::close_active_browser_tab(&rule.target_executables, title_re);
                 } else {
-                    enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, compiled_re)
-                };
-                if !tab_closed {
-                    if rule.monitor_selection == MonitorSelection::Executables {
-                        enforcer::close_target_windows(&rule.target_executables, compiled_re);
-                    } else {
-                        enforcer::close_target_windows(enforcer::BROWSER_EXES, compiled_re);
-                    }
+                    enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re);
                 }
             }
             RuleAction::CloseWindow => {
@@ -1409,11 +1440,49 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
 }
 
 /// Helper to check if a visible matching window exists for this rule and return the matched title/process name.
-pub fn find_matching_window_for_rule(rule: &Rule, compiled_re: Option<&Regex>) -> Option<String> {
+pub fn find_matching_window_for_rule(
+    rule: &Rule,
+    compiled_re: Option<&Regex>,
+    events: &[AwEvent],
+    now_utc: DateTime<Utc>,
+    poll_interval_secs: u64,
+) -> Option<String> {
     match rule.monitor_selection {
         MonitorSelection::Titles => enforcer::find_matching_window::<&str>(&[], compiled_re),
         MonitorSelection::Urls => {
-            enforcer::find_matching_window(enforcer::BROWSER_EXES, None)
+            let browser_match = enforcer::find_matching_window(enforcer::BROWSER_EXES, None)?;
+            let recency_cutoff =
+                now_utc - Duration::seconds((poll_interval_secs.max(2) as i64) * 2 + 5);
+
+            let matching_ev = events
+                .iter()
+                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                .find(|ev| {
+                    let ev_end =
+                        ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                    ev_end >= recency_cutoff
+                });
+
+            if let Some(ev) = matching_ev {
+                Some(
+                    ev.data
+                        .url
+                        .as_deref()
+                        .map(|u| {
+                            u.strip_prefix("https://")
+                                .or_else(|| u.strip_prefix("http://"))
+                                .unwrap_or(u)
+                                .split('/')
+                                .next()
+                                .unwrap_or(u)
+                                .to_string()
+                        })
+                        .or_else(|| ev.data.url.clone())
+                        .unwrap_or(browser_match),
+                )
+            } else {
+                None
+            }
         }
         MonitorSelection::Executables => {
             if rule.target_executables.is_empty()
