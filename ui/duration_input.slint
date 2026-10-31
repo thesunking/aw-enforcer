@@ -22,11 +22,10 @@ export component DurationInput inherits HorizontalLayout {
 
     SpinBox {
         width: 110px;
-        value: root.value;
+        value <=> root.value;
         minimum: root.minimum-value;
         maximum: root.maximum-value;
         edited(val) => {
-            root.value = val;
             root.edited(val, root.unit);
         }
     }
@@ -34,9 +33,8 @@ export component DurationInput inherits HorizontalLayout {
     ComboBox {
         width: 85px;
         model: ["Hr", "Min", "Sec"];
-        current-value: root.unit;
+        current-value <=> root.unit;
         selected(u) => {
-            root.unit = u;
             root.edited(root.value, u);
         }
     }

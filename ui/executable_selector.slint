@@ -38,6 +38,7 @@ export component ExecutableSelector inherits VerticalLayout {
                 if (val != "" && val != "Pick running/recent app...") {
                     root.add-known-app(val);
                     self.current-value = "Pick running/recent app...";
+                    self.current-index = -1;
                 }
             }
         }

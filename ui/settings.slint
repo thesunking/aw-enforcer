@@ -243,6 +243,33 @@ export component SettingsWindow inherits Window {
     // Unified Rules Data
     in-out property <[RuleView]> rules;
 
+    // Active Rule Properties (bound directly with <=> to avoid one-way binding severance)
+    in-out property <bool> rule-enabled: true;
+    in-out property <string> rule-name: "";
+    in-out property <string> rule-monitor-selection: "Executables";
+    in-out property <string> rule-title-regex: "";
+    in-out property <string> rule-url-regex: "";
+    in-out property <string> rule-trigger: "Period";
+    in-out property <int> rule-period-val: 20;
+    in-out property <string> rule-period-unit: "Min";
+    in-out property <int> rule-reset-afk-val: 5;
+    in-out property <string> rule-reset-afk-unit: "Min";
+    in-out property <int> rule-limit-val: 60;
+    in-out property <string> rule-limit-unit: "Min";
+    in-out property <string> rule-action: "Show Overlay";
+    in-out property <string> rule-notification-method: "HUD";
+    in-out property <int> rule-notification-duration-val: 10;
+    in-out property <string> rule-notification-duration-unit: "Sec";
+    in-out property <bool> rule-show-remaining-time: true;
+    in-out property <int> rule-warn-before-val: 0;
+    in-out property <string> rule-warn-before-unit: "Sec";
+    in-out property <int> rule-grace-val: 0;
+    in-out property <string> rule-grace-unit: "Sec";
+    in-out property <int> rule-break-val: 5;
+    in-out property <string> rule-break-unit: "Min";
+    in-out property <bool> rule-click-through: false;
+    in-out property <bool> rule-strict-mode: false;
+
     // Known apps for dropdown picker
     in property <[string]> known-apps;
 
@@ -290,6 +317,8 @@ export component SettingsWindow inherits Window {
     callback apply-line-style(int /* line_idx */, string /* style */);
     callback append-placeholder(int /* line_idx */, string /* placeholder */);
     callback update-message-preview(int /* rule_idx */);
+    callback select-rule(int /* rule_idx */);
+    callback active-rule-edited();
 
     HorizontalLayout {
         // ==========================================
@@ -390,9 +419,7 @@ export component SettingsWindow inherits Window {
                             subnav := TouchArea {
                                 clicked => {
                                     root.active-tab = 1;
-                                    root.selected-rule-idx = i;
-                                    root.editor-message-text = r.message;
-                                    root.update-message-preview(i);
+                                    root.select-rule(i);
                                 }
                             }
                         }
@@ -600,11 +627,10 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             SpinBox {
                                 width: 140px;
-                                value: root.day-start-hour;
+                                value <=> root.day-start-hour;
                                 minimum: 0;
                                 maximum: 23;
                                 edited(val) => {
-                                    root.day-start-hour = val;
                                     root.has-unsaved-changes = true;
                                 }
                             }
@@ -699,11 +725,10 @@ export component SettingsWindow inherits Window {
                             label: "Overlay Opacity: " + Math.round(root.overlay-opacity * 100) + "%";
                             label-width: 220px;
                             Slider {
-                                value: root.overlay-opacity;
+                                value <=> root.overlay-opacity;
                                 minimum: 0.1;
                                 maximum: 1.0;
                                 changed(val) => {
-                                    root.overlay-opacity = val;
                                     root.has-unsaved-changes = true;
                                 }
                             }
@@ -887,9 +912,7 @@ export component SettingsWindow inherits Window {
 
                                     rule_touch := TouchArea {
                                         clicked => {
-                                            root.selected-rule-idx = i;
-                                            root.editor-message-text = r.message;
-                                            root.update-message-preview(i);
+                                            root.select-rule(i);
                                         }
                                     }
                                 }
@@ -1040,9 +1063,7 @@ export component SettingsWindow inherits Window {
                                     Button {
                                         text: "Configure";
                                         clicked => {
-                                            root.selected-rule-idx = i;
-                                            root.editor-message-text = r.message;
-                                            root.update-message-preview(i);
+                                            root.select-rule(i);
                                         }
                                     }
 
@@ -1060,9 +1081,9 @@ export component SettingsWindow inherits Window {
 
                     // 1B. CHILD RULE TAB
                     if root.selected-rule-idx >= 0 && root.selected-rule-idx < root.rules.length : child_rule_view := VerticalLayout {
-                        property <string> cur-monitor: root.rules[root.selected-rule-idx].monitor-selection;
-                        property <string> cur-trigger: root.rules[root.selected-rule-idx].trigger;
-                        property <string> cur-action: root.rules[root.selected-rule-idx].action;
+                        property <string> cur-monitor: root.rule-monitor-selection;
+                        property <string> cur-trigger: root.rule-trigger;
+                        property <string> cur-action: root.rule-action;
                         property <bool> has-target-executables: root.rules[root.selected-rule-idx].target-executables.length > 0;
 
                         spacing: 16px;
@@ -1075,11 +1096,10 @@ export component SettingsWindow inherits Window {
                             FormRow {
                                 label: "Rule Enabled:";
                                 CheckBox {
-                                    checked: root.rules[root.selected-rule-idx].enabled;
+                                    checked <=> root.rule-enabled;
                                     text: "Active during scheduled hours";
                                     toggled => {
-                                        root.rules[root.selected-rule-idx].enabled = self.checked;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1087,11 +1107,9 @@ export component SettingsWindow inherits Window {
                             FormRow {
                                 label: "Rule Name:";
                                 LineEdit {
-                                    text: root.rules[root.selected-rule-idx].name;
+                                    text <=> root.rule-name;
                                     edited(val) => {
-                                        root.rules[root.selected-rule-idx].name = val;
-                                        root.has-unsaved-changes = true;
-                                        root.update-message-preview(root.selected-rule-idx);
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1107,20 +1125,9 @@ export component SettingsWindow inherits Window {
                                 ComboBox {
                                     width: 200px;
                                     model: ["Executables", "Titles", "Urls"];
-                                    current-value: root.rules[root.selected-rule-idx].monitor-selection;
+                                    current-value <=> root.rule-monitor-selection;
                                     selected(val) => {
-                                        root.rules[root.selected-rule-idx].monitor-selection = val;
-                                        if val == "Executables" {
-                                            if root.rules[root.selected-rule-idx].action == "Kill Process" && root.rules[root.selected-rule-idx].target-executables.length == 0 {
-                                                root.rules[root.selected-rule-idx].action = "Close Window";
-                                            }
-                                        } else {
-                                            if root.rules[root.selected-rule-idx].action == "Kill Process" {
-                                                root.rules[root.selected-rule-idx].action = "Close Window";
-                                            }
-                                        }
-                                        root.update-message-preview(root.selected-rule-idx);
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1142,11 +1149,10 @@ export component SettingsWindow inherits Window {
                             if child_rule_view.cur-monitor == "Titles" : FormRow {
                                 label: "Window Title Regex:";
                                 LineEdit {
-                                    text: root.rules[root.selected-rule-idx].title-regex;
+                                    text <=> root.rule-title-regex;
                                     placeholder-text: "(?i)(youtube|twitch|reddit)";
                                     edited(val) => {
-                                        root.rules[root.selected-rule-idx].title-regex = val;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1154,11 +1160,10 @@ export component SettingsWindow inherits Window {
                             if child_rule_view.cur-monitor == "Urls" : FormRow {
                                 label: "Browser URL Regex:";
                                 LineEdit {
-                                    text: root.rules[root.selected-rule-idx].url-regex;
+                                    text <=> root.rule-url-regex;
                                     placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
                                     edited(val) => {
-                                        root.rules[root.selected-rule-idx].url-regex = val;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1175,11 +1180,9 @@ export component SettingsWindow inherits Window {
                                 ComboBox {
                                     width: 220px;
                                     model: ["Period", "Limit"];
-                                    current-value: root.rules[root.selected-rule-idx].trigger;
+                                    current-value <=> root.rule-trigger;
                                     selected(val) => {
-                                        root.rules[root.selected-rule-idx].trigger = val;
-                                        root.update-message-preview(root.selected-rule-idx);
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1188,13 +1191,10 @@ export component SettingsWindow inherits Window {
                                 label: "Period:";
                                 minimum-value: 1;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].period-val;
-                                unit: root.rules[root.selected-rule-idx].period-unit;
+                                value <=> root.rule-period-val;
+                                unit <=> root.rule-period-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].period-val = val;
-                                    root.rules[root.selected-rule-idx].period-unit = u;
-                                    root.update-message-preview(root.selected-rule-idx);
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
@@ -1202,12 +1202,10 @@ export component SettingsWindow inherits Window {
                                 label: "Reset Session after AFK:";
                                 minimum-value: 1;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].reset-afk-val;
-                                unit: root.rules[root.selected-rule-idx].reset-afk-unit;
+                                value <=> root.rule-reset-afk-val;
+                                unit <=> root.rule-reset-afk-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].reset-afk-val = val;
-                                    root.rules[root.selected-rule-idx].reset-afk-unit = u;
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
@@ -1215,13 +1213,10 @@ export component SettingsWindow inherits Window {
                                 label: "Daily Limit (0 = immediate):";
                                 minimum-value: 0;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].limit-val;
-                                unit: root.rules[root.selected-rule-idx].limit-unit;
+                                value <=> root.rule-limit-val;
+                                unit <=> root.rule-limit-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].limit-val = val;
-                                    root.rules[root.selected-rule-idx].limit-unit = u;
-                                    root.update-message-preview(root.selected-rule-idx);
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
                         }
@@ -1239,10 +1234,9 @@ export component SettingsWindow inherits Window {
                                     model: (child_rule_view.cur-monitor == "Executables" && child_rule_view.has-target-executables)
                                         ? ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]
                                         : ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window"];
-                                    current-value: root.rules[root.selected-rule-idx].action;
+                                    current-value <=> root.rule-action;
                                     selected(val) => {
-                                        root.rules[root.selected-rule-idx].action = val;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1255,21 +1249,21 @@ export component SettingsWindow inherits Window {
                                         width: 106px;
                                         height: 32px;
                                         border-radius: 6px;
-                                        background: root.rules[root.selected-rule-idx].notification-method == method
+                                        background: root.rule-notification-method == method
                                             ? #2563eb
                                             : (method_touch.has-hover ? #334155 : #0f172a);
                                         border-width: 1px;
-                                        border-color: root.rules[root.selected-rule-idx].notification-method == method
+                                        border-color: root.rule-notification-method == method
                                             ? #60a5fa
                                             : #475569;
 
                                         Text {
                                             text: method;
-                                            color: root.rules[root.selected-rule-idx].notification-method == method
+                                            color: root.rule-notification-method == method
                                                 ? #ffffff
                                                 : #cbd5e1;
                                             font-size: 13px;
-                                            font-weight: root.rules[root.selected-rule-idx].notification-method == method ? 700 : 500;
+                                            font-weight: root.rule-notification-method == method ? 700 : 500;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
                                         }
@@ -1277,35 +1271,32 @@ export component SettingsWindow inherits Window {
                                         method_touch := TouchArea {
                                             mouse-cursor: pointer;
                                             clicked => {
-                                                root.rules[root.selected-rule-idx].notification-method = method;
-                                                root.has-unsaved-changes = true;
+                                                root.rule-notification-method = method;
+                                                root.active-rule-edited();
                                             }
                                         }
                                     }
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Notification" && root.rules[root.selected-rule-idx].notification-method == "HUD" : DurationInput {
+                            if child_rule_view.cur-action == "Show Notification" && root.rule-notification-method == "HUD" : DurationInput {
                                 label: "Duration:";
                                 minimum-value: 1;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].notification-duration-val;
-                                unit: root.rules[root.selected-rule-idx].notification-duration-unit;
+                                value <=> root.rule-notification-duration-val;
+                                unit <=> root.rule-notification-duration-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].notification-duration-val = val;
-                                    root.rules[root.selected-rule-idx].notification-duration-unit = u;
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Notification" && root.rules[root.selected-rule-idx].notification-method == "HUD" : FormRow {
+                            if child_rule_view.cur-action == "Show Notification" && root.rule-notification-method == "HUD" : FormRow {
                                 label: "Show Time Remaining:";
                                 CheckBox {
                                     text: "Show countdown timer on notification";
-                                    checked: root.rules[root.selected-rule-idx].show-remaining-time;
+                                    checked <=> root.rule-show-remaining-time;
                                     toggled => {
-                                        root.rules[root.selected-rule-idx].show-remaining-time = self.checked;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1314,13 +1305,10 @@ export component SettingsWindow inherits Window {
                                 label: "Warn Before Action (0 = disabled):";
                                 minimum-value: 0;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].warn-before-val;
-                                unit: root.rules[root.selected-rule-idx].warn-before-unit;
+                                value <=> root.rule-warn-before-val;
+                                unit <=> root.rule-warn-before-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].warn-before-val = val;
-                                    root.rules[root.selected-rule-idx].warn-before-unit = u;
-                                    root.update-message-preview(root.selected-rule-idx);
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
@@ -1328,12 +1316,10 @@ export component SettingsWindow inherits Window {
                                 label: "Grace Countdown (0 = disabled):";
                                 minimum-value: 0;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].grace-val;
-                                unit: root.rules[root.selected-rule-idx].grace-unit;
+                                value <=> root.rule-grace-val;
+                                unit <=> root.rule-grace-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].grace-val = val;
-                                    root.rules[root.selected-rule-idx].grace-unit = u;
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
@@ -1341,13 +1327,10 @@ export component SettingsWindow inherits Window {
                                 label: "Break Duration:";
                                 minimum-value: 1;
                                 maximum-value: 3600;
-                                value: root.rules[root.selected-rule-idx].break-val;
-                                unit: root.rules[root.selected-rule-idx].break-unit;
+                                value <=> root.rule-break-val;
+                                unit <=> root.rule-break-unit;
                                 edited(val, u) => {
-                                    root.rules[root.selected-rule-idx].break-val = val;
-                                    root.rules[root.selected-rule-idx].break-unit = u;
-                                    root.update-message-preview(root.selected-rule-idx);
-                                    root.has-unsaved-changes = true;
+                                    root.active-rule-edited();
                                 }
                             }
 
@@ -1355,10 +1338,9 @@ export component SettingsWindow inherits Window {
                                 label: "Click-through Overlay:";
                                 CheckBox {
                                     text: "Pass mouse clicks and keystrokes through overlay";
-                                    checked: root.rules[root.selected-rule-idx].click-through;
+                                    checked <=> root.rule-click-through;
                                     toggled => {
-                                        root.rules[root.selected-rule-idx].click-through = self.checked;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }
@@ -1367,10 +1349,9 @@ export component SettingsWindow inherits Window {
                                 label: "Strict Mode:";
                                 CheckBox {
                                     text: "Hide Skip/Snooze buttons and lock settings during enforcement";
-                                    checked: root.rules[root.selected-rule-idx].strict-mode;
+                                    checked <=> root.rule-strict-mode;
                                     toggled => {
-                                        root.rules[root.selected-rule-idx].strict-mode = self.checked;
-                                        root.has-unsaved-changes = true;
+                                        root.active-rule-edited();
                                     }
                                 }
                             }

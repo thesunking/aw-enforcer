@@ -276,6 +276,37 @@ fn refresh_message_editor_state(
     }
 }
 
+/// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
+fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView) {
+    win.set_rule_enabled(rule.enabled);
+    win.set_rule_name(rule.name.clone());
+    win.set_rule_monitor_selection(rule.monitor_selection.clone());
+    win.set_rule_title_regex(rule.title_regex.clone());
+    win.set_rule_url_regex(rule.url_regex.clone());
+    win.set_rule_trigger(rule.trigger.clone());
+    win.set_rule_period_val(rule.period_val);
+    win.set_rule_period_unit(rule.period_unit.clone());
+    win.set_rule_reset_afk_val(rule.reset_afk_val);
+    win.set_rule_reset_afk_unit(rule.reset_afk_unit.clone());
+    win.set_rule_limit_val(rule.limit_val);
+    win.set_rule_limit_unit(rule.limit_unit.clone());
+    win.set_rule_action(rule.action.clone());
+    win.set_rule_notification_method(rule.notification_method.clone());
+    win.set_rule_notification_duration_val(rule.notification_duration_val);
+    win.set_rule_notification_duration_unit(rule.notification_duration_unit.clone());
+    win.set_rule_show_remaining_time(rule.show_remaining_time);
+    win.set_rule_warn_before_val(rule.warn_before_val);
+    win.set_rule_warn_before_unit(rule.warn_before_unit.clone());
+    win.set_rule_grace_val(rule.grace_val);
+    win.set_rule_grace_unit(rule.grace_unit.clone());
+    win.set_rule_break_val(rule.break_val);
+    win.set_rule_break_unit(rule.break_unit.clone());
+    win.set_rule_click_through(rule.click_through);
+    win.set_rule_strict_mode(rule.strict_mode);
+    win.set_editor_message_text(rule.message.clone());
+    refresh_message_editor_state(win, &rule.message, 0, Some(rule));
+}
+
 /// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
 fn apply_config_to_ui(
     win: &SettingsWindow,
@@ -319,7 +350,7 @@ fn apply_config_to_ui(
 
     if let Some(r) = cfg.rules.get(safe_idx) {
         let rv = rule_to_view(r);
-        refresh_message_editor_state(win, &r.message, 0, Some(&rv));
+        load_rule_into_editor(win, &rv);
     }
     win.set_has_unsaved_changes(false);
 }
@@ -366,12 +397,7 @@ fn add_executable_to_rule(
         if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(trimmed)) {
             targets.push(trimmed.into());
             rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
-            refresh_message_editor_state(
-                win,
-                &rule_view.message,
-                win.get_selected_message_line() as usize,
-                Some(rule_view),
-            );
+            load_rule_into_editor(win, rule_view);
             return true;
         }
         false
@@ -655,7 +681,7 @@ fn open_settings_window(
                 let idx = rm.row_count();
                 rm.push(rv.clone());
                 win.set_selected_rule_idx(idx as i32);
-                refresh_message_editor_state(&win, &new_rule.message, 0, Some(&rv));
+                load_rule_into_editor(&win, &rv);
                 win.set_has_unsaved_changes(true);
             }
         });
@@ -676,7 +702,7 @@ fn open_settings_window(
                             let new_idx = if u < rm.row_count() { u } else { rm.row_count() - 1 };
                             win.set_selected_rule_idx(new_idx as i32);
                             if let Some(rule) = rm.row_data(new_idx) {
-                                refresh_message_editor_state(&win, &rule.message, 0, Some(&rule));
+                                load_rule_into_editor(&win, &rule);
                             }
                         } else {
                             win.set_selected_rule_idx(-1);
@@ -686,6 +712,79 @@ fn open_settings_window(
                         win.set_selected_rule_idx(cur - 1);
                     }
                     win.set_has_unsaved_changes(true);
+                }
+            }
+        });
+    }
+
+    // Select rule
+    {
+        let rm = rules_model.clone();
+        let sw = settings_weak.clone();
+        settings_win.on_select_rule(move |idx| {
+            if let Some(win) = sw.upgrade() {
+                let u = idx as usize;
+                if u < rm.row_count() {
+                    win.set_selected_rule_idx(idx);
+                    if let Some(rule) = rm.row_data(u) {
+                        load_rule_into_editor(&win, &rule);
+                    }
+                }
+            }
+        });
+    }
+
+    // Active rule edited
+    {
+        let rm = rules_model.clone();
+        let sw = settings_weak.clone();
+        settings_win.on_active_rule_edited(move || {
+            if let Some(win) = sw.upgrade() {
+                let idx = win.get_selected_rule_idx();
+                let u = idx as usize;
+                if idx >= 0 && u < rm.row_count() {
+                    if let Some(mut rule) = rm.row_data(u) {
+                        rule.enabled = win.get_rule_enabled();
+                        rule.name = win.get_rule_name();
+                        rule.monitor_selection = win.get_rule_monitor_selection();
+                        rule.title_regex = win.get_rule_title_regex();
+                        rule.url_regex = win.get_rule_url_regex();
+                        rule.trigger = win.get_rule_trigger();
+                        rule.period_val = win.get_rule_period_val();
+                        rule.period_unit = win.get_rule_period_unit();
+                        rule.reset_afk_val = win.get_rule_reset_afk_val();
+                        rule.reset_afk_unit = win.get_rule_reset_afk_unit();
+                        rule.limit_val = win.get_rule_limit_val();
+                        rule.limit_unit = win.get_rule_limit_unit();
+                        rule.action = win.get_rule_action();
+                        rule.notification_method = win.get_rule_notification_method();
+                        rule.notification_duration_val = win.get_rule_notification_duration_val();
+                        rule.notification_duration_unit = win.get_rule_notification_duration_unit();
+                        rule.show_remaining_time = win.get_rule_show_remaining_time();
+                        rule.warn_before_val = win.get_rule_warn_before_val();
+                        rule.warn_before_unit = win.get_rule_warn_before_unit();
+                        rule.grace_val = win.get_rule_grace_val();
+                        rule.grace_unit = win.get_rule_grace_unit();
+                        rule.break_val = win.get_rule_break_val();
+                        rule.break_unit = win.get_rule_break_unit();
+                        rule.click_through = win.get_rule_click_through();
+                        rule.strict_mode = win.get_rule_strict_mode();
+
+                        let has_specific_exe = rule.monitor_selection.as_str() == "Executables"
+                            && rule.target_executables.iter().any(|t| {
+                                let s = t.trim();
+                                !s.is_empty() && s != "*"
+                            });
+                        if !has_specific_exe && rule.action.as_str() == "Kill Process" {
+                            rule.action = "Close Window".into();
+                            win.set_rule_action(rule.action.clone());
+                        }
+
+                        let cur_line = win.get_selected_message_line() as usize;
+                        refresh_message_editor_state(&win, &rule.message, cur_line, Some(&rule));
+                        rm.set_row_data(u, rule);
+                        win.set_has_unsaved_changes(true);
+                    }
                 }
             }
         });
@@ -745,12 +844,7 @@ fn open_settings_window(
                     }
                     rule_view.target_executables =
                         ModelRc::from(Rc::new(VecModel::from(current_targets)));
-                    refresh_message_editor_state(
-                        win,
-                        &rule_view.message,
-                        win.get_selected_message_line() as usize,
-                        Some(rule_view),
-                    );
+                    load_rule_into_editor(win, rule_view);
                     return true;
                 }
                 false
