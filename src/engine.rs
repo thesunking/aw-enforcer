@@ -139,6 +139,7 @@ pub struct RuleRuntime {
     pub action_executed_today: bool,
     pub snoozed_until: Option<DateTime<Local>>,
     pub live_status_badge: String,
+    pub last_matched_app: Option<String>,
 }
 
 impl RuleRuntime {
@@ -158,6 +159,7 @@ impl RuleRuntime {
             action_executed_today: false,
             snoozed_until: None,
             live_status_badge: String::new(),
+            last_matched_app: None,
         }
     }
 
@@ -178,6 +180,7 @@ impl RuleRuntime {
         self.last_completed_at = Some(now);
         self.can_rollback_completion = true;
         self.action_executed_today = true;
+        self.last_matched_app = None;
     }
 
     /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
@@ -309,6 +312,131 @@ impl Engine {
                 .map(|rt| rt.daily_usage_seconds)
                 .unwrap_or(0),
         }
+    }
+
+    /// Returns `true` if `self.active_overlay_mode` is `BreakEnforcer`, `HudTimer`, or `HudToast` with matching `rule_id`.
+    pub fn is_rule_displayed(&self, rule_id: &str) -> bool {
+        self.active_overlay_mode.rule_id() == Some(rule_id)
+    }
+
+    /// Transitions to the highest-priority remaining active countdown rule, or hides the overlay if none remain.
+    pub fn transition_to_active_countdown_or_hide(&mut self) {
+        // 1. Highest priority: BreakEnforcer (active_break > 0)
+        let active_break_rule = self.config.rules.iter().find(|r| {
+            self.runtimes
+                .get(&r.id)
+                .and_then(|rt| rt.active_break)
+                .map(|(rem, _)| rem > 0)
+                .unwrap_or(false)
+        }).cloned();
+
+        if let Some(rule) = active_break_rule {
+            let (rem, total) = self
+                .runtimes
+                .get(&rule.id)
+                .and_then(|rt| rt.active_break)
+                .unwrap();
+            let matched_app = self
+                .runtimes
+                .get(&rule.id)
+                .and_then(|r| r.last_matched_app.clone())
+                .unwrap_or_else(|| "Active Application".to_string());
+            let elapsed = self.rule_elapsed_seconds(&rule);
+            let threshold = match rule.trigger {
+                TriggerType::Period => rule.period.to_seconds(),
+                TriggerType::Limit => rule.limit.to_seconds(),
+            };
+            let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+            let paragraphs = formatter::parse_message(
+                &rule.message,
+                &ctx,
+                self.default_text_color(),
+                TextHorizontalAlignment::Center,
+            );
+            self.active_overlay_mode = OverlayMode::Hidden;
+            self.show_overlay(OverlayMode::BreakEnforcer {
+                rule_id: rule.id.clone(),
+                title: rule.name.clone(),
+                paragraphs,
+                remaining_seconds: rem,
+                allow_snooze: !rule.strict_mode,
+                strict_mode: rule.strict_mode,
+                click_through: rule.click_through,
+            });
+            self.overlay_tx
+                .send(OverlayAction::UpdateCountdown {
+                    remaining: rem,
+                    total,
+                    is_idle: get_idle_time_millis() >= 3000,
+                })
+                .ok();
+            return;
+        }
+
+        // 2. Second highest priority: HudTimer (grace_countdown > 0)
+        let grace_rule = self.config.rules.iter().find(|r| {
+            self.runtimes
+                .get(&r.id)
+                .and_then(|rt| rt.grace_countdown)
+                .map(|(rem, _)| rem > 0)
+                .unwrap_or(false)
+        }).cloned();
+
+        if let Some(rule) = grace_rule {
+            let (rem, total) = self
+                .runtimes
+                .get(&rule.id)
+                .and_then(|rt| rt.grace_countdown)
+                .unwrap();
+            let matched_app = self
+                .runtimes
+                .get(&rule.id)
+                .and_then(|r| r.last_matched_app.clone())
+                .unwrap_or_else(|| "Active Application".to_string());
+            let elapsed = self.rule_elapsed_seconds(&rule);
+            let threshold = match rule.trigger {
+                TriggerType::Period => rule.period.to_seconds(),
+                TriggerType::Limit => rule.limit.to_seconds(),
+            };
+            let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+            let default_msg = format!(
+                "[color=#f87171 bold] {} in {}s.",
+                rule.action.as_str(),
+                total
+            );
+            let raw_msg = if matches!(rule.action, RuleAction::ShowOverlay | RuleAction::ShowNotification)
+                && !rule.message.trim().is_empty()
+            {
+                &rule.message
+            } else {
+                &default_msg
+            };
+            let paragraphs = formatter::parse_message(
+                raw_msg,
+                &ctx,
+                self.default_text_color(),
+                TextHorizontalAlignment::Left,
+            );
+            self.active_overlay_mode = OverlayMode::Hidden;
+            self.show_overlay(OverlayMode::HudTimer {
+                rule_id: rule.id.clone(),
+                title: format!("{}: {}", rule.action.as_str(), rule.name),
+                paragraphs,
+                duration_seconds: total,
+                remaining_seconds: rem,
+            });
+            self.overlay_tx
+                .send(OverlayAction::UpdateCountdown {
+                    remaining: rem,
+                    total,
+                    is_idle: get_idle_time_millis() >= 3000,
+                })
+                .ok();
+            return;
+        }
+
+        // 3. No active countdown remaining: hide overlay
+        self.hide_overlay();
     }
 
     /// Handles asynchronous daemon commands from tray or UI.
@@ -474,6 +602,7 @@ impl Engine {
                         self.config.general.poll_interval_seconds,
                     )
                 }
+                .or_else(|| self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone()))
                 .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = match rule.trigger {
@@ -506,60 +635,77 @@ impl Engine {
             }
         }
 
+        let rule_ids: Vec<String> = self.runtimes.keys().cloned().collect();
+
         // 1. Check active break countdowns
         let mut completed_breaks = Vec::new();
-        for (rule_id, rt) in self.runtimes.iter_mut() {
-            if let Some((ref mut rem, total)) = rt.active_break {
-                if is_idle && *rem > 0 {
-                    *rem -= 1;
-                }
-                self.overlay_tx
-                    .send(OverlayAction::UpdateCountdown {
-                        remaining: *rem,
-                        total,
-                        is_idle,
-                    })
-                    .ok();
+        let mut break_displayed_finished = false;
+        for rule_id in &rule_ids {
+            let is_displayed = self.is_rule_displayed(rule_id);
+            if let Some(rt) = self.runtimes.get_mut(rule_id) {
+                if let Some((ref mut rem, total)) = rt.active_break {
+                    if is_idle && *rem > 0 {
+                        *rem -= 1;
+                    }
+                    if is_displayed {
+                        self.overlay_tx
+                            .send(OverlayAction::UpdateCountdown {
+                                remaining: *rem,
+                                total,
+                                is_idle,
+                            })
+                            .ok();
+                    }
 
-                if *rem == 0 {
-                    rt.complete_cycle(Local::now());
-                    completed_breaks.push(rule_id.clone());
+                    if *rem == 0 {
+                        rt.complete_cycle(Local::now());
+                        completed_breaks.push(rule_id.clone());
+                        if is_displayed {
+                            break_displayed_finished = true;
+                        }
+                    }
                 }
             }
         }
-        if !completed_breaks.is_empty() && !self.any_countdown_active() {
-            self.hide_overlay();
+        if break_displayed_finished {
+            self.transition_to_active_countdown_or_hide();
         }
 
         // 2. Check active grace countdowns for limit rules
         let mut completed_enforcements = Vec::new();
-        for (rule_id, rt) in self.runtimes.iter_mut() {
-            if let Some((ref mut rem, total)) = rt.grace_countdown {
-                if *rem > 0 {
-                    *rem -= 1;
-                    self.overlay_tx
-                        .send(OverlayAction::UpdateCountdown {
-                            remaining: *rem,
-                            total,
-                            is_idle,
-                        })
-                        .ok();
-                }
+        let mut grace_displayed_finished = false;
+        for rule_id in &rule_ids {
+            let is_displayed = self.is_rule_displayed(rule_id);
+            if let Some(rt) = self.runtimes.get_mut(rule_id) {
+                if let Some((ref mut rem, total)) = rt.grace_countdown {
+                    if *rem > 0 {
+                        *rem -= 1;
+                        if is_displayed {
+                            self.overlay_tx
+                                .send(OverlayAction::UpdateCountdown {
+                                    remaining: *rem,
+                                    total,
+                                    is_idle,
+                                })
+                                .ok();
+                        }
+                    }
 
-                if *rem == 0 {
-                    rt.grace_countdown = None;
-                    completed_enforcements.push(rule_id.clone());
+                    if *rem == 0 {
+                        rt.grace_countdown = None;
+                        completed_enforcements.push(rule_id.clone());
+                        if is_displayed {
+                            grace_displayed_finished = true;
+                        }
+                    }
                 }
             }
         }
 
         for rule_id in completed_enforcements {
-            if !self.any_countdown_active() {
-                self.hide_overlay();
-            }
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
-                let matched_name = if rule.monitor_selection == MonitorSelection::Urls {
+                let target_window = if rule.monitor_selection == MonitorSelection::Urls {
                     enforcer::find_matching_window(enforcer::BROWSER_EXES, None)
                 } else {
                     find_matching_window_for_rule(
@@ -569,14 +715,42 @@ impl Engine {
                         now.with_timezone(&Utc),
                         self.config.general.poll_interval_seconds,
                     )
+                };
+
+                let is_destructive = matches!(
+                    rule.action,
+                    RuleAction::CloseTab
+                        | RuleAction::CloseWindow
+                        | RuleAction::KillProcess
+                        | RuleAction::LockWorkstation
+                );
+
+                if is_destructive && target_window.is_none() {
+                    tracing::info!(
+                        "Target window for rule '{}' was closed during grace period; skipping destructive action",
+                        rule.name
+                    );
+                    if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                        rt.complete_cycle(now);
+                    }
+                    continue;
                 }
-                .unwrap_or_else(|| "Active Application".to_string());
+
+                let matched_name = target_window
+                    .or_else(|| self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone()))
+                    .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = match rule.trigger {
                     TriggerType::Period => rule.period.to_seconds(),
                     TriggerType::Limit => rule.limit.to_seconds(),
                 };
                 self.execute_rule_action(&rule, re.as_ref(), now, &matched_name, elapsed, threshold).await;
+            }
+        }
+
+        if grace_displayed_finished {
+            if !matches!(self.active_overlay_mode, OverlayMode::BreakEnforcer { .. }) {
+                self.transition_to_active_countdown_or_hide();
             }
         }
 
@@ -597,8 +771,8 @@ impl Engine {
                         is_idle,
                     })
                     .ok();
-                if rem == 0 && !self.any_countdown_active() {
-                    self.hide_overlay();
+                if rem == 0 {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
         } else if let OverlayMode::HudTimer {
@@ -618,8 +792,8 @@ impl Engine {
                         is_idle,
                     })
                     .ok();
-                if rem == 0 && !self.any_countdown_active() {
-                    self.hide_overlay();
+                if rem == 0 {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
         } else if let OverlayMode::BreakEnforcer {
@@ -640,8 +814,8 @@ impl Engine {
                         is_idle,
                     })
                     .ok();
-                if rem == 0 && !self.any_countdown_active() {
-                    self.hide_overlay();
+                if rem == 0 {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
         }
@@ -663,6 +837,7 @@ impl Engine {
                 rt.pending_break_since = None;
                 rt.daily_usage_seconds = 0;
                 rt.can_rollback_completion = false;
+                rt.last_matched_app = None;
             }
         }
 
@@ -989,6 +1164,10 @@ impl Engine {
         let Some(matched_app_name) = matched_window else {
             return true;
         };
+
+        if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+            rt.last_matched_app = Some(matched_app_name.clone());
+        }
 
         let warn_secs = rule.warn_before.to_seconds();
         let grace_secs = rule.grace_duration.to_seconds();
@@ -2068,5 +2247,108 @@ mod tests {
 
         assert_eq!(engine.rule_elapsed_seconds(&period_rule), 1800);
         assert_eq!(engine.rule_elapsed_seconds(&limit_rule), 7200);
+    }
+
+    #[tokio::test]
+    async fn test_isolated_countdown_updates_and_toast_expiry() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut break_rule = Rule::default_template(0);
+        break_rule.id = "rule-break".to_string();
+        break_rule.action = RuleAction::ShowOverlay;
+
+        let mut grace_rule = Rule::default_template(1);
+        grace_rule.id = "rule-grace".to_string();
+        grace_rule.action = RuleAction::CloseWindow;
+        grace_rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![break_rule.clone(), grace_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Simulate active BreakEnforcer overlay for rule-break
+        engine.runtimes.get_mut("rule-break").unwrap().active_break = Some((300, 300));
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-break".to_string(),
+            title: "Break".to_string(),
+            paragraphs: Vec::new(),
+            remaining_seconds: 300,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        };
+
+        // rule-grace has a background grace countdown
+        engine.runtimes.get_mut("rule-grace").unwrap().grace_countdown = Some((10, 10));
+
+        assert!(engine.is_rule_displayed("rule-break"));
+        assert!(!engine.is_rule_displayed("rule-grace"));
+
+        // Drain any pending messages
+        while overlay_rx.try_recv().is_ok() {}
+
+        // Tick realtime
+        engine.realtime_tick().await;
+
+        // Background grace_countdown decremented to 9
+        assert_eq!(
+            engine.runtimes.get("rule-grace").unwrap().grace_countdown,
+            Some((9, 10))
+        );
+
+        // Verify that NO UpdateCountdown for grace_countdown (remaining: 9) was sent to the overlay!
+        let mut received_grace_countdown = false;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::UpdateCountdown { remaining, .. } = action {
+                if remaining == 9 {
+                    received_grace_countdown = true;
+                }
+            }
+        }
+        assert!(
+            !received_grace_countdown,
+            "Background grace countdown should not send UpdateCountdown to active BreakEnforcer overlay"
+        );
+
+        // 2. Expired HudToast hides cleanly (or transitions to active countdown)
+        // Set HudToast with 1s remaining and no other active countdowns
+        engine.runtimes.get_mut("rule-break").unwrap().active_break = None;
+        engine.runtimes.get_mut("rule-grace").unwrap().grace_countdown = None;
+
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-toast".to_string(),
+            title: "Toast".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![5],
+            duration_seconds: 5,
+            remaining_seconds: 1,
+            show_time_remaining: true,
+        };
+
+        while overlay_rx.try_recv().is_ok() {}
+
+        engine.realtime_tick().await;
+
+        // The toast expired (1s -> 0s) and with no active countdowns, overlay transitions to Hidden
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+        let mut received_hide = false;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if matches!(action, OverlayAction::Hide) {
+                received_hide = true;
+            }
+        }
+        assert!(received_hide, "Expired HudToast should dispatch Hide when no countdowns remain");
+
+        // 3. Re-verify target closed during grace period skips destructive action
+        engine.runtimes.get_mut("rule-grace").unwrap().grace_countdown = Some((1, 10));
+        engine.realtime_tick().await;
+
+        // Grace finished, target wasn't open, cycle marked completed
+        assert_eq!(
+            engine.runtimes.get("rule-grace").unwrap().grace_countdown,
+            None
+        );
+        assert!(engine.runtimes.get("rule-grace").unwrap().action_executed_today);
     }
 }

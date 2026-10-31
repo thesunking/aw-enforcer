@@ -100,6 +100,16 @@ impl OverlayMode {
             OverlayMode::BreakEnforcer { .. } => 4,
         }
     }
+
+    /// Returns the rule ID associated with this overlay mode, if any.
+    pub fn rule_id(&self) -> Option<&str> {
+        match self {
+            OverlayMode::BreakEnforcer { rule_id, .. }
+            | OverlayMode::HudToast { rule_id, .. }
+            | OverlayMode::HudTimer { rule_id, .. } => Some(rule_id.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Target Win32 window geometry and extended style flags for an overlay window instance.
