@@ -161,9 +161,13 @@ impl AwClient {
     }
 
     /// Queries browser tab events from aw-watcher-web intersected with not-afk status.
-    #[allow(dead_code)]
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
-        if !self.has_required_buckets().await || !self.has_web_bucket.load(Ordering::Relaxed) {
+        if !self.buckets_verified.load(Ordering::Relaxed) || !self.has_web_bucket.load(Ordering::Relaxed) {
+            self.buckets_verified.store(false, Ordering::Relaxed);
+            self.has_required_buckets().await;
+        }
+
+        if !self.has_web_bucket.load(Ordering::Relaxed) {
             return Vec::new();
         }
 
@@ -187,10 +191,14 @@ impl AwClient {
             Ok(r) => {
                 let status = r.status();
                 tracing::warn!("ActivityWatch web query returned HTTP status {}", status);
+                self.buckets_verified.store(false, Ordering::Relaxed);
+                self.has_web_bucket.store(false, Ordering::Relaxed);
                 return Vec::new();
             }
             Err(e) => {
                 tracing::warn!("ActivityWatch web query network error: {}", e);
+                self.buckets_verified.store(false, Ordering::Relaxed);
+                self.has_web_bucket.store(false, Ordering::Relaxed);
                 return Vec::new();
             }
         };
