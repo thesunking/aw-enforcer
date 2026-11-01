@@ -607,6 +607,7 @@ struct LiveUiState {
     active_app: String,
     strict_lock_active: bool,
     rule_statuses: Vec<(String, String)>,
+    any_snoozed: bool,
 }
 
 impl Default for LiveUiState {
@@ -617,6 +618,7 @@ impl Default for LiveUiState {
             active_app: "None".to_string(),
             strict_lock_active: false,
             rule_statuses: Vec::new(),
+            any_snoozed: false,
         }
     }
 }
@@ -1001,6 +1003,44 @@ fn open_settings_window(
                         refresh_rule_regex_validation(&win, &rm);
                         win.set_has_unsaved_changes(true);
                     }
+                }
+            }
+        });
+    }
+
+    // Snooze rule
+    {
+        let rm = rules_model.clone();
+        let cmd_tx = command_tx.clone();
+        settings_win.on_snooze_rule(move |idx, minutes| {
+            let u = idx as usize;
+            if u < rm.row_count() {
+                if let Some(r) = rm.row_data(u) {
+                    let rule_id = r.id.to_string();
+                    let mins = if minutes > 0 { minutes as u32 } else { 15 };
+                    cmd_tx
+                        .send(DaemonCommand::SnoozeBreak {
+                            rule_id,
+                            minutes: mins,
+                        })
+                        .ok();
+                }
+            }
+        });
+    }
+
+    // Reset rule session
+    {
+        let rm = rules_model.clone();
+        let cmd_tx = command_tx.clone();
+        settings_win.on_reset_rule_session(move |idx| {
+            let u = idx as usize;
+            if u < rm.row_count() {
+                if let Some(r) = rm.row_data(u) {
+                    let rule_id = r.id.to_string();
+                    cmd_tx
+                        .send(DaemonCommand::ResetRuleSession { rule_id })
+                        .ok();
                 }
             }
         });
@@ -1539,6 +1579,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         strict_lock_active,
                         rule_statuses,
                         tray_tooltip,
+                        any_snoozed,
                     } => {
                         {
                             let mut ls = live_state_ref.borrow_mut();
@@ -1547,6 +1588,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ls.active_app = active_app.clone();
                             ls.strict_lock_active = strict_lock_active;
                             ls.rule_statuses = rule_statuses.clone();
+                            ls.any_snoozed = any_snoozed;
                         }
 
                         if let Some(ref win) = *settings_slot_ref.borrow() {
@@ -1562,6 +1604,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         item_dismiss.set_enabled(!strict_lock_active);
                         item_snooze.set_enabled(!strict_lock_active);
+                        item_snooze.set_text(if any_snoozed {
+                            "Resume Snoozed Rules"
+                        } else {
+                            "Snooze All (15m)"
+                        });
                         item_pause.set_enabled(!strict_lock_active);
 
                         if settings_slot_ref
@@ -1717,7 +1764,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
                         }
                         "snooze_15m" => {
-                            cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
+                            let is_locked = live_state_ref.borrow().strict_lock_active;
+                            if is_locked {
+                                continue;
+                            }
+                            let was_snoozed = live_state_ref.borrow().any_snoozed;
+                            if was_snoozed {
+                                cmd_tx.send(DaemonCommand::ClearSnoozeAll).ok();
+                            } else {
+                                cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
+                            }
                         }
                         "toggle_pause_all" => {
                             let is_locked = live_state_ref.borrow().strict_lock_active;

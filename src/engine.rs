@@ -148,6 +148,8 @@ pub enum DaemonCommand {
     CloseOverlay,
     TriggerTestOverlay { mode: String },
     PreviewRule(Box<Rule>),
+    ResetRuleSession { rule_id: String },
+    ClearSnoozeAll,
 }
 
 /// Actions dispatched from the engine to the Slint UI thread.
@@ -167,6 +169,7 @@ pub enum OverlayAction {
         strict_lock_active: bool,
         rule_statuses: Vec<(String, String)>,
         tray_tooltip: String,
+        any_snoozed: bool,
     },
     Hide,
 }
@@ -562,6 +565,7 @@ impl Engine {
                 if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
                 }
+                self.poll_tick().await;
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 tracing::debug!("Acknowledged app warning for rule {rule_id}");
@@ -691,6 +695,27 @@ impl Engine {
                     return;
                 }
                 self.preview_rule_alert(&rule).await;
+            }
+            DaemonCommand::ResetRuleSession { rule_id } => {
+                if self.is_strict_lock_active(Local::now()) {
+                    tracing::warn!("ResetRuleSession ignored: strict enforcement active");
+                    return;
+                }
+                let now = Local::now();
+                if let Some(rt) = self.runtimes.get_mut(&rule_id) {
+                    rt.complete_cycle(now);
+                }
+                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
+                    self.transition_to_active_countdown_or_hide();
+                }
+                self.poll_tick().await;
+            }
+            DaemonCommand::ClearSnoozeAll => {
+                self.global_snoozed_until = None;
+                for rt in self.runtimes.values_mut() {
+                    rt.snoozed_until = None;
+                }
+                self.poll_tick().await;
             }
         }
     }
@@ -1208,6 +1233,17 @@ impl Engine {
             )
         };
 
+        let any_snoozed = self.global_snoozed_until.filter(|&u| u > now).is_some()
+            || self.config.rules.iter().any(|r| {
+                r.enabled
+                    && self
+                        .runtimes
+                        .get(&r.id)
+                        .and_then(|rt| rt.snoozed_until)
+                        .filter(|&u| u > now)
+                        .is_some()
+            });
+
         self.overlay_tx
             .send(OverlayAction::UpdateLiveStatus {
                 session_duration_text: format!("{}m", max_session_secs / 60),
@@ -1216,6 +1252,7 @@ impl Engine {
                 strict_lock_active,
                 rule_statuses,
                 tray_tooltip,
+                any_snoozed,
             })
             .ok();
 
@@ -4154,5 +4191,64 @@ mod tests {
         } else {
             panic!("Expected HudTimer mode for CloseWindow preview with grace_duration > 0");
         }
+    }
+    #[tokio::test]
+    async fn test_reset_rule_session_resets_timer_and_clears_snooze() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-reset-test".to_string();
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(20, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        {
+            let rt = engine.runtimes.get_mut("rule-reset-test").unwrap();
+            rt.current_session_seconds = 1200;
+            rt.snoozed_until = Some(now + Duration::minutes(15));
+            rt.warned_current_cycle = true;
+        }
+
+        engine
+            .handle_command(DaemonCommand::ResetRuleSession {
+                rule_id: "rule-reset-test".to_string(),
+            })
+            .await;
+
+        let rt = engine.runtimes.get("rule-reset-test").unwrap();
+        assert!(rt.snoozed_until.is_none());
+        assert!(rt.last_completed_at.is_some());
+        assert!(!rt.warned_current_cycle);
+    }
+
+    #[tokio::test]
+    async fn test_clear_snooze_all_clears_global_and_per_rule_snoozes() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule1 = Rule::default_template(0);
+        rule1.id = "rule-1".to_string();
+        let mut rule2 = Rule::default_template(1);
+        rule2.id = "rule-2".to_string();
+
+        cfg.rules = vec![rule1, rule2];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        engine.global_snoozed_until = Some(now + Duration::minutes(30));
+        engine.runtimes.get_mut("rule-1").unwrap().snoozed_until = Some(now + Duration::minutes(10));
+        engine.runtimes.get_mut("rule-2").unwrap().snoozed_until = Some(now + Duration::minutes(20));
+
+        engine.handle_command(DaemonCommand::ClearSnoozeAll).await;
+
+        assert!(engine.global_snoozed_until.is_none());
+        assert!(engine.runtimes.get("rule-1").unwrap().snoozed_until.is_none());
+        assert!(engine.runtimes.get("rule-2").unwrap().snoozed_until.is_none());
     }
 }

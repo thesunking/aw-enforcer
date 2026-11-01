@@ -313,6 +313,8 @@ export component SettingsWindow inherits Window {
     callback delete-rule(int /* rule_idx */);
     callback duplicate-rule(int /* rule_idx */);
     callback toggle-rule-enabled(int /* rule_idx */, bool /* enabled */);
+    callback snooze-rule(int /* rule_idx */, int /* minutes */);
+    callback reset-rule-session(int /* rule_idx */);
 
     callback add-known-app-to-rule(int /* rule_idx */, string /* app */);
     callback remove-executable-from-rule(int /* rule_idx */, int /* exe_idx */);
@@ -1105,8 +1107,24 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 HorizontalLayout {
-                                    spacing: 10px;
+                                    spacing: 8px;
                                     alignment: end;
+
+                                    Button {
+                                        text: "Snooze 15m";
+                                        enabled: !root.ui-locked-by-strict;
+                                        clicked => {
+                                            root.snooze-rule(i, 15);
+                                        }
+                                    }
+
+                                    Button {
+                                        text: "Reset Timer";
+                                        enabled: !root.ui-locked-by-strict;
+                                        clicked => {
+                                            root.reset-rule-session(i);
+                                        }
+                                    }
 
                                     Button {
                                         text: "Configure";
@@ -1143,6 +1161,65 @@ export component SettingsWindow inherits Window {
                         property <bool> has-target-executables: root.rules[root.selected-rule-idx].target-executables.length > 0;
 
                         spacing: 16px;
+
+                        HorizontalLayout {
+                            alignment: space-between;
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+
+                                Text {
+                                    text: root.rules[root.selected-rule-idx].name != "" ? root.rules[root.selected-rule-idx].name : ("Rule " + (root.selected-rule-idx + 1));
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    color: #f8fafc;
+                                    vertical-alignment: center;
+                                }
+
+                                if root.rules[root.selected-rule-idx].status-text != "" : Rectangle {
+                                    background: #0284c7.with-alpha(0.2);
+                                    border-radius: 4px;
+                                    border-width: 1px;
+                                    border-color: #38bdf8.with-alpha(0.4);
+
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        padding-top: 2px;
+                                        padding-bottom: 2px;
+                                        Text {
+                                            text: root.rules[root.selected-rule-idx].status-text;
+                                            font-size: 11px;
+                                            font-weight: 600;
+                                            color: #38bdf8;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+
+                                Button {
+                                    text: "Snooze 15m";
+                                    enabled: !root.ui-locked-by-strict;
+                                    clicked => {
+                                        root.snooze-rule(root.selected-rule-idx, 15);
+                                    }
+                                }
+
+                                Button {
+                                    text: "Reset Timer";
+                                    enabled: !root.ui-locked-by-strict;
+                                    clicked => {
+                                        root.reset-rule-session(root.selected-rule-idx);
+                                    }
+                                }
+                            }
+                        }
 
                         // ==========================================
                         // SECTION 1: GENERAL
