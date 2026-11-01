@@ -10,7 +10,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::sync::mpsc;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder,
+    MouseButton, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
@@ -777,6 +777,24 @@ fn open_settings_window(
                     mode: mode.to_string(),
                 })
                 .ok();
+        });
+    }
+
+    // Preview rule alert
+    {
+        let sw = settings_weak.clone();
+        let cmd_tx = command_tx.clone();
+        settings_win.on_preview_rule_alert(move || {
+            if let Some(win) = sw.upgrade() {
+                let cur_idx = win.get_selected_rule_idx();
+                if cur_idx >= 0 {
+                    let r_model = win.get_rules();
+                    if let Some(v) = r_model.row_data(cur_idx as usize) {
+                        let rule = view_to_rule(&v);
+                        cmd_tx.send(DaemonCommand::PreviewRule(Box::new(rule))).ok();
+                    }
+                }
+            }
         });
     }
 
@@ -1566,6 +1584,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
                 overlay_mgr.borrow_mut().apply_pending_win32_styles();
+
+                // Process System Tray Icon Double-Click Events
+                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                    if let TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        if let Err(e) = open_settings_window(
+                            &settings_slot_ref,
+                            &rules_model_ref,
+                            &cfg_cell,
+                            &ui_client_cell,
+                            &live_state_ref,
+                            &aw_connected_flag_ref,
+                            &cmd_tx,
+                            &handle,
+                            &item_pause,
+                            &overlay_mgr,
+                            true,
+                        ) {
+                            tracing::error!("Failed to open SettingsWindow on tray double-click: {e}");
+                        }
+                    }
+                }
 
                 // Process System Tray Menu Events
                 while let Ok(event) = MenuEvent::receiver().try_recv() {

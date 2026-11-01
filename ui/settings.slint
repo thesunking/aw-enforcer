@@ -301,6 +301,7 @@ export component SettingsWindow inherits Window {
     callback save-config();
     callback discard-changes();
     callback test-overlay(string /* mode */);
+    callback preview-rule-alert();
     callback show-activity-stats();
     callback validate-time-format(string /* code */);
     callback browse-executable();
@@ -1546,6 +1547,14 @@ export component SettingsWindow inherits Window {
                                         FormattedText {
                                             paragraphs: root.preview-paragraphs;
                                         }
+                                    }
+                                }
+
+                                Button {
+                                    text: "Preview This Rule's Alert";
+                                    enabled: !root.ui-locked-by-strict;
+                                    clicked => {
+                                        root.preview-rule-alert();
                                     }
                                 }
                             }

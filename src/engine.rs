@@ -147,6 +147,7 @@ pub enum DaemonCommand {
     ShowStatsOverlay,
     CloseOverlay,
     TriggerTestOverlay { mode: String },
+    PreviewRule(Box<Rule>),
 }
 
 /// Actions dispatched from the engine to the Slint UI thread.
@@ -312,8 +313,15 @@ impl Engine {
 
     /// Dispatches an `OverlayMode` to the UI thread if its priority is at least as high as the currently active overlay.
     fn show_overlay(&mut self, mode: OverlayMode) {
-        // Never allow a lower-priority overlay to clobber a higher-priority active overlay
-        if mode.priority() < self.active_overlay_mode.priority()
+        let is_current_test = self
+            .active_overlay_mode
+            .rule_id()
+            .map(|id| id.starts_with("test_"))
+            .unwrap_or(false);
+        // Never allow a lower-priority overlay to clobber a higher-priority active overlay,
+        // unless the active overlay is a test/preview overlay being replaced.
+        if !is_current_test
+            && mode.priority() < self.active_overlay_mode.priority()
             && !matches!(self.active_overlay_mode, OverlayMode::Hidden)
         {
             return;
@@ -616,6 +624,13 @@ impl Engine {
                 }
                 self.trigger_test_overlay(&mode).await;
             }
+            DaemonCommand::PreviewRule(rule) => {
+                if self.is_strict_lock_active(Local::now()) {
+                    tracing::warn!("PreviewRule ignored: strict enforcement active");
+                    return;
+                }
+                self.preview_rule_alert(&rule).await;
+            }
         }
     }
 
@@ -662,12 +677,13 @@ impl Engine {
             ..
         } = self.active_overlay_mode
         {
-            if rule_id == "test_break" && *remaining_seconds > 0 {
+            if (rule_id == "test_break" || rule_id.starts_with("test_")) && *remaining_seconds > 0 {
                 if is_idle {
                     *remaining_seconds -= 1;
                 }
                 let rem = *remaining_seconds;
-                self.send_overlay_countdown_tick(rem, 300, is_idle);
+                let total = if rule_id == "test_break" { 300 } else { 15 };
+                self.send_overlay_countdown_tick(rem, total, is_idle);
             }
         }
 
@@ -1028,8 +1044,12 @@ impl Engine {
                 "Paused".to_string()
             } else if !rule.schedule.is_active(day_index, hour_index) {
                 "Off-schedule".to_string()
-            } else if rt.snoozed_until.map(|u| u > now).unwrap_or(false) {
-                "Snoozed".to_string()
+            } else if let Some(until) = self.global_snoozed_until.filter(|&u| u > now) {
+                let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
+                format!("Snoozed ({}m)", rem_mins)
+            } else if let Some(until) = rt.snoozed_until.filter(|&u| u > now) {
+                let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
+                format!("Snoozed ({}m)", rem_mins)
             } else if rule.trigger == TriggerType::Period {
                 format!(
                     "Session: {} / {}",
@@ -1069,6 +1089,14 @@ impl Engine {
         let tray_tooltip = if self.config.general.pause_all_rules {
             format!(
                 "AW-Enforcer (Paused) — Today: {}h {}m",
+                total_today_mins / 60,
+                total_today_mins % 60
+            )
+        } else if let Some(until) = self.global_snoozed_until.filter(|&u| u > now) {
+            let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
+            format!(
+                "AW-Enforcer (Snoozed {}m) — Today: {}h {}m",
+                rem_mins,
                 total_today_mins / 60,
                 total_today_mins % 60
             )
@@ -1762,6 +1790,58 @@ impl Engine {
             "hud_status" => {
                 self.display_stats_overlay(false).await;
             }
+            _ => {}
+        }
+    }
+
+    /// Triggers an alert preview for a specific rule configuration.
+    pub async fn preview_rule_alert(&mut self, rule: &Rule) {
+        let app_name = if rule.monitor_selection == MonitorSelection::Urls {
+            "youtube.com"
+        } else if !rule.target_executables.is_empty() && rule.target_executables[0] != "*" {
+            &rule.target_executables[0]
+        } else {
+            "code.exe"
+        };
+        let threshold = rule.trigger_threshold_seconds();
+        let ctx = self.build_message_context(rule, app_name, threshold, threshold, 0);
+
+        match rule.action {
+            RuleAction::ShowOverlay => {
+                let paragraphs =
+                    self.parse_rule_message(&rule.message, &ctx, TextHorizontalAlignment::Center);
+                let mode = OverlayMode::BreakEnforcer {
+                    rule_id: "test_preview".to_string(),
+                    title: rule.name.clone(),
+                    paragraphs,
+                    remaining_seconds: 15,
+                    allow_snooze: true,
+                    strict_mode: false,
+                    click_through: rule.click_through,
+                };
+                self.show_overlay(mode);
+            }
+            RuleAction::ShowNotification => match rule.notification_method {
+                NotificationMethod::Windows => {
+                    let text = ctx.interpolate(&rule.message);
+                    enforcer::send_system_notification(&rule.name, &text);
+                }
+                NotificationMethod::Hud => {
+                    let paragraphs =
+                        self.parse_rule_message(&rule.message, &ctx, TextHorizontalAlignment::Left);
+                    let dur = rule.notification_duration.to_seconds().max(1);
+                    let mode = OverlayMode::HudToast {
+                        rule_id: "test_preview".to_string(),
+                        title: rule.name.clone(),
+                        paragraphs,
+                        snooze_options_minutes: vec![5, 10, 15],
+                        duration_seconds: dur,
+                        remaining_seconds: dur,
+                        show_time_remaining: rule.show_remaining_time,
+                    };
+                    self.show_overlay(mode);
+                }
+            },
             _ => {}
         }
     }
@@ -3015,5 +3095,101 @@ mod tests {
             engine.runtimes.get("rule-urls-newest-title").unwrap().last_matched_title.as_deref(),
             Some("Latest Video - YouTube")
         );
+    }
+
+    #[tokio::test]
+    async fn test_preview_rule_alert_overlay_and_notification() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule_overlay = Rule::default_template(0);
+        rule_overlay.id = "rule-overlay".to_string();
+        rule_overlay.action = RuleAction::ShowOverlay;
+        rule_overlay.message = "Take a break! {app_name}".to_string();
+
+        let mut rule_notif = Rule::default_template(1);
+        rule_notif.id = "rule-notif".to_string();
+        rule_notif.action = RuleAction::ShowNotification;
+        rule_notif.notification_method = NotificationMethod::Hud;
+        rule_notif.message = "Notification for {app_name}".to_string();
+
+        cfg.rules = vec![rule_overlay.clone(), rule_notif.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Preview rule with ShowOverlay
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_overlay)))
+            .await;
+
+        let action1 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action1 {
+            OverlayAction::Show(OverlayMode::BreakEnforcer {
+                rule_id,
+                paragraphs,
+                remaining_seconds,
+                strict_mode,
+                ..
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(remaining_seconds, 15);
+                assert!(!strict_mode);
+                assert!(!paragraphs.is_empty());
+            }
+            other => panic!("Expected BreakEnforcer overlay, got: {other:?}"),
+        }
+
+        // 2. Preview rule with ShowNotification (Hud)
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_notif)))
+            .await;
+
+        let action2 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action2 {
+            OverlayAction::Show(OverlayMode::HudToast {
+                rule_id,
+                paragraphs,
+                remaining_seconds,
+                ..
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(remaining_seconds, 10);
+                assert!(!paragraphs.is_empty());
+            }
+            other => panic!("Expected HudToast overlay, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_snooze_status_badges_and_tooltip() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule1 = Rule::default_template(0);
+        rule1.id = "rule-1".to_string();
+        let mut rule2 = Rule::default_template(1);
+        rule2.id = "rule-2".to_string();
+        cfg.rules = vec![rule1, rule2];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        // Set rule 2 as snoozed for 10 minutes
+        engine.runtimes.get_mut("rule-2").unwrap().snoozed_until = Some(now + Duration::minutes(10));
+
+        let rt2 = engine.runtimes.get("rule-2").unwrap();
+        let rem2 = ((rt2.snoozed_until.unwrap() - now).num_seconds().max(1) + 59) / 60;
+        let badge2 = format!("Snoozed ({}m)", rem2);
+        assert_eq!(badge2, "Snoozed (10m)");
+
+        // Set global snooze for 15 minutes
+        engine.global_snoozed_until = Some(now + Duration::minutes(15));
+        let rem_global = ((engine.global_snoozed_until.unwrap() - now).num_seconds().max(1) + 59) / 60;
+        let badge_global = format!("Snoozed ({}m)", rem_global);
+        assert_eq!(badge_global, "Snoozed (15m)");
+
+        let tooltip = format!(
+            "AW-Enforcer (Snoozed {}m) — Today: {}h {}m",
+            rem_global, 2, 30
+        );
+        assert_eq!(tooltip, "AW-Enforcer (Snoozed 15m) — Today: 2h 30m");
     }
 }
