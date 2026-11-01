@@ -105,18 +105,23 @@ pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<
 
 /// Aligns a timestamp down to the start of its current statistics histogram bin.
 fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
-    let current_minute = now.minute();
     let bin_size = bin_size_mins.max(1);
-    let aligned_minute = if bin_size >= 60 {
-        0
+    if bin_size >= 60 {
+        let hour_step = ((bin_size / 60) as u32).max(1);
+        let aligned_hour = (now.hour() / hour_step) * hour_step;
+        now.with_hour(aligned_hour)
+            .and_then(|t| t.with_minute(0))
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(now)
     } else {
-        (current_minute / (bin_size as u32)) * (bin_size as u32)
-    };
-
-    now.with_minute(aligned_minute)
-        .and_then(|t| t.with_second(0))
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or(now)
+        let current_minute = now.minute();
+        let aligned_minute = (current_minute / (bin_size as u32)) * (bin_size as u32);
+        now.with_minute(aligned_minute)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(now)
+    }
 }
 
 /// Cached 24-hour histogram bins used to live-update `OverlayMode::HudStatus` on each `poll_tick`
@@ -1615,22 +1620,27 @@ impl Engine {
             cache.bin_size_mins = bin_size_mins;
             cache.current_bin_start = new_bin_start;
         } else if new_bin_start > cache.current_bin_start {
-            // Finalize the previous active bin before shifting
-            let prev_start_utc = cache.current_bin_start.with_timezone(&Utc);
-            let prev_end_utc =
-                (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-            let prev_secs = compute_coalesced_overlap_seconds(events, prev_start_utc, prev_end_utc) as f32;
-            if let Some(last) = cache.bin_seconds.last_mut() {
-                *last = prev_secs;
-            }
-
             let elapsed_bins =
                 ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0)
                     as usize;
+            let old_bin_start = cache.current_bin_start;
             let shift = elapsed_bins.min(bin_count);
             cache.bin_seconds.drain(0..shift);
             cache.bin_seconds.resize(bin_count, 0.0);
             cache.current_bin_start = new_bin_start;
+
+            for i in 0..elapsed_bins {
+                let b_start = old_bin_start + Duration::minutes((i as i64) * bin_size_mins);
+                let b_end = b_start + Duration::minutes(bin_size_mins);
+                let b_start_utc = b_start.with_timezone(&Utc);
+                let b_end_utc = b_end.with_timezone(&Utc);
+                let bin_idx = (bin_count as isize) - 1 - (elapsed_bins as isize) + (i as isize);
+                if bin_idx >= 0 && (bin_idx as usize) < bin_count {
+                    let secs =
+                        compute_coalesced_overlap_seconds(events, b_start_utc, b_end_utc) as f32;
+                    cache.bin_seconds[bin_idx as usize] = secs;
+                }
+            }
         }
 
         // Recompute only the current (latest) bin from poll_tick's events
@@ -2256,6 +2266,53 @@ mod tests {
             }
             other => panic!("Expected HudStatus, got {:?}", other),
         }
+
+        // 3. Multi-hour rollover (elapsed_bins == 2, jump from 15:00 to 17:10:00)
+        // 15:00..16:00 has 2400s (40m), intermediate 16:00..17:00 has 900s (15m), active 17:00..17:10 has 300s (5m)
+        let bin_15 = Local.with_ymd_and_hms(2026, 10, 30, 15, 0, 0).unwrap();
+        let bin_16 = Local.with_ymd_and_hms(2026, 10, 30, 16, 0, 0).unwrap();
+        let bin_17 = Local.with_ymd_and_hms(2026, 10, 30, 17, 0, 0).unwrap();
+        let now3 = Local.with_ymd_and_hms(2026, 10, 30, 17, 10, 0).unwrap();
+        let ev3 = vec![
+            make_event(bin_15.with_timezone(&Utc), 2400.0, "code.exe", "VS Code", ""),
+            make_event(bin_16.with_timezone(&Utc), 900.0, "code.exe", "VS Code", ""),
+            make_event(bin_17.with_timezone(&Utc), 300.0, "code.exe", "VS Code", ""),
+        ];
+        engine.refresh_stats_overlay_from_events(now3, &ev3);
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
+                assert!(!is_loading);
+                assert_eq!(*total_active_minutes, 110); // 20m + 30m + 40m + 15m + 5m
+                assert!((bin_values[19] - (1200.0 / 3600.0)).abs() < 1e-4); // 13:00..14:00 shifted to index 19
+                assert!((bin_values[20] - (1800.0 / 3600.0)).abs() < 1e-4); // 14:00..15:00 shifted to index 20
+                assert!((bin_values[21] - (2400.0 / 3600.0)).abs() < 1e-4); // 15:00..16:00 populated (40m)
+                assert!((bin_values[22] - (900.0 / 3600.0)).abs() < 1e-4);  // intermediate 16:00..17:00 populated (15m)
+                assert!((bin_values[23] - (300.0 / 3600.0)).abs() < 1e-4);  // current 17:00..18:00 populated (5m)
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_align_stats_bin_start_multi_hour() {
+        // Sub-hour: 15 mins
+        let dt = Local.with_ymd_and_hms(2026, 10, 30, 14, 27, 45).unwrap();
+        let aligned_15 = align_stats_bin_start(dt, 15);
+        assert_eq!(aligned_15, Local.with_ymd_and_hms(2026, 10, 30, 14, 15, 0).unwrap());
+
+        // 1 hour (60 mins)
+        let aligned_60 = align_stats_bin_start(dt, 60);
+        assert_eq!(aligned_60, Local.with_ymd_and_hms(2026, 10, 30, 14, 0, 0).unwrap());
+
+        // 2 hours (120 mins) - hour 15 should align to 14
+        let dt15 = Local.with_ymd_and_hms(2026, 10, 30, 15, 45, 12).unwrap();
+        let aligned_120 = align_stats_bin_start(dt15, 120);
+        assert_eq!(aligned_120, Local.with_ymd_and_hms(2026, 10, 30, 14, 0, 0).unwrap());
+
+        // 3 hours (180 mins) - hour 14 should align to 12
+        let aligned_180 = align_stats_bin_start(dt, 180);
+        assert_eq!(aligned_180, Local.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap());
     }
 
     #[tokio::test]
