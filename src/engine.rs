@@ -340,11 +340,39 @@ impl Engine {
             .unwrap_or(false);
         // Never allow a lower-priority overlay to clobber a higher-priority active overlay,
         // unless the active overlay is a test/preview overlay being replaced.
-        if !is_current_test
-            && mode.priority() < self.active_overlay_mode.priority()
-            && !matches!(self.active_overlay_mode, OverlayMode::Hidden)
-        {
-            return;
+        if !is_current_test {
+            if mode.priority() < self.active_overlay_mode.priority()
+                && !matches!(self.active_overlay_mode, OverlayMode::Hidden)
+            {
+                return;
+            }
+
+            if let (
+                OverlayMode::BreakEnforcer {
+                    rule_id: cur_rule_id,
+                    strict_mode: cur_strict,
+                    click_through: cur_click,
+                    remaining_seconds: cur_rem,
+                    ..
+                },
+                OverlayMode::BreakEnforcer {
+                    rule_id: new_rule_id,
+                    strict_mode: new_strict,
+                    click_through: new_click,
+                    remaining_seconds: new_rem,
+                    ..
+                },
+            ) = (&self.active_overlay_mode, &mode)
+            {
+                if cur_rule_id != new_rule_id {
+                    let cannot_replace = (*cur_strict && !*new_strict)
+                        || (*cur_strict == *new_strict && !*cur_click && *new_click)
+                        || (*cur_strict == *new_strict && *cur_click == *new_click && *cur_rem >= *new_rem);
+                    if cannot_replace {
+                        return;
+                    }
+                }
+            }
         }
         if !matches!(mode, OverlayMode::HudStatus { .. }) {
             self.stats_cache = None;
@@ -367,7 +395,7 @@ impl Engine {
                 continue;
             }
             if let Some(rt) = self.runtimes.get(&rule.id) {
-                if rt.active_break.is_some() || rt.grace_countdown.is_some() {
+                if rt.active_break.is_some() || rt.grace_countdown.is_some() || rt.pending_break_since.is_some() {
                     return true;
                 }
             }
@@ -400,13 +428,29 @@ impl Engine {
     /// Transitions to the highest-priority remaining active countdown rule, or hides the overlay if none remain.
     pub fn transition_to_active_countdown_or_hide(&mut self) {
         // 1. Highest priority: BreakEnforcer (active_break > 0)
-        let active_break_rule = self.config.rules.iter().find(|r| {
-            r.enabled && self.runtimes
-                .get(&r.id)
-                .and_then(|rt| rt.active_break)
-                .map(|(rem, _)| rem > 0)
-                .unwrap_or(false)
-        }).cloned();
+        let active_break_rule = self
+            .config
+            .rules
+            .iter()
+            .filter(|r| {
+                r.enabled
+                    && self
+                        .runtimes
+                        .get(&r.id)
+                        .and_then(|rt| rt.active_break)
+                        .map(|(rem, _)| rem > 0)
+                        .unwrap_or(false)
+            })
+            .max_by_key(|r| {
+                let rem = self
+                    .runtimes
+                    .get(&r.id)
+                    .and_then(|rt| rt.active_break)
+                    .map(|(rem, _)| rem)
+                    .unwrap_or(0);
+                (r.strict_mode, !r.click_through, rem)
+            })
+            .cloned();
 
         if let Some(rule) = active_break_rule {
             let (rem, total) = self
@@ -3910,5 +3954,102 @@ mod tests {
         let rt_done = engine.runtimes.get("rule-urls-nav-away").unwrap();
         assert_eq!(rt_done.grace_countdown, None);
         assert!(rt_done.action_executed_today);
+    }
+
+    #[tokio::test]
+    async fn test_strict_break_not_clobbered_by_non_strict_break_and_pending_break_locks() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut non_strict_rule = Rule::default_template(0);
+        non_strict_rule.id = "rule-non-strict".to_string();
+        non_strict_rule.name = "Non-Strict Break".to_string();
+        non_strict_rule.action = RuleAction::ShowOverlay;
+        non_strict_rule.strict_mode = false;
+        non_strict_rule.click_through = false;
+
+        let mut strict_rule = Rule::default_template(1);
+        strict_rule.id = "rule-strict".to_string();
+        strict_rule.name = "Strict Break".to_string();
+        strict_rule.action = RuleAction::ShowOverlay;
+        strict_rule.strict_mode = true;
+        strict_rule.click_through = false;
+
+        // Place non_strict_rule before strict_rule in cfg.rules to test priority selection over list ordering
+        cfg.rules = vec![non_strict_rule.clone(), strict_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+
+        // (a) Strict rule with pending_break_since: Some(now) sets is_strict_lock_active == true
+        // and blocks DismissBreakOverlay, SnoozeAll, and SetPauseAll(true)
+        if let Some(rt) = engine.runtimes.get_mut("rule-strict") {
+            rt.pending_break_since = Some(now);
+        }
+        assert!(engine.is_strict_lock_active(now));
+
+        engine.handle_command(DaemonCommand::DismissBreakOverlay).await;
+        assert!(engine.runtimes.get("rule-strict").unwrap().pending_break_since.is_some());
+
+        engine.handle_command(DaemonCommand::SnoozeAll { minutes: 15 }).await;
+        assert!(engine.global_snoozed_until.is_none());
+
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+        assert!(!engine.config.general.pause_all_rules);
+
+        // Clear pending break
+        if let Some(rt) = engine.runtimes.get_mut("rule-strict") {
+            rt.pending_break_since = None;
+        }
+
+        // (b) When an active strict BreakEnforcer is showing, calling show_overlay with a
+        // non-strict BreakEnforcer for another rule does NOT overwrite active_overlay_mode.
+        engine.show_overlay(OverlayMode::BreakEnforcer {
+            rule_id: "rule-strict".to_string(),
+            title: "Strict Break".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 300,
+            remaining_seconds: 300,
+            allow_snooze: false,
+            strict_mode: true,
+            click_through: false,
+        });
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-strict"));
+
+        // Attempt to show non-strict break from another rule
+        engine.show_overlay(OverlayMode::BreakEnforcer {
+            rule_id: "rule-non-strict".to_string(),
+            title: "Non-Strict Break".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 600,
+            remaining_seconds: 600,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        });
+        // Still rule-strict!
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-strict"));
+        if let OverlayMode::BreakEnforcer { strict_mode, .. } = engine.active_overlay_mode {
+            assert!(strict_mode);
+        } else {
+            panic!("Expected BreakEnforcer");
+        }
+
+        // (c) When transitioning to an active countdown, an active strict break rule is selected
+        // over an active non-strict break rule regardless of configuration list ordering.
+        engine.runtimes.get_mut("rule-non-strict").unwrap().active_break = Some((500, 500));
+        engine.runtimes.get_mut("rule-strict").unwrap().active_break = Some((200, 200));
+
+        engine.active_overlay_mode = OverlayMode::Hidden;
+        engine.transition_to_active_countdown_or_hide();
+
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-strict"));
+        if let OverlayMode::BreakEnforcer { strict_mode, remaining_seconds, .. } = engine.active_overlay_mode {
+            assert!(strict_mode);
+            assert_eq!(remaining_seconds, 200);
+        } else {
+            panic!("Expected BreakEnforcer for strict rule");
+        }
     }
 }
