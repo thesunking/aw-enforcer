@@ -110,6 +110,28 @@ impl MessageContext {
             .replace("{limit}", &self.limit)
             .replace("{remaining}", &self.remaining)
     }
+
+    /// Interpolates placeholders and strips formatting markup into clean plain text for native notifications.
+    pub fn interpolate_plain(&self, template: &str) -> String {
+        format_plain_message(template, self)
+    }
+}
+
+/// Interpolates placeholders and strips heading prefixes (`# `, `## `) and style attribute blocks (`[...]`)
+/// to produce clean plain text suitable for native system notifications.
+pub fn format_plain_message(raw_message: &str, ctx: &MessageContext) -> String {
+    let interpolated = ctx.interpolate(raw_message);
+    let mut cleaned_lines = Vec::new();
+    for line in split_lines(&interpolated) {
+        let (_header_prefix, rest) = split_header_prefix(line);
+        let content = if let Some((_inner, remaining)) = extract_attr_block(rest) {
+            remaining
+        } else {
+            rest
+        };
+        cleaned_lines.push(content);
+    }
+    cleaned_lines.join("\n")
 }
 
 /// Preset color palette mapping hex color codes to their UI combo-box labels.
@@ -631,5 +653,24 @@ mod tests {
         assert_eq!(paras[0].font_weight, 700);
         assert!(paras[0].italic);
         assert_eq!(paras[0].color, parse_hex_color("#38bdf8").unwrap());
+    }
+
+    #[test]
+    fn test_format_plain_message() {
+        let mut ctx = MessageContext::default();
+        ctx.rule_name = "Workday Break".to_string();
+        ctx.app = "chrome.exe".to_string();
+        ctx.session_duration = "50m".to_string();
+        ctx.break_time = "10m".to_string();
+        ctx.remaining = "5m".to_string();
+        ctx.limit = "1h".to_string();
+
+        let raw = "# Time to stretch!\r\n[color=#38bdf8 size=18 bold] Active for {session_duration} in {app}.\r\n## [Reminder] Please step away for {break_time}.";
+        let plain = format_plain_message(raw, &ctx);
+        assert_eq!(
+            plain,
+            "Time to stretch!\nActive for 50m in chrome.exe.\n[Reminder] Please step away for 10m."
+        );
+        assert_eq!(ctx.interpolate_plain(raw), plain);
     }
 }

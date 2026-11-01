@@ -1534,7 +1534,7 @@ impl Engine {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                         rt.complete_cycle(now);
                     }
-                    enforcer::send_system_notification(&rule.name, &ctx.interpolate(&rule.message));
+                    enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(&rule.message, &ctx));
                     return;
                 }
 
@@ -1574,7 +1574,7 @@ impl Engine {
                 }
                 match rule.notification_method {
                     NotificationMethod::Windows => {
-                        enforcer::send_system_notification(&rule.name, &ctx.interpolate(&rule.message));
+                        enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(&rule.message, &ctx));
                     }
                     NotificationMethod::Hud => {
                         let paragraphs = self.parse_rule_message(
@@ -1937,7 +1937,7 @@ impl Engine {
             }
             RuleAction::ShowNotification => match rule.notification_method {
                 NotificationMethod::Windows => {
-                    let text = ctx.interpolate(&rule.message);
+                    let text = formatter::format_plain_message(&rule.message, &ctx);
                     enforcer::send_system_notification(&rule.name, &text);
                 }
                 NotificationMethod::Hud => {
