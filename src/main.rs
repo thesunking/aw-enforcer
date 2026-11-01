@@ -270,53 +270,8 @@ fn refresh_message_editor_state(
 
     // Context for live preview interpolation
     let real_ctx = if let Some(r) = rule {
-        let app_name = match r.monitor_selection.as_str() {
-            "Titles" | "Urls" => {
-                if r.name.is_empty() {
-                    "Browser / Window".to_string()
-                } else {
-                    r.name.to_string()
-                }
-            }
-            _ => first_specific_executable(&r.target_executables)
-                .unwrap_or_else(|| "ActiveApp.exe".to_string()),
-        };
-
-        let p_unit = TimeUnit::from_str_lossy(r.period_unit.as_str());
-        let b_unit = TimeUnit::from_str_lossy(r.break_unit.as_str());
-        let l_unit = TimeUnit::from_str_lossy(r.limit_unit.as_str());
-        let warn_unit = TimeUnit::from_str_lossy(r.warn_before_unit.as_str());
-
-        let threshold_secs = if r.trigger.as_str() == "Period" {
-            DurationConfig::new(r.period_val.max(0) as u32, p_unit).to_seconds()
-        } else {
-            DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_seconds()
-        };
-
-        let (eff_warn_secs, remaining) = if r.warn_before_val > 0 {
-            let cfg = DurationConfig::new(r.warn_before_val as u32, warn_unit);
-            (cfg.to_seconds(), cfg.to_short_string())
-        } else {
-            let fallback_cfg = DurationConfig::new(5, TimeUnit::Min);
-            (fallback_cfg.to_seconds().min(threshold_secs), fallback_cfg.to_short_string())
-        };
-
-        let used_secs = threshold_secs.saturating_sub(eff_warn_secs);
-        let used = formatter::format_seconds_human(used_secs);
-
-        MessageContext {
-            rule_name: if r.name.is_empty() {
-                "Break Reminder".to_string()
-            } else {
-                r.name.to_string()
-            },
-            app: app_name,
-            session_duration: DurationConfig::new(r.period_val.max(0) as u32, p_unit).to_short_string(),
-            break_time: DurationConfig::new(r.break_val.max(0) as u32, b_unit).to_short_string(),
-            used,
-            limit: DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_short_string(),
-            remaining,
-        }
+        let domain_rule = view_to_rule(r);
+        formatter::build_preview_context(&domain_rule)
     } else {
         MessageContext::sample()
     };

@@ -283,6 +283,9 @@ impl OverlayManager {
 
     /// Applies any unapplied `Win32Placement` styles (`WS_POPUP`, `WS_EX_TOPMOST`, click-through, and DWM blur-behind) to native HWNDs.
     pub fn apply_pending_win32_styles(&mut self) {
+        if matches!(self.current_mode, OverlayMode::Hidden) {
+            return;
+        }
         if matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
             let current_monitors = Self::enumerate_monitors();
             let active_placements_count = self.desired_placements.iter().filter(|p| p.is_some()).count();
@@ -792,10 +795,11 @@ impl OverlayManager {
     /// Updates the countdown text, progress bar ratio, and user-idle indicator across all active overlay windows.
     pub fn update_countdown(&mut self, remaining_seconds: u32, total_seconds: u32, is_user_idle: bool) {
         match &mut self.current_mode {
-            OverlayMode::BreakEnforcer { remaining_seconds: ref mut rem, .. }
-            | OverlayMode::HudToast { remaining_seconds: ref mut rem, .. }
-            | OverlayMode::HudTimer { remaining_seconds: ref mut rem, .. } => {
+            OverlayMode::BreakEnforcer { remaining_seconds: ref mut rem, duration_seconds: ref mut dur, .. }
+            | OverlayMode::HudToast { remaining_seconds: ref mut rem, duration_seconds: ref mut dur, .. }
+            | OverlayMode::HudTimer { remaining_seconds: ref mut rem, duration_seconds: ref mut dur, .. } => {
                 *rem = remaining_seconds;
+                *dur = total_seconds;
             }
             _ => {}
         }

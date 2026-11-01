@@ -1958,23 +1958,7 @@ impl Engine {
 
     /// Triggers an alert preview for a specific rule configuration.
     pub async fn preview_rule_alert(&mut self, rule: &Rule) {
-        let app_name = if rule.monitor_selection == MonitorSelection::Urls {
-            "youtube.com"
-        } else if !rule.target_executables.is_empty() && rule.target_executables[0] != "*" {
-            &rule.target_executables[0]
-        } else {
-            "code.exe"
-        };
-        let threshold = rule.trigger_threshold_seconds();
-        let (elapsed_secs, rem_secs) = if rule.trigger == TriggerType::Limit || rule.message.contains("{remaining}") {
-            let warn_secs = rule.warn_before.to_seconds();
-            let rem = if warn_secs > 0 { warn_secs } else { 300.min(threshold) };
-            let elapsed = threshold.saturating_sub(rem);
-            (elapsed, rem)
-        } else {
-            (threshold, 0)
-        };
-        let ctx = self.build_message_context(rule, app_name, elapsed_secs, threshold, rem_secs);
+        let ctx = formatter::build_preview_context(rule);
 
         match rule.action {
             RuleAction::ShowOverlay => {
@@ -1997,7 +1981,7 @@ impl Engine {
                     let text = if !rule.message.trim().is_empty() {
                         formatter::format_plain_message(&rule.message, &ctx)
                     } else {
-                        format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs))
+                        format!("{} in {}.", rule.action.as_str(), &ctx.remaining)
                     };
                     enforcer::send_system_notification(&rule.name, &text);
                 }
@@ -2005,7 +1989,7 @@ impl Engine {
                     let default_msg = format!(
                         "[color=#f59e0b bold] {} in {}.",
                         rule.action.as_str(),
-                        formatter::format_seconds_human(rem_secs)
+                        &ctx.remaining
                     );
                     let raw_msg = if !rule.message.trim().is_empty() {
                         &rule.message
@@ -2061,7 +2045,7 @@ impl Engine {
                     let default_msg = format!(
                         "[color=#f59e0b bold] {} in {}.",
                         rule.action.as_str(),
-                        formatter::format_seconds_human(rem_secs)
+                        &ctx.remaining
                     );
                     let raw_msg = if !rule.message.trim().is_empty() {
                         &rule.message
@@ -4138,6 +4122,37 @@ mod tests {
             assert_eq!(remaining_seconds, 200);
         } else {
             panic!("Expected BreakEnforcer for strict rule");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_rule_alert_unified_context_clamping() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-test-preview".to_string();
+        rule.name = "Test Preview Rule".to_string();
+        rule.action = RuleAction::CloseWindow;
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.message = "Closing {app} in {remaining}!".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        engine.preview_rule_alert(&rule).await;
+
+        if let OverlayMode::HudTimer { paragraphs, title, duration_seconds, remaining_seconds, .. } = &engine.active_overlay_mode {
+            assert_eq!(title, "Close Window: Test Preview Rule");
+            assert_eq!(*duration_seconds, 5);
+            assert_eq!(*remaining_seconds, 5);
+            assert_eq!(paragraphs.len(), 1);
+            assert!(paragraphs[0].text.contains("youtube.com"));
+            assert!(paragraphs[0].text.contains("5m"));
+        } else {
+            panic!("Expected HudTimer mode for CloseWindow preview with grace_duration > 0");
         }
     }
 }

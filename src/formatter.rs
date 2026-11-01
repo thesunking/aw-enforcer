@@ -85,6 +85,54 @@ pub struct MessageContext {
     pub remaining: String,
 }
 
+/// Builds a consistent `MessageContext` for previewing warnings and alerts for a given rule.
+pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
+    let threshold_secs = rule.trigger_threshold_seconds().max(1);
+    let warn_secs = rule.warn_before.to_seconds();
+    let rem_secs = if warn_secs > 0 {
+        warn_secs.min(threshold_secs)
+    } else {
+        300.min(threshold_secs)
+    };
+    let used_secs = threshold_secs.saturating_sub(rem_secs);
+
+    let app = match rule.monitor_selection {
+        crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
+        crate::config::MonitorSelection::Titles => {
+            if !rule.name.trim().is_empty() {
+                rule.name.trim().to_string()
+            } else {
+                "Active Window".to_string()
+            }
+        }
+        crate::config::MonitorSelection::Executables => rule
+            .target_executables
+            .iter()
+            .find(|t| {
+                let s = t.trim();
+                !s.is_empty() && s != "*"
+            })
+            .cloned()
+            .unwrap_or_else(|| "code.exe".to_string()),
+    };
+
+    let rule_name = if rule.name.trim().is_empty() {
+        "Break Reminder".to_string()
+    } else {
+        rule.name.trim().to_string()
+    };
+
+    MessageContext {
+        rule_name,
+        session_duration: rule.period.to_short_string(),
+        break_time: rule.break_duration.to_short_string(),
+        app,
+        used: format_seconds_human(used_secs),
+        limit: rule.limit.to_short_string(),
+        remaining: format_seconds_human(rem_secs),
+    }
+}
+
 impl MessageContext {
     /// Returns a sample `MessageContext` for live previewing in the Settings UI.
     pub fn sample() -> Self {
@@ -673,5 +721,29 @@ mod tests {
             "Time to stretch!\nActive for 50m in chrome.exe.\n[Reminder] Please step away for 10m."
         );
         assert_eq!(ctx.interpolate_plain(raw), plain);
+    }
+
+    #[test]
+    fn test_build_preview_context_clamping() {
+        use crate::config::{DurationConfig, MonitorSelection, Rule, TimeUnit, TriggerType};
+
+        let mut rule = Rule::default_template(0);
+        rule.name = "Work Timer".to_string();
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(20, TimeUnit::Min); // 1200s
+        rule.warn_before = DurationConfig::new(30, TimeUnit::Min); // 1800s > 1200s
+        rule.monitor_selection = MonitorSelection::Executables;
+        rule.target_executables = vec!["*".to_string(), "rustrover64.exe".to_string()];
+
+        let ctx = build_preview_context(&rule);
+        assert_eq!(ctx.rule_name, "Work Timer");
+        assert_eq!(ctx.app, "rustrover64.exe");
+        assert_eq!(ctx.remaining, "20m"); // clamped to threshold 1200s
+        assert_eq!(ctx.used, "0s"); // 1200 - 1200 = 0
+
+        rule.warn_before = DurationConfig::new(0, TimeUnit::Min);
+        let ctx2 = build_preview_context(&rule);
+        assert_eq!(ctx2.remaining, "5m"); // fallback 300s
+        assert_eq!(ctx2.used, "15m"); // 20m - 5m = 15m
     }
 }
