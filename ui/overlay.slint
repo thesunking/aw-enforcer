@@ -426,12 +426,18 @@ export component OverlayWindow inherits Window {
 
                         for lbl[idx] in root.histogram-labels : Rectangle {
                             width: 12px;
-                            Text {
-                                text: lbl;
-                                color: #94a3b8;
-                                font-size: 8px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+
+                            Rectangle {
+                                width: 36px;
+                                x: (parent.width - self.width) / 2;
+
+                                Text {
+                                    text: lbl;
+                                    color: #94a3b8;
+                                    font-size: 8px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                     }

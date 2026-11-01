@@ -240,29 +240,6 @@ impl OverlayManager {
         let safe_w = width.max(1);
         let safe_h = height.max(1);
 
-        if let Some(win) = self.windows.get(idx) {
-            // Pre-position native HWND if already created
-            if let Some(hwnd) = Self::extract_hwnd(win) {
-                unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        x,
-                        y,
-                        safe_w,
-                        safe_h,
-                        SWP_NOACTIVATE,
-                    );
-                }
-            }
-
-            // Synchronize Slint physical geometry and show the window
-            win.window().set_position(slint::PhysicalPosition::new(x, y));
-            win.window()
-                .set_size(slint::PhysicalSize::new(safe_w as u32, safe_h as u32));
-            win.show().ok();
-        }
-
         self.set_desired_placement(
             idx,
             Win32Placement {
@@ -281,6 +258,45 @@ impl OverlayManager {
 
     /// Applies any unapplied `Win32Placement` styles (`WS_POPUP`, `WS_EX_TOPMOST`, click-through, and DWM blur-behind) to native HWNDs.
     pub fn apply_pending_win32_styles(&mut self) {
+        if matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
+            let current_monitors = Self::enumerate_monitors();
+            let active_placements_count = self.desired_placements.iter().filter(|p| p.is_some()).count();
+            let mut monitors_changed = current_monitors.len() != active_placements_count;
+            if !monitors_changed {
+                for (idx, mon) in current_monitors.iter().enumerate() {
+                    let is_full_monitor = mon.work_rect.left == mon.monitor_rect.left
+                        && mon.work_rect.top == mon.monitor_rect.top
+                        && mon.work_rect.right == mon.monitor_rect.right
+                        && mon.work_rect.bottom == mon.monitor_rect.bottom;
+                    let width = (mon.work_rect.right - mon.work_rect.left).max(1);
+                    let height = ((mon.work_rect.bottom - mon.work_rect.top) - if is_full_monitor { 1 } else { 0 }).max(1);
+
+                    match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
+                        Some(p) => {
+                            if p.x != mon.work_rect.left
+                                || p.y != mon.work_rect.top
+                                || p.width != width
+                                || p.height != height
+                            {
+                                monitors_changed = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            monitors_changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if monitors_changed {
+                let mode = self.current_mode.clone();
+                self.show_mode(mode);
+                return;
+            }
+        }
+
         for idx in 0..self.windows.len() {
             let desired = match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
                 Some(d) => d.clone(),
@@ -649,9 +665,16 @@ impl OverlayManager {
 
                     set_window_paragraphs(win, paragraphs);
 
+                    let snooze_labels: Vec<slint::SharedString> = snooze_options_minutes
+                        .iter()
+                        .map(|&m| format!("{} min", m).into())
+                        .collect();
+                    win.set_snooze_labels(ModelRc::from(Rc::new(VecModel::from(snooze_labels))));
+
                     let snooze_i32: Vec<i32> =
                         snooze_options_minutes.iter().map(|&m| m as i32).collect();
                     win.set_snooze_options(ModelRc::from(Rc::new(VecModel::from(snooze_i32))));
+                    win.set_selected_snooze_index(0);
                 }
 
                 let scale = self.windows[0].window().scale_factor().max(1.0);
