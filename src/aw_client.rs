@@ -234,14 +234,13 @@ impl AwClient {
         let window_bucket = self.window_bucket_id.read().await.clone();
         let afk_bucket = self.afk_bucket_id.read().await.clone();
 
-        let window_line = match window_bucket {
-            Some(ref id) => format!("events = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
-            None => "events = flood(query_bucket(find_bucket(\"aw-watcher-window_\")));".to_string(),
+        let (window_id, afk_id) = match (&window_bucket, &afk_bucket) {
+            (Some(w), Some(a)) => (w, a),
+            _ => return Ok(Vec::new()),
         };
-        let afk_line = match afk_bucket {
-            Some(ref id) => format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
-            None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
-        };
+
+        let window_line = format!("events = flood(query_bucket(\"{}\"));", escape_bucket_id(window_id));
+        let afk_line = format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id));
 
         let query_body = serde_json::json!({
             "timeperiods": [timeperiod],
@@ -270,7 +269,7 @@ impl AwClient {
             self.refresh_buckets().await;
         }
 
-        if !self.has_web_bucket.load(Ordering::Relaxed) {
+        if !self.buckets_verified.load(Ordering::Relaxed) || !self.has_web_bucket.load(Ordering::Relaxed) {
             return Vec::new();
         }
 
@@ -278,6 +277,12 @@ impl AwClient {
         if web_buckets.is_empty() {
             return Vec::new();
         }
+
+        let afk_bucket = self.afk_bucket_id.read().await.clone();
+        let afk_id = match afk_bucket {
+            Some(ref id) => id.clone(),
+            None => return Vec::new(),
+        };
 
         let url = format!("{}/api/0/query/", self.base_url);
         let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
@@ -293,12 +298,7 @@ impl AwClient {
             format!("sort_by_timestamp(concat({concat_args}))")
         };
         let web_line = format!("web = flood({web_expr});");
-
-        let afk_bucket = self.afk_bucket_id.read().await.clone();
-        let afk_line = match afk_bucket {
-            Some(ref id) => format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
-            None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
-        };
+        let afk_line = format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(&afk_id));
 
         let query_body = serde_json::json!({
             "timeperiods": [timeperiod],
@@ -569,5 +569,42 @@ mod tests {
             escape_bucket_id("aw-watcher-web-chrome_\"test\"\\pc"),
             "aw-watcher-web-chrome_\\\"test\\\"\\\\pc"
         );
+    }
+
+    #[tokio::test]
+    async fn test_query_never_uses_find_bucket_when_buckets_none() {
+        let client = AwClient::new(56999, "");
+        assert_eq!(*client.window_bucket_id.read().await, None);
+        assert_eq!(*client.afk_bucket_id.read().await, None);
+
+        let now = Utc::now();
+        let start = now - chrono::Duration::hours(1);
+
+        // When buckets_verified is forced to true while window_bucket_id and afk_bucket_id are None,
+        // it must return Ok(empty) immediately without constructing find_bucket or making network queries
+        client.buckets_verified.store(true, Ordering::Relaxed);
+        let res = client.query_intersected_events(start, now).await.unwrap();
+        assert!(res.is_empty());
+
+        // When only window_bucket_id is set but afk_bucket_id is None:
+        *client.window_bucket_id.write().await = Some("aw-watcher-window_LOCAL".to_string());
+        let res2 = client.query_intersected_events(start, now).await.unwrap();
+        assert!(res2.is_empty());
+
+        // When only afk_bucket_id is set but window_bucket_id is None:
+        *client.window_bucket_id.write().await = None;
+        *client.afk_bucket_id.write().await = Some("aw-watcher-afk_LOCAL".to_string());
+        let res3 = client.query_intersected_events(start, now).await.unwrap();
+        assert!(res3.is_empty());
+
+        // For query_web_events:
+        // Set last check to now so elapsed_60s is false
+        *client.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
+        client.has_web_bucket.store(true, Ordering::Relaxed);
+        *client.web_bucket_ids.write().await = vec!["aw-watcher-web-chrome_LOCAL".to_string()];
+        *client.afk_bucket_id.write().await = None;
+        // afk_bucket_id is None: must return empty without find_bucket fallback
+        let web_res = client.query_web_events(start, now).await;
+        assert!(web_res.is_empty());
     }
 }

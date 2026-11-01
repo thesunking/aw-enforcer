@@ -1030,16 +1030,21 @@ impl Engine {
             }
         }
 
-        let all_events = self
-            .aw_client
-            .query_intersected_events(min_start_utc, now_utc)
-            .await
-            .unwrap_or_default();
-
-        let web_events = if has_url_rules {
-            self.aw_client.query_web_events(min_start_utc, now_utc).await
+        let (all_events, web_events) = if has_url_rules {
+            let _ = self.aw_client.has_required_buckets().await;
+            let (all_res, web_res) = tokio::join!(
+                self.aw_client.query_intersected_events(min_start_utc, now_utc),
+                self.aw_client.query_web_events(min_start_utc, now_utc)
+            );
+            (all_res.unwrap_or_default(), web_res)
         } else {
-            Vec::new()
+            (
+                self.aw_client
+                    .query_intersected_events(min_start_utc, now_utc)
+                    .await
+                    .unwrap_or_default(),
+                Vec::new(),
+            )
         };
 
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
