@@ -229,6 +229,14 @@ fn view_to_rule(view: &RuleView) -> Rule {
     rule
 }
 
+/// Returns the first non-empty, non-wildcard executable from a rule's target executables model.
+fn first_specific_executable(targets: &slint::ModelRc<slint::SharedString>) -> Option<String> {
+    targets.iter().find_map(|t| {
+        let s = t.trim();
+        (!s.is_empty() && s != "*").then(|| s.to_string())
+    })
+}
+
 /// Refreshes the message editor UI state (line count, active selection, toggle highlights, color/size dropdowns, and preview).
 fn refresh_message_editor_state(
     win: &SettingsWindow,
@@ -270,17 +278,8 @@ fn refresh_message_editor_state(
                     r.name.to_string()
                 }
             }
-            _ => {
-                let mut found = None;
-                for t in r.target_executables.iter() {
-                    let s = t.trim().to_string();
-                    if !s.is_empty() && s != "*" {
-                        found = Some(s);
-                        break;
-                    }
-                }
-                found.unwrap_or_else(|| "ActiveApp.exe".to_string())
-            }
+            _ => first_specific_executable(&r.target_executables)
+                .unwrap_or_else(|| "ActiveApp.exe".to_string()),
         };
 
         let threshold_secs = if r.trigger.as_str() == "Period" {
@@ -947,10 +946,7 @@ fn open_settings_window(
                         rule.strict_mode = win.get_rule_strict_mode();
 
                         let has_specific_exe = rule.monitor_selection.as_str() == "Executables"
-                            && rule.target_executables.iter().any(|t| {
-                                let s = t.trim();
-                                !s.is_empty() && s != "*"
-                            });
+                            && first_specific_executable(&rule.target_executables).is_some();
                         if !has_specific_exe && rule.action.as_str() == "Kill Process" {
                             rule.action = "Close Window".into();
                             win.set_rule_action(rule.action.clone());

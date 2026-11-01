@@ -385,15 +385,27 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Enforces safety invariants on this rule, downgrading `KillProcess` to `CloseWindow`
-    /// whenever the rule does not target at least one specific executable name.
-    pub fn sanitize(&mut self) {
-        let has_specific_exe = self.monitor_selection == MonitorSelection::Executables
+    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard) executable name.
+    pub fn has_specific_executable(&self) -> bool {
+        self.monitor_selection == MonitorSelection::Executables
             && self.target_executables.iter().any(|t| {
                 let s = t.trim();
                 !s.is_empty() && s != "*"
-            });
-        if !has_specific_exe && self.action == RuleAction::KillProcess {
+            })
+    }
+
+    /// Returns the threshold duration in seconds configured for this rule's trigger (`Period` or `Limit`).
+    pub fn trigger_threshold_seconds(&self) -> u32 {
+        match self.trigger {
+            TriggerType::Period => self.period.to_seconds(),
+            TriggerType::Limit => self.limit.to_seconds(),
+        }
+    }
+
+    /// Enforces safety invariants on this rule, downgrading `KillProcess` to `CloseWindow`
+    /// whenever the rule does not target at least one specific executable name.
+    pub fn sanitize(&mut self) {
+        if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
             self.action = RuleAction::CloseWindow;
         }
     }
@@ -943,5 +955,22 @@ mod tests {
         let dup_empty = empty_name.duplicate("rule-5".to_string());
         assert_eq!(dup_empty.id, "rule-5");
         assert_eq!(dup_empty.name, "Rule 5");
+    }
+
+    #[test]
+    fn test_rule_predicates_and_threshold() {
+        let mut r = Rule::default_template(0);
+        assert!(!r.has_specific_executable()); // defaults to ["*"]
+        assert_eq!(r.trigger_threshold_seconds(), 50 * 60);
+
+        r.target_executables = vec!["code.exe".to_string()];
+        assert!(r.has_specific_executable());
+
+        r.monitor_selection = MonitorSelection::Titles;
+        assert!(!r.has_specific_executable());
+
+        r.trigger = TriggerType::Limit;
+        r.limit = DurationConfig::new(2, TimeUnit::Hr);
+        assert_eq!(r.trigger_threshold_seconds(), 7200);
     }
 }

@@ -1,7 +1,6 @@
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
 use regex::Regex;
 use slint::Color;
-use crate::formatter::TextHorizontalAlignment;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -14,7 +13,7 @@ use crate::config::{
     TriggerType,
 };
 use crate::enforcer;
-use crate::formatter::{self, MessageContext};
+use crate::formatter::{self, FormattedParagraph, MessageContext, TextHorizontalAlignment};
 use crate::overlay::OverlayMode;
 
 /// Merges overlapping and adjacent intervals into a minimal sorted list of non-overlapping intervals.
@@ -382,21 +381,13 @@ impl Engine {
                 .get(&rule.id)
                 .and_then(|rt| rt.active_break)
                 .unwrap();
-            let matched_app = self
-                .runtimes
-                .get(&rule.id)
-                .and_then(|r| r.last_matched_app.clone())
-                .unwrap_or_else(|| "Active Application".to_string());
+            let matched_app = self.get_last_matched_app_or_default(&rule.id);
             let elapsed = self.rule_elapsed_seconds(&rule);
-            let threshold = match rule.trigger {
-                TriggerType::Period => rule.period.to_seconds(),
-                TriggerType::Limit => rule.limit.to_seconds(),
-            };
+            let threshold = rule.trigger_threshold_seconds();
             let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
-            let paragraphs = formatter::parse_message(
+            let paragraphs = self.parse_rule_message(
                 &rule.message,
                 &ctx,
-                self.default_text_color(),
                 TextHorizontalAlignment::Center,
             );
             self.active_overlay_mode = OverlayMode::Hidden;
@@ -434,16 +425,9 @@ impl Engine {
                 .get(&rule.id)
                 .and_then(|rt| rt.grace_countdown)
                 .unwrap();
-            let matched_app = self
-                .runtimes
-                .get(&rule.id)
-                .and_then(|r| r.last_matched_app.clone())
-                .unwrap_or_else(|| "Active Application".to_string());
+            let matched_app = self.get_last_matched_app_or_default(&rule.id);
             let elapsed = self.rule_elapsed_seconds(&rule);
-            let threshold = match rule.trigger {
-                TriggerType::Period => rule.period.to_seconds(),
-                TriggerType::Limit => rule.limit.to_seconds(),
-            };
+            let threshold = rule.trigger_threshold_seconds();
             let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
             let default_msg = format!(
                 "[color=#f87171 bold] {} in {}s.",
@@ -457,10 +441,9 @@ impl Engine {
             } else {
                 &default_msg
             };
-            let paragraphs = formatter::parse_message(
+            let paragraphs = self.parse_rule_message(
                 raw_msg,
                 &ctx,
-                self.default_text_color(),
                 TextHorizontalAlignment::Left,
             );
             self.active_overlay_mode = OverlayMode::Hidden;
@@ -638,16 +621,7 @@ impl Engine {
             if *remaining_seconds > 0 {
                 *remaining_seconds -= 1;
                 let rem = *remaining_seconds;
-                self.overlay_tx
-                    .send(OverlayAction::UpdateCountdown {
-                        remaining: rem,
-                        total: duration_seconds,
-                        is_idle,
-                    })
-                    .ok();
-                if rem == 0 {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.send_overlay_countdown_tick(rem, duration_seconds, is_idle);
             }
         } else if let OverlayMode::HudTimer {
             ref rule_id,
@@ -659,16 +633,7 @@ impl Engine {
             if rule_id == "test_timer" && *remaining_seconds > 0 {
                 *remaining_seconds -= 1;
                 let rem = *remaining_seconds;
-                self.overlay_tx
-                    .send(OverlayAction::UpdateCountdown {
-                        remaining: rem,
-                        total: duration_seconds,
-                        is_idle,
-                    })
-                    .ok();
-                if rem == 0 {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.send_overlay_countdown_tick(rem, duration_seconds, is_idle);
             }
         } else if let OverlayMode::BreakEnforcer {
             ref rule_id,
@@ -681,16 +646,7 @@ impl Engine {
                     *remaining_seconds -= 1;
                 }
                 let rem = *remaining_seconds;
-                self.overlay_tx
-                    .send(OverlayAction::UpdateCountdown {
-                        remaining: rem,
-                        total: 300,
-                        is_idle,
-                    })
-                    .ok();
-                if rem == 0 {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.send_overlay_countdown_tick(rem, 300, is_idle);
             }
         }
 
@@ -724,10 +680,7 @@ impl Engine {
                 }
                 .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.rule_elapsed_seconds(&rule);
-                let threshold = match rule.trigger {
-                    TriggerType::Period => rule.period.to_seconds(),
-                    TriggerType::Limit => rule.limit.to_seconds(),
-                };
+                let threshold = rule.trigger_threshold_seconds();
                 let break_secs = rule.break_duration.to_seconds().max(1);
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.prev_completed_at = rt.last_completed_at;
@@ -736,10 +689,9 @@ impl Engine {
                     rt.action_executed_today = true;
                 }
                 let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
-                let paragraphs = formatter::parse_message(
+                let paragraphs = self.parse_rule_message(
                     &rule.message,
                     &ctx,
-                    self.default_text_color(),
                     TextHorizontalAlignment::Center,
                 );
                 self.show_overlay(OverlayMode::BreakEnforcer {
@@ -875,10 +827,7 @@ impl Engine {
                 }
                 .unwrap_or_else(|| "Active Application".to_string());
                 let elapsed = self.rule_elapsed_seconds(&rule);
-                let threshold = match rule.trigger {
-                    TriggerType::Period => rule.period.to_seconds(),
-                    TriggerType::Limit => rule.limit.to_seconds(),
-                };
+                let threshold = rule.trigger_threshold_seconds();
                 self.execute_rule_action(&rule, re.as_ref(), now, &matched_name, elapsed, threshold).await;
             }
         }
@@ -1094,6 +1043,38 @@ impl Engine {
         self.refresh_stats_overlay_from_events(now, &all_events);
     }
 
+    /// Parses a raw rule message with context using the engine's default text color and requested alignment.
+    fn parse_rule_message(
+        &self,
+        raw_msg: &str,
+        ctx: &MessageContext,
+        alignment: TextHorizontalAlignment,
+    ) -> Vec<FormattedParagraph> {
+        formatter::parse_message(raw_msg, ctx, self.default_text_color(), alignment)
+    }
+
+    /// Returns the last matched application name for `rule_id`, falling back to `"Active Application"`.
+    fn get_last_matched_app_or_default(&self, rule_id: &str) -> String {
+        self.runtimes
+            .get(rule_id)
+            .and_then(|r| r.last_matched_app.clone())
+            .unwrap_or_else(|| "Active Application".to_string())
+    }
+
+    /// Sends an overlay countdown update and triggers a transition or hide if remaining time reaches zero.
+    fn send_overlay_countdown_tick(&mut self, remaining: u32, total: u32, is_idle: bool) {
+        self.overlay_tx
+            .send(OverlayAction::UpdateCountdown {
+                remaining,
+                total,
+                is_idle,
+            })
+            .ok();
+        if remaining == 0 {
+            self.transition_to_active_countdown_or_hide();
+        }
+    }
+
     /// Builds a `MessageContext` populated with formatted session duration, usage, limit, and remaining durations for a rule.
     fn build_message_context(
         &self,
@@ -1139,10 +1120,9 @@ impl Engine {
             } else {
                 &default_msg
             };
-            let paragraphs = formatter::parse_message(
+            let paragraphs = self.parse_rule_message(
                 raw_msg,
                 ctx,
-                self.default_text_color(),
                 TextHorizontalAlignment::Left,
             );
             let dur = rule.notification_duration.to_seconds().max(1);
@@ -1342,10 +1322,9 @@ impl Engine {
                 } else {
                     &default_msg
                 };
-                let paragraphs = formatter::parse_message(
+                let paragraphs = self.parse_rule_message(
                     raw_msg,
                     &ctx,
-                    self.default_text_color(),
                     TextHorizontalAlignment::Left,
                 );
                 self.show_overlay(OverlayMode::HudTimer {
@@ -1401,10 +1380,9 @@ impl Engine {
                     rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
-                let paragraphs = formatter::parse_message(
+                let paragraphs = self.parse_rule_message(
                     &rule.message,
                     &ctx,
-                    self.default_text_color(),
                     TextHorizontalAlignment::Center,
                 );
                 self.show_overlay(OverlayMode::BreakEnforcer {
@@ -1426,10 +1404,9 @@ impl Engine {
                         enforcer::send_system_notification(&rule.name, &ctx.interpolate(&rule.message));
                     }
                     NotificationMethod::Hud => {
-                        let paragraphs = formatter::parse_message(
+                        let paragraphs = self.parse_rule_message(
                             &rule.message,
                             &ctx,
-                            self.default_text_color(),
                             TextHorizontalAlignment::Left,
                         );
                         let dur = rule.notification_duration.to_seconds().max(1);

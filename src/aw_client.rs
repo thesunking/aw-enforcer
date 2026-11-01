@@ -177,35 +177,7 @@ impl AwClient {
             ]
         });
 
-        let resp_result = self.client.post(&url).json(&query_body).send().await;
-        let resp = match resp_result {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let status = r.status();
-                tracing::warn!("ActivityWatch query returned HTTP status {}", status);
-                self.buckets_verified.store(false, Ordering::Relaxed);
-                return Ok(Vec::new());
-            }
-            Err(e) => {
-                tracing::warn!("ActivityWatch query network error: {}", e);
-                self.buckets_verified.store(false, Ordering::Relaxed);
-                return Err(e.into());
-            }
-        };
-
-        let body: Value = resp.json().await?;
-        // ActivityWatch /api/0/query/ returns a list of results per timeperiod: [[events]]
-        if let Some(arr) = body.as_array() {
-            if let Some(first_period_events) = arr.first() {
-                if let Ok(events) =
-                    serde_json::from_value::<Vec<AwEvent>>(first_period_events.clone())
-                {
-                    return Ok(events);
-                }
-            }
-        }
-
-        Ok(Vec::new())
+        self.execute_query(&url, &query_body).await
     }
 
     /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
@@ -256,39 +228,52 @@ impl AwClient {
             ]
         });
 
-        let resp_result = self.client.post(&url).json(&query_body).send().await;
+        let events = self.execute_query(&url, &query_body).await.unwrap_or_default();
+        if events.is_empty() && !self.buckets_verified.load(Ordering::Relaxed) {
+            self.has_web_bucket.store(false, Ordering::Relaxed);
+        }
+        events
+    }
+
+    /// Dispatches a query request to ActivityWatch `/api/0/query/`, checking HTTP status and parsing returned events.
+    async fn execute_query(
+        &self,
+        url: &str,
+        query_body: &Value,
+    ) -> Result<Vec<AwEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let resp_result = self.client.post(url).json(query_body).send().await;
         let resp = match resp_result {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 let status = r.status();
-                tracing::warn!("ActivityWatch web query returned HTTP status {}", status);
+                tracing::warn!("ActivityWatch query returned HTTP status {}", status);
                 self.buckets_verified.store(false, Ordering::Relaxed);
-                self.has_web_bucket.store(false, Ordering::Relaxed);
-                return Vec::new();
+                return Ok(Vec::new());
             }
             Err(e) => {
-                tracing::warn!("ActivityWatch web query network error: {}", e);
+                tracing::warn!("ActivityWatch query network error: {}", e);
                 self.buckets_verified.store(false, Ordering::Relaxed);
-                self.has_web_bucket.store(false, Ordering::Relaxed);
-                return Vec::new();
+                return Err(e.into());
             }
         };
 
         let body: Value = match resp.json().await {
             Ok(b) => b,
-            Err(_) => return Vec::new(),
+            Err(_) => return Ok(Vec::new()),
         };
 
-        if let Some(arr) = body.as_array() {
-            if let Some(first_period_events) = arr.first() {
-                if let Ok(events) =
-                    serde_json::from_value::<Vec<AwEvent>>(first_period_events.clone())
-                {
-                    return events;
-                }
+        Ok(parse_query_response_events(&body))
+    }
+}
+
+/// Extracts `Vec<AwEvent>` from an ActivityWatch `/api/0/query/` response body array (`[[events]]`).
+fn parse_query_response_events(body: &Value) -> Vec<AwEvent> {
+    if let Some(arr) = body.as_array() {
+        if let Some(first_period_events) = arr.first() {
+            if let Ok(events) = serde_json::from_value::<Vec<AwEvent>>(first_period_events.clone()) {
+                return events;
             }
         }
-
-        Vec::new()
     }
+    Vec::new()
 }

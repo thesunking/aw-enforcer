@@ -260,18 +260,26 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     1
 }
 
+/// Returns true if `targets` contains at least one non-empty, non-wildcard executable entry.
+pub fn has_specific_targets<S: AsRef<str>>(targets: &[S]) -> bool {
+    targets.iter().any(|t| {
+        let s = t.as_ref().trim();
+        !s.is_empty() && s != "*"
+    })
+}
+
+/// Returns true if `targets` contains a wildcard `"*"` entry.
+pub fn has_wildcard_target<S: AsRef<str>>(targets: &[S]) -> bool {
+    targets.iter().any(|t| t.as_ref().trim() == "*")
+}
+
 /// Enumerates top-level windows, optionally sending `WM_CLOSE` to matches, and returns `(matched_count, first_matched_name)`.
 fn scan_windows<S: AsRef<str>>(
     target_executables: &[S],
     compiled_regex: Option<&Regex>,
     close_matched: bool,
 ) -> (usize, Option<String>) {
-    let has_exe_targets = target_executables
-        .iter()
-        .any(|t| {
-            let s = t.as_ref().trim();
-            !s.is_empty() && s != "*"
-        });
+    let has_exe_targets = has_specific_targets(target_executables);
 
     let mut ctx = EnumMatchContext {
         target_executables,
@@ -297,8 +305,7 @@ pub fn close_target_windows<S: AsRef<str>>(
     target_executables: &[S],
     compiled_regex: Option<&Regex>,
 ) -> usize {
-    let is_wildcard = compiled_regex.is_none()
-        && target_executables.iter().any(|t| t.as_ref().trim() == "*");
+    let is_wildcard = compiled_regex.is_none() && has_wildcard_target(target_executables);
     if is_wildcard {
         unsafe {
             let hwnd = GetForegroundWindow();
@@ -322,16 +329,7 @@ pub fn find_matching_window<S: AsRef<str>>(
 
 /// Terminates processes matching target executables via Win32 ToolHelp snapshot.
 pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
-    if target_executables.is_empty() {
-        return 0;
-    }
-    let has_specific_target = target_executables
-        .iter()
-        .any(|t| {
-            let s = t.as_ref().trim();
-            !s.is_empty() && s != "*"
-        });
-    if !has_specific_target {
+    if target_executables.is_empty() || !has_specific_targets(target_executables) {
         return 0;
     }
 
@@ -377,13 +375,8 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
             return false;
         }
 
-        let has_wildcard = target_executables.iter().any(|t| t.as_ref().trim() == "*");
-        let has_exe_targets = target_executables
-            .iter()
-            .any(|t| {
-                let s = t.as_ref().trim();
-                !s.is_empty() && s != "*"
-            });
+        let has_wildcard = has_wildcard_target(target_executables);
+        let has_exe_targets = has_specific_targets(target_executables);
 
         let title_matches = if let Some(re) = compiled_regex {
             let mut title_buf = [0u16; 512];
@@ -467,5 +460,19 @@ mod tests {
         assert!(exe_name_matches_targets("firefox.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("notepad.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("code.exe", BROWSER_EXES));
+    }
+
+    #[test]
+    fn test_target_predicates() {
+        assert!(has_wildcard_target(&["*"]));
+        assert!(has_wildcard_target(&["notepad.exe", " * "]));
+        assert!(!has_wildcard_target(&["notepad.exe"]));
+        assert!(!has_wildcard_target::<&str>(&[]));
+
+        assert!(has_specific_targets(&["notepad.exe"]));
+        assert!(has_specific_targets(&["*", "chrome.exe"]));
+        assert!(!has_specific_targets(&["*"]));
+        assert!(!has_specific_targets(&["", "   "]));
+        assert!(!has_specific_targets::<&str>(&[]));
     }
 }

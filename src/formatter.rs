@@ -268,45 +268,69 @@ pub struct LineFormattingStatus {
     pub size_val: u32,      // e.g. 18 or 0 (default)
 }
 
+/// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
+fn split_header_prefix(line: &str) -> (&str, &str) {
+    let trimmed = line.trim();
+    if let Some(r) = trimmed.strip_prefix("## ") {
+        ("## ", r.trim_start())
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("# ", r.trim_start())
+    } else {
+        ("", trimmed)
+    }
+}
+
+/// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
+fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
+            if is_valid_attr_block(inner) {
+                let content = rest[close_idx + 1..].trim_start();
+                return Some((inner, content));
+            }
+        }
+    }
+    None
+}
+
+/// Formats a line by attaching header prefix and attribute block if tokens are non-empty.
+fn format_line_with_attrs(header_prefix: &str, tokens: &[String], content: &str) -> String {
+    if tokens.is_empty() {
+        format!("{}{}", header_prefix, content)
+    } else {
+        format!("{}[{}] {}", header_prefix, tokens.join(" "), content)
+    }
+}
+
 /// Inspects the line at `line_idx` and returns its active heading or `[attr ...]` formatting state.
 pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormattingStatus {
     let lines: Vec<&str> = split_lines(raw_text).collect();
     if line_idx >= lines.len() {
         return LineFormattingStatus::default();
     }
-    let line = lines[line_idx].trim();
+    let line = lines[line_idx];
     let mut status = LineFormattingStatus::default();
 
-    let rest = if let Some(r) = line.strip_prefix("## ") {
-        status.is_h2 = true;
-        r.trim_start()
-    } else if let Some(r) = line.strip_prefix("# ") {
-        status.is_h1 = true;
-        r.trim_start()
-    } else {
-        line
-    };
+    let (header, rest) = split_header_prefix(line);
+    status.is_h1 = header == "# ";
+    status.is_h2 = header == "## ";
 
-    if rest.starts_with('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let inner = &rest[1..close_idx];
-            if is_valid_attr_block(inner) {
-                for token in inner.split_whitespace() {
-                    match token {
-                        "bold" => status.is_bold = true,
-                        "italic" => status.is_italic = true,
-                        "underline" => status.is_underline = true,
-                        s if s.starts_with("color=") => {
-                            status.color_code = s.strip_prefix("color=").unwrap_or("").to_string();
-                        }
-                        s if s.starts_with("size=") => {
-                            if let Ok(val) = s.strip_prefix("size=").unwrap_or("").parse::<u32>() {
-                                status.size_val = val;
-                            }
-                        }
-                        _ => {}
+    if let Some((inner, _)) = extract_attr_block(rest) {
+        for token in inner.split_whitespace() {
+            match token {
+                "bold" => status.is_bold = true,
+                "italic" => status.is_italic = true,
+                "underline" => status.is_underline = true,
+                s if s.starts_with("color=") => {
+                    status.color_code = s.strip_prefix("color=").unwrap_or("").to_string();
+                }
+                s if s.starts_with("size=") => {
+                    if let Ok(val) = s.strip_prefix("size=").unwrap_or("").parse::<u32>() {
+                        status.size_val = val;
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -369,45 +393,20 @@ pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) ->
 
 /// Strips any existing `# ` or `## ` prefix from `line` and returns the inner content.
 fn strip_existing_prefix(line: &str) -> &str {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("## ") {
-        return rest.trim_start();
-    }
-    if let Some(rest) = trimmed.strip_prefix("# ") {
-        return rest.trim_start();
-    }
-    trimmed
+    split_header_prefix(line).1
 }
 
 /// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block,
 /// preserving any leading `# ` or `## ` heading prefix.
 fn strip_attr_prefix(line: &str, prefix: &str) -> String {
-    let trimmed = line.trim();
-    let (header_prefix, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
-        ("## ", r.trim_start())
-    } else if let Some(r) = trimmed.strip_prefix("# ") {
-        ("# ", r.trim_start())
-    } else {
-        ("", trimmed)
-    };
-
-    if rest.starts_with('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let inner = &rest[1..close_idx];
-            if is_valid_attr_block(inner) {
-                let tokens: Vec<String> = inner
-                    .split_whitespace()
-                    .filter(|t| !t.starts_with(prefix))
-                    .map(|s| s.to_string())
-                    .collect();
-                let content = rest[close_idx + 1..].trim_start();
-                if tokens.is_empty() {
-                    return format!("{}{}", header_prefix, content);
-                } else {
-                    return format!("{}[{}] {}", header_prefix, tokens.join(" "), content);
-                }
-            }
-        }
+    let (header_prefix, rest) = split_header_prefix(line);
+    if let Some((inner, content)) = extract_attr_block(rest) {
+        let tokens: Vec<String> = inner
+            .split_whitespace()
+            .filter(|t| !t.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect();
+        return format_line_with_attrs(header_prefix, &tokens, content);
     }
     line.to_string()
 }
@@ -415,44 +414,26 @@ fn strip_attr_prefix(line: &str, prefix: &str) -> String {
 /// Toggles or replaces a single attribute token inside a line's leading `[...]` attribute block,
 /// preserving any leading `# ` or `## ` heading prefix.
 fn toggle_attr(line: &str, attr: &str) -> String {
-    let trimmed = line.trim();
-    let (header_prefix, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
-        ("## ", r.trim_start())
-    } else if let Some(r) = trimmed.strip_prefix("# ") {
-        ("# ", r.trim_start())
-    } else {
-        ("", trimmed)
-    };
+    let (header_prefix, rest) = split_header_prefix(line);
+    if let Some((inner, content)) = extract_attr_block(rest) {
+        let mut tokens: Vec<String> =
+            inner.split_whitespace().map(|s| s.to_string()).collect();
 
-    if rest.starts_with('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let inner = &rest[1..close_idx];
-            if is_valid_attr_block(inner) {
-                let mut tokens: Vec<String> =
-                    inner.split_whitespace().map(|s| s.to_string()).collect();
-                let content = rest[close_idx + 1..].trim_start();
-
-                if let Some(pos) = tokens.iter().position(|t| t == attr) {
-                    tokens.remove(pos);
-                } else {
-                    if attr.starts_with("color=") {
-                        tokens.retain(|t| !t.starts_with("color="));
-                    } else if attr.starts_with("size=") {
-                        tokens.retain(|t| !t.starts_with("size="));
-                    }
-                    tokens.push(attr.to_string());
-                }
-
-                if tokens.is_empty() {
-                    return format!("{}{}", header_prefix, content);
-                } else {
-                    return format!("{}[{}] {}", header_prefix, tokens.join(" "), content);
-                }
+        if let Some(pos) = tokens.iter().position(|t| t == attr) {
+            tokens.remove(pos);
+        } else {
+            if attr.starts_with("color=") {
+                tokens.retain(|t| !t.starts_with("color="));
+            } else if attr.starts_with("size=") {
+                tokens.retain(|t| !t.starts_with("size="));
             }
+            tokens.push(attr.to_string());
         }
+
+        return format_line_with_attrs(header_prefix, &tokens, content);
     }
 
-    format!("{}[{}] {}", header_prefix, attr, rest)
+    format_line_with_attrs(header_prefix, &[attr.to_string()], rest)
 }
 
 #[cfg(test)]

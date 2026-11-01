@@ -571,9 +571,7 @@ impl OverlayManager {
             } => {
                 self.prepare_windows(monitors.len());
 
-                let mins = remaining_seconds / 60;
-                let secs = remaining_seconds % 60;
-                let countdown_str = format!("{:02}:{:02}", mins, secs);
+                let countdown_str = format_countdown(*remaining_seconds, false);
 
                 for (idx, mon) in monitors.iter().enumerate() {
                     if idx >= self.windows.len() {
@@ -592,8 +590,7 @@ impl OverlayManager {
                         win.set_click_through(*click_through);
                         win.set_is_user_idle(true);
 
-                        let para_models = Rc::new(VecModel::from(paragraphs.clone()));
-                        win.set_message_paragraphs(ModelRc::from(para_models));
+                        set_window_paragraphs(win, paragraphs);
                     }
 
                     let width = mon.work_rect.right - mon.work_rect.left;
@@ -641,26 +638,13 @@ impl OverlayManager {
                     win.set_rule_id(rule_id.as_str().into());
                     win.set_title_text(title.as_str().into());
                     win.set_show_time_remaining(*show_time_remaining);
-                    let countdown_str = if *remaining_seconds < 60 {
-                        format!("{}s", remaining_seconds)
-                    } else {
-                        let mins = remaining_seconds / 60;
-                        let secs = remaining_seconds % 60;
-                        format!("{:02}:{:02}", mins, secs)
-                    };
-                    win.set_countdown_text(countdown_str.into());
-                    let ratio = if *duration_seconds > 0 {
-                        *remaining_seconds as f32 / *duration_seconds as f32
-                    } else {
-                        0.0
-                    };
-                    win.set_progress_ratio(ratio);
+                    win.set_countdown_text(format_countdown(*remaining_seconds, true).into());
+                    win.set_progress_ratio(compute_progress_ratio(*remaining_seconds, *duration_seconds));
                     win.set_click_through(false);
                     win.set_allow_snooze(!snooze_options_minutes.is_empty());
                     win.set_strict_mode(snooze_options_minutes.is_empty());
 
-                    let para_models = Rc::new(VecModel::from(paragraphs.clone()));
-                    win.set_message_paragraphs(ModelRc::from(para_models));
+                    set_window_paragraphs(win, paragraphs);
 
                     let snooze_i32: Vec<i32> =
                         snooze_options_minutes.iter().map(|&m| m as i32).collect();
@@ -668,9 +652,7 @@ impl OverlayManager {
                 }
 
                 let scale = self.windows[0].window().scale_factor().max(1.0);
-                let card_w = (480.0 * scale).round() as i32;
-                let card_h = (280.0 * scale).round() as i32;
-                let margin = (20.0 * scale).round() as i32;
+                let (card_w, card_h, margin) = scale_card_bounds(scale, 480.0, 280.0, 20.0);
                 let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, false, true, false);
@@ -691,23 +673,15 @@ impl OverlayManager {
                     win.set_mode("hud_timer".into());
                     win.set_rule_id(rule_id.as_str().into());
                     win.set_title_text(title.as_str().into());
-                    win.set_countdown_text(format!("{}s", remaining_seconds).into());
-                    let ratio = if *duration_seconds > 0 {
-                        *remaining_seconds as f32 / *duration_seconds as f32
-                    } else {
-                        0.0
-                    };
-                    win.set_progress_ratio(ratio);
+                    win.set_countdown_text(format_countdown(*remaining_seconds, true).into());
+                    win.set_progress_ratio(compute_progress_ratio(*remaining_seconds, *duration_seconds));
                     win.set_click_through(true);
 
-                    let para_models = Rc::new(VecModel::from(paragraphs.clone()));
-                    win.set_message_paragraphs(ModelRc::from(para_models));
+                    set_window_paragraphs(win, paragraphs);
                 }
 
                 let scale = self.windows[0].window().scale_factor().max(1.0);
-                let card_w = (420.0 * scale).round() as i32;
-                let card_h = (180.0 * scale).round() as i32;
-                let margin = (20.0 * scale).round() as i32;
+                let (card_w, card_h, margin) = scale_card_bounds(scale, 420.0, 180.0, 20.0);
                 let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, true, true, false);
@@ -725,9 +699,7 @@ impl OverlayManager {
                 self.prepare_windows(1);
 
                 let scale = self.windows[0].window().scale_factor().max(1.0);
-                let card_w = (540.0 * scale).round() as i32;
-                let card_h = (270.0 * scale).round() as i32;
-                let margin = (20.0 * scale).round() as i32;
+                let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
 
                 let win = &self.windows[0];
                 Self::apply_theme_to_window(win, &self.overlay_config);
@@ -764,19 +736,8 @@ impl OverlayManager {
     /// Updates the countdown text, progress bar ratio, and user-idle indicator across all active overlay windows.
     pub fn update_countdown(&mut self, remaining_seconds: u32, total_seconds: u32, is_user_idle: bool) {
         let is_hud = matches!(self.current_mode, OverlayMode::HudTimer { .. } | OverlayMode::HudToast { .. });
-        let countdown_str = if is_hud && remaining_seconds < 60 {
-            format!("{}s", remaining_seconds)
-        } else {
-            let mins = remaining_seconds / 60;
-            let secs = remaining_seconds % 60;
-            format!("{:02}:{:02}", mins, secs)
-        };
-
-        let ratio = if total_seconds > 0 {
-            remaining_seconds as f32 / total_seconds as f32
-        } else {
-            0.0
-        };
+        let countdown_str = format_countdown(remaining_seconds, is_hud);
+        let ratio = compute_progress_ratio(remaining_seconds, total_seconds);
 
         for win in &self.windows {
             win.set_countdown_text(countdown_str.as_str().into());
@@ -784,4 +745,39 @@ impl OverlayManager {
             win.set_is_user_idle(is_user_idle);
         }
     }
+}
+
+/// Formats remaining seconds as either `"15s"` (for HUDs under 60s) or `"MM:SS"`.
+fn format_countdown(remaining_seconds: u32, is_hud: bool) -> String {
+    if is_hud && remaining_seconds < 60 {
+        format!("{}s", remaining_seconds)
+    } else {
+        let mins = remaining_seconds / 60;
+        let secs = remaining_seconds % 60;
+        format!("{:02}:{:02}", mins, secs)
+    }
+}
+
+/// Computes the ratio of remaining to total duration safely clamped between 0.0 and 1.0.
+fn compute_progress_ratio(remaining_seconds: u32, total_seconds: u32) -> f32 {
+    if total_seconds > 0 {
+        remaining_seconds as f32 / total_seconds as f32
+    } else {
+        0.0
+    }
+}
+
+/// Computes scaled DPI-aware card dimensions `(width, height, margin)` from logical measurements.
+fn scale_card_bounds(scale: f32, w: f32, h: f32, margin: f32) -> (i32, i32, i32) {
+    (
+        (w * scale).round() as i32,
+        (h * scale).round() as i32,
+        (margin * scale).round() as i32,
+    )
+}
+
+/// Sets formatted message paragraphs on an `OverlayWindow`.
+fn set_window_paragraphs(win: &OverlayWindow, paragraphs: &[FormattedParagraph]) {
+    let para_models = Rc::new(VecModel::from(paragraphs.to_vec()));
+    win.set_message_paragraphs(ModelRc::from(para_models));
 }
