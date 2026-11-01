@@ -408,6 +408,7 @@ impl Engine {
                 rule_id: rule.id.clone(),
                 title: rule.name.clone(),
                 paragraphs,
+                duration_seconds: total,
                 remaining_seconds: rem,
                 allow_snooze: !rule.strict_mode,
                 strict_mode: rule.strict_mode,
@@ -674,6 +675,7 @@ impl Engine {
         } else if let OverlayMode::BreakEnforcer {
             ref rule_id,
             ref mut remaining_seconds,
+            duration_seconds,
             ..
         } = self.active_overlay_mode
         {
@@ -682,8 +684,7 @@ impl Engine {
                     *remaining_seconds -= 1;
                 }
                 let rem = *remaining_seconds;
-                let total = if rule_id == "test_break" { 300 } else { 15 };
-                self.send_overlay_countdown_tick(rem, total, is_idle);
+                self.send_overlay_countdown_tick(rem, duration_seconds, is_idle);
             }
         }
 
@@ -697,8 +698,8 @@ impl Engine {
                 }
             }
         }
-        for rule_id in launched_breaks {
-            if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
+        for rule_id in &launched_breaks {
+            if let Some(rule) = self.config.rules.iter().find(|r| r.id == *rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let matched_app = if rule.monitor_selection == MonitorSelection::Urls {
                     self.runtimes
@@ -735,6 +736,7 @@ impl Engine {
                     rule_id: rule.id.clone(),
                     title: rule.name.clone(),
                     paragraphs,
+                    duration_seconds: break_secs,
                     remaining_seconds: break_secs,
                     allow_snooze: !rule.strict_mode,
                     strict_mode: rule.strict_mode,
@@ -749,6 +751,9 @@ impl Engine {
         let mut completed_breaks = Vec::new();
         let mut break_displayed_finished = false;
         for rule_id in &rule_ids {
+            if launched_breaks.contains(rule_id) {
+                continue;
+            }
             let is_displayed = self.is_rule_displayed(rule_id);
             if let Some(rt) = self.runtimes.get_mut(rule_id) {
                 if let Some((ref mut rem, total)) = rt.active_break {
@@ -756,6 +761,13 @@ impl Engine {
                         *rem -= 1;
                     }
                     if is_displayed {
+                        if let OverlayMode::BreakEnforcer {
+                            ref mut remaining_seconds,
+                            ..
+                        } = self.active_overlay_mode
+                        {
+                            *remaining_seconds = *rem;
+                        }
                         self.overlay_tx
                             .send(OverlayAction::UpdateCountdown {
                                 remaining: *rem,
@@ -789,6 +801,13 @@ impl Engine {
                     if *rem > 0 {
                         *rem -= 1;
                         if is_displayed {
+                            if let OverlayMode::HudTimer {
+                                ref mut remaining_seconds,
+                                ..
+                            } = self.active_overlay_mode
+                            {
+                                *remaining_seconds = *rem;
+                            }
                             self.overlay_tx
                                 .send(OverlayAction::UpdateCountdown {
                                     remaining: *rem,
@@ -1475,6 +1494,7 @@ impl Engine {
                     rule_id: rule.id.clone(),
                     title: rule.name.clone(),
                     paragraphs,
+                    duration_seconds: break_secs,
                     remaining_seconds: break_secs,
                     allow_snooze: !rule.strict_mode,
                     strict_mode: rule.strict_mode,
@@ -1754,6 +1774,7 @@ impl Engine {
                     rule_id: "test_break".into(),
                     title: "Test Break Enforcer".into(),
                     paragraphs,
+                    duration_seconds: 300,
                     remaining_seconds: 300,
                     allow_snooze: true,
                     strict_mode: false,
@@ -1814,6 +1835,7 @@ impl Engine {
                     rule_id: "test_preview".to_string(),
                     title: rule.name.clone(),
                     paragraphs,
+                    duration_seconds: 15,
                     remaining_seconds: 15,
                     allow_snooze: true,
                     strict_mode: false,
@@ -2189,6 +2211,7 @@ mod tests {
             rule_id: rule_id.clone(),
             title: "Break".into(),
             paragraphs: Vec::new(),
+            duration_seconds: 60,
             remaining_seconds: 60,
             allow_snooze: false,
             strict_mode: true,
@@ -2565,6 +2588,7 @@ mod tests {
             rule_id: "rule-break".to_string(),
             title: "Break".to_string(),
             paragraphs: Vec::new(),
+            duration_seconds: 300,
             remaining_seconds: 300,
             allow_snooze: true,
             strict_mode: false,
@@ -2858,6 +2882,7 @@ mod tests {
             rule_id: "rule-1".to_string(),
             title: "Rule 1 Break".to_string(),
             paragraphs: Vec::new(),
+            duration_seconds: 300,
             remaining_seconds: 300,
             allow_snooze: true,
             strict_mode: false,
@@ -2919,6 +2944,7 @@ mod tests {
             rule_id: "rule-a".to_string(),
             title: "Rule A".to_string(),
             paragraphs: Vec::new(),
+            duration_seconds: 200,
             remaining_seconds: 200,
             allow_snooze: true,
             strict_mode: false,
@@ -2960,6 +2986,7 @@ mod tests {
             rule_id: "rule-sched".to_string(),
             title: "Rule Break".to_string(),
             paragraphs: Vec::new(),
+            duration_seconds: 300,
             remaining_seconds: 300,
             allow_snooze: true,
             strict_mode: false,
@@ -3126,11 +3153,13 @@ mod tests {
             OverlayAction::Show(OverlayMode::BreakEnforcer {
                 rule_id,
                 paragraphs,
+                duration_seconds,
                 remaining_seconds,
                 strict_mode,
                 ..
             }) => {
                 assert_eq!(rule_id, "test_preview");
+                assert_eq!(duration_seconds, 15);
                 assert_eq!(remaining_seconds, 15);
                 assert!(!strict_mode);
                 assert!(!paragraphs.is_empty());
@@ -3191,5 +3220,67 @@ mod tests {
             rem_global, 2, 30
         );
         assert_eq!(tooltip, "AW-Enforcer (Snoozed 15m) — Today: 2h 30m");
+    }
+
+    #[tokio::test]
+    async fn test_pending_break_launch_retains_full_duration_without_same_tick_decrement() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-break-test".to_string();
+        rule.action = RuleAction::ShowOverlay;
+        rule.break_duration = DurationConfig::new(30, TimeUnit::Sec);
+        cfg.rules = vec![rule.clone()];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Simulate a rule waiting on natural break delay for over 15 seconds
+        let now = Local::now();
+        engine.runtimes.get_mut("rule-break-test").unwrap().pending_break_since =
+            Some(now - Duration::seconds(20));
+
+        // Tick realtime: Step 1 launches the pending break
+        engine.realtime_tick().await;
+
+        let rt = engine.runtimes.get("rule-break-test").unwrap();
+        // rt.active_break must retain its full (30, 30) duration and NOT be decremented to 29
+        assert_eq!(rt.active_break, Some((30, 30)));
+        assert_eq!(rt.pending_break_since, None);
+
+        // active_overlay_mode must be BreakEnforcer with duration_seconds == 30 and remaining_seconds == 30
+        match &engine.active_overlay_mode {
+            OverlayMode::BreakEnforcer {
+                rule_id,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            } => {
+                assert_eq!(rule_id, "rule-break-test");
+                assert_eq!(*duration_seconds, 30);
+                assert_eq!(*remaining_seconds, 30);
+            }
+            other => panic!("Expected BreakEnforcer overlay, got: {other:?}"),
+        }
+
+        // OverlayAction::Show must have been sent with duration_seconds: 30 and remaining_seconds: 30
+        let mut received_show = false;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::Show(OverlayMode::BreakEnforcer {
+                rule_id,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            }) = action
+            {
+                if rule_id == "rule-break-test" {
+                    assert_eq!(duration_seconds, 30);
+                    assert_eq!(remaining_seconds, 30);
+                    received_show = true;
+                }
+            }
+        }
+        assert!(received_show, "OverlayAction::Show(BreakEnforcer) should be received");
     }
 }

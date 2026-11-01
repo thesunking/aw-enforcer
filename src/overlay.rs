@@ -56,6 +56,7 @@ pub enum OverlayMode {
         rule_id: String,
         title: String,
         paragraphs: Vec<FormattedParagraph>,
+        duration_seconds: u32,
         remaining_seconds: u32,
         allow_snooze: bool,
         strict_mode: bool,
@@ -564,6 +565,7 @@ impl OverlayManager {
                 rule_id,
                 title,
                 paragraphs,
+                duration_seconds,
                 remaining_seconds,
                 allow_snooze,
                 strict_mode,
@@ -585,10 +587,11 @@ impl OverlayManager {
                         win.set_rule_id(rule_id.as_str().into());
                         win.set_title_text(title.as_str().into());
                         win.set_countdown_text(countdown_str.as_str().into());
+                        win.set_progress_ratio(compute_progress_ratio(*remaining_seconds, *duration_seconds));
                         win.set_allow_snooze(*allow_snooze);
                         win.set_strict_mode(*strict_mode);
                         win.set_click_through(*click_through);
-                        win.set_is_user_idle(true);
+                        win.set_is_user_idle(crate::engine::get_idle_time_millis() >= 3000);
 
                         set_window_paragraphs(win, paragraphs);
                     }
