@@ -499,7 +499,6 @@ export component SettingsWindow inherits Window {
                         mouse-cursor: (root.time-format-valid && root.rule-regex-valid && !root.ui-locked-by-strict) ? pointer : not-allowed;
                         clicked => {
                             if !root.ui-locked-by-strict && root.time-format-valid && root.rule-regex-valid {
-                                root.has-unsaved-changes = false;
                                 root.save-config();
                             }
                         }

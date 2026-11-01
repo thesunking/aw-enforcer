@@ -690,6 +690,11 @@ impl Config {
 
         cfg.overlay.opacity = cfg.overlay.opacity.clamp(0.1, 1.0);
 
+        cfg.stats.threshold_excessive_minutes = cfg
+            .stats
+            .threshold_excessive_minutes
+            .max(cfg.stats.daily_screentime_target_minutes);
+
         cfg.sanitize_rules();
 
         Ok(cfg)
@@ -972,5 +977,17 @@ mod tests {
         r.trigger = TriggerType::Limit;
         r.limit = DurationConfig::new(2, TimeUnit::Hr);
         assert_eq!(r.trigger_threshold_seconds(), 7200);
+    }
+
+    #[test]
+    fn test_stats_threshold_excessive_clamped_to_target() {
+        let mut cfg = Config::default();
+        cfg.stats.daily_screentime_target_minutes = 480;
+        cfg.stats.threshold_excessive_minutes = 300; // Less than target
+        cfg.stats.threshold_excessive_minutes = cfg
+            .stats
+            .threshold_excessive_minutes
+            .max(cfg.stats.daily_screentime_target_minutes);
+        assert_eq!(cfg.stats.threshold_excessive_minutes, 480);
     }
 }

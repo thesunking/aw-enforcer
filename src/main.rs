@@ -320,6 +320,27 @@ fn refresh_message_editor_state(
     }
 }
 
+/// Validates regex pattern for a given monitor selection mode, rejecting empty patterns for Titles and Urls.
+pub fn validate_rule_pattern(mode: &str, title_re: &str, url_re: &str) -> (bool, String) {
+    match mode {
+        "Titles" => {
+            if title_re.trim().is_empty() {
+                (false, "Title regex pattern cannot be empty".to_string())
+            } else {
+                config::validate_regex_pattern(title_re)
+            }
+        }
+        "Urls" => {
+            if url_re.trim().is_empty() {
+                (false, "URL regex pattern cannot be empty".to_string())
+            } else {
+                config::validate_regex_pattern(url_re)
+            }
+        }
+        _ => (true, String::new()),
+    }
+}
+
 /// Validates regular expressions across all rules if Title or URL monitoring is selected,
 /// prioritizing the currently active rule's error message, and updating `rule-regex-valid`
 /// and `rule-regex-error` on `win`.
@@ -327,17 +348,9 @@ fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) 
     let cur_idx = win.get_selected_rule_idx();
     if cur_idx >= 0 {
         let mode = win.get_rule_monitor_selection();
-        let (valid, err) = match mode.as_str() {
-            "Titles" => {
-                let pat = win.get_rule_title_regex();
-                config::validate_regex_pattern(&pat)
-            }
-            "Urls" => {
-                let pat = win.get_rule_url_regex();
-                config::validate_regex_pattern(&pat)
-            }
-            _ => (true, String::new()),
-        };
+        let title_re = win.get_rule_title_regex();
+        let url_re = win.get_rule_url_regex();
+        let (valid, err) = validate_rule_pattern(mode.as_str(), &title_re, &url_re);
         if !valid {
             win.set_rule_regex_valid(false);
             win.set_rule_regex_error(err.into());
@@ -350,11 +363,14 @@ fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) 
             continue;
         }
         if let Some(r) = rm.row_data(i) {
-            let (valid, err) = match r.monitor_selection.as_str() {
-                "Titles" => config::validate_regex_pattern(&r.title_regex),
-                "Urls" => config::validate_regex_pattern(&r.url_regex),
-                _ => (true, String::new()),
-            };
+            if !r.enabled {
+                continue;
+            }
+            let (valid, err) = validate_rule_pattern(
+                r.monitor_selection.as_str(),
+                &r.title_regex,
+                &r.url_regex,
+            );
             if !valid {
                 let name = if !r.name.trim().is_empty() {
                     r.name.as_str()
@@ -692,8 +708,13 @@ fn open_settings_window(
 
                 updated_config.stats.daily_screentime_target_minutes =
                     win.get_daily_target_minutes().max(1) as u32;
-                updated_config.stats.threshold_excessive_minutes =
-                    win.get_threshold_excessive_minutes().max(1) as u32;
+                let raw_excessive = win.get_threshold_excessive_minutes().max(1) as u32;
+                let clamped_excessive =
+                    raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
+                if clamped_excessive != raw_excessive {
+                    win.set_threshold_excessive_minutes(clamped_excessive as i32);
+                }
+                updated_config.stats.threshold_excessive_minutes = clamped_excessive;
                 updated_config.stats.histogram_time_format =
                     win.get_time_format_code().to_string();
 
@@ -1226,6 +1247,9 @@ fn open_settings_window(
                     }
                     rm_inner.set_vec(Vec::new());
                 });
+            } else if let Some(win) = slot_inner.borrow().as_ref() {
+                apply_config_to_ui(win, &cfg_for_close.borrow(), &rm_inner);
+                win.set_strict_unlock_countdown(0);
             }
             slint::CloseRequestResponse::HideWindow
         });
@@ -1669,4 +1693,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     slint::run_event_loop_until_quit()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_rule_pattern_empty_and_valid() {
+        // Executables mode ignores regex
+        let (valid, _) = validate_rule_pattern("Executables", "", "");
+        assert!(valid);
+
+        // Titles mode requires non-empty pattern and valid regex
+        let (valid_empty_title, err_empty_title) = validate_rule_pattern("Titles", "   ", "");
+        assert!(!valid_empty_title);
+        assert_eq!(err_empty_title, "Title regex pattern cannot be empty");
+
+        let (valid_bad_title, _) = validate_rule_pattern("Titles", "[a-z", "");
+        assert!(!valid_bad_title);
+
+        let (valid_good_title, _) = validate_rule_pattern("Titles", "(?i)youtube", "");
+        assert!(valid_good_title);
+
+        // Urls mode requires non-empty pattern and valid regex
+        let (valid_empty_url, err_empty_url) = validate_rule_pattern("Urls", "", "   ");
+        assert!(!valid_empty_url);
+        assert_eq!(err_empty_url, "URL regex pattern cannot be empty");
+
+        let (valid_bad_url, _) = validate_rule_pattern("Urls", "", "(?i)*.com");
+        assert!(!valid_bad_url);
+
+        let (valid_good_url, _) = validate_rule_pattern("Urls", "", "(?i)youtube\\.com");
+        assert!(valid_good_url);
+    }
 }
