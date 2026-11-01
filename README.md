@@ -7,7 +7,7 @@
 ## Key Features
 
 - **Orthogonal Rule Engine (`Monitor` × `Trigger` × `Action`):**
-  - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or active browser tab URL regular expressions (`Urls` via `aw-watcher-web`).
+  - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or active browser tab URL regular expressions (`Urls` dynamically discovered across all installed browsers via `aw-watcher-web*`, ignoring non-local synced buckets).
   - **2 Trigger Types:**
     - **`Period`:** Triggers after a continuous active session duration (with interval coalescing and configurable AFK reset threshold).
     - **`Limit`:** Triggers when cumulative daily active usage reaches a quota (anchored to a configurable logical day-start hour, e.g., `04:00 AM`).
@@ -16,22 +16,28 @@
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card (with configurable duration, optional countdown timer, and snooze buttons) or a native `Windows` Action Center toast.
     - **`Show Statistics`:** Opens the draggable 24-Hour Screen Time Summary HUD with an hourly activity histogram that live-updates on every poll tick while open without extra ActivityWatch requests.
     - **`Lock Workstation`:** Immediately locks the Windows session (`LockWorkStation`), with idle detection to avoid repeated lock calls while already away.
-    - **`Close Tab`:** Sends `Ctrl+W` to close the active tab of the matching foreground window without closing the entire browser window if focus shifts.
+    - **`Close Tab`:** Sends `Ctrl+W` to close the active tab of the matching foreground window without closing the entire browser window if focus shifts (with browser executable and tab title verification for `Urls` rules).
     - **`Close Window`:** Gracefully closes matching visible, non-minimized windows via `WM_CLOSE`.
     - **`Kill Process`:** Terminates matching background and foreground processes (restricted to rules targeting specific `.exe` names).
 
 - **Three-Stage Enforcement Pipeline:**
   1. **Stage 1 — Pre-Action Warning (`Warn Before Action`):** Alerts you ahead of time (via HUD toast or Windows notification) before a break or quota enforcement triggers.
-  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work.
-  3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
+  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. For URL and executable rules, closing or navigating away from the target tab or app during the grace period safely aborts destructive actions.
+  3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes. Newly spawned HUD cards retain their full duration without same-tick countdown decrement.
 
 - **Ergonomic, Shell & Anti-Bypass Safeguards:**
+  - **Single-Instance IPC & Window Activation:** Enforces a persistent Win32 mutex (`Local\AW_Enforcer_SingleInstance_Mutex`) and signals a named Win32 event (`Local\AW_Enforcer_Activate_Event`) when a second instance is launched, automatically restoring and focusing the running instance's Settings window.
+  - **Double-Counting Prevention (Interval Coalescing):** Automatically sorts and merges overlapping or adjacent ActivityWatch events (`merge_overlapping_intervals`) across continuous session calculations, cumulative daily usage quotas, and 24-hour histogram binning.
   - **Idle-Aware Break Timer:** Full-screen breaks wait for a natural 1.5-second pause in typing/mouse movement before appearing and pause their countdown (`⏸ Input detected — timer paused until you step away`) whenever physical input is detected.
   - **Fullscreen / D3D Presentation Suppression:** Optionally detects fullscreen Direct3D games, presentations, or Windows Focus Assist (`SHQueryUserNotificationState`) and downgrades intrusive overlays to passive notifications.
   - **Strict Mode & Top-Priority Break Lockout:** When enabled on a `Show Overlay` rule, gives `BreakEnforcer` the highest overlay priority (preventing grace timers or test cards from replacing it), hides Skip/Snooze buttons on the break screen, disables system tray and command bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
   - **Protected Process & Windows Shell Guards:** Automatically excludes the `aw-enforcer` process and Windows shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) from wildcard window closing, tab closing, and process termination.
   - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
+
+- **Display, HiDPI & DWM Compositing:**
+  - **DPI-Aware Overlay Sizing:** Dynamically reads window scale factors to scale HUD card geometry and screen margins accurately on high-DPI displays.
+  - **DWM Client Frame Reset:** Properly resets DWM frame client margins (`DwmExtendFrameIntoClientArea`) on reused overlay windows when transitioning from fullscreen break overlays to HUD cards.
 
 - **Performance & Idle Memory Optimization:**
   - **Slint Rendering Backend (`slint_renderer`):** Switch between OpenGL hardware acceleration (`renderer-femtovg`, default) and lightweight CPU software rendering (`renderer-software`) directly from the Settings **Performance** section. CPU rendering significantly reduces GPU VRAM and overall memory footprint in resource-constrained or virtualized environments (requires application restart).
@@ -42,10 +48,12 @@
   - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
 
 - **Rich Message Editor & Live Preview:**
-  - Customize break and notification messages with Markdown-style headings (`#`, `##`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}`, `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
+  - Customize break and notification messages with Markdown headings (`#`, `##`) with full inline formatting attribute support (e.g. `# [color=#38bdf8 italic] Heading`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}` (retaining URL hostnames for URL rules), `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
 
-- **7×24 Weekly Active Hours Schedule:**
-  - Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
+- **Interactive Rule Management & Real-Time Validation:**
+  - **Multi-Rule Syntax Validation:** Live regex syntax checking on `Titles` and `Urls` rules with real-time error messages in the editor and an aggregate warning banner in the left sidebar above `Save & Apply Changes`.
+  - **Overview Rule Toggle & Deletion Safety:** Toggle rule activation directly from the Overview list via two-way bindings, and automatically revalidate regexes on rule deletion to instantly clear blocking validation errors.
+  - **7×24 Weekly Active Hours Schedule:** Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
 
 ---
 
