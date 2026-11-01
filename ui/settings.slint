@@ -1400,7 +1400,7 @@ export component SettingsWindow inherits Window {
                             }
 
                             // 3H. Message Template & Formatting Toolbar Sub-card
-                            if child_rule_view.cur-action == "Show Overlay" || child_rule_view.cur-action == "Show Notification" : Rectangle {
+                            if child_rule_view.cur-action == "Show Overlay" || child_rule_view.cur-action == "Show Notification" || root.rule-warn-before-val > 0 || root.rule-grace-val > 0 : Rectangle {
                                 background: #0f172a.with-alpha(0.6);
                                 border-radius: 8px;
                                 border-width: 1px;

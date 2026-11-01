@@ -468,9 +468,7 @@ impl Engine {
                 rule.action.as_str(),
                 total
             );
-            let raw_msg = if matches!(rule.action, RuleAction::ShowOverlay | RuleAction::ShowNotification)
-                && !rule.message.trim().is_empty()
-            {
+            let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
                 &rule.message
             } else {
                 &default_msg
@@ -1242,13 +1240,18 @@ impl Engine {
             || (rule.action == RuleAction::ShowNotification && rule.notification_method == NotificationMethod::Windows);
 
         let warn_title = format!("Upcoming: {}", rule.name);
-        let warn_body = format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
+        let default_body = format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
 
         if use_windows {
+            let warn_body = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
+                formatter::format_plain_message(&rule.message, ctx)
+            } else {
+                default_body
+            };
             enforcer::send_system_notification(&warn_title, &warn_body);
         } else {
             let default_msg = format!("[color=#f59e0b bold] {} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
-            let raw_msg = if !rule.message.trim().is_empty() && matches!(rule.action, RuleAction::ShowOverlay | RuleAction::ShowNotification) {
+            let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
                 &rule.message
             } else {
                 &default_msg
@@ -1485,9 +1488,7 @@ impl Engine {
                     rule.action.as_str(),
                     effective_grace
                 );
-                let raw_msg = if matches!(rule.action, RuleAction::ShowOverlay | RuleAction::ShowNotification)
-                    && !rule.message.trim().is_empty()
-                {
+                let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
                     &rule.message
                 } else {
                     &default_msg
@@ -1936,12 +1937,26 @@ impl Engine {
             }
             RuleAction::ShowNotification => match rule.notification_method {
                 NotificationMethod::Windows => {
-                    let text = formatter::format_plain_message(&rule.message, &ctx);
+                    let text = if !rule.message.trim().is_empty() {
+                        formatter::format_plain_message(&rule.message, &ctx)
+                    } else {
+                        format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs))
+                    };
                     enforcer::send_system_notification(&rule.name, &text);
                 }
                 NotificationMethod::Hud => {
+                    let default_msg = format!(
+                        "[color=#f59e0b bold] {} in {}.",
+                        rule.action.as_str(),
+                        formatter::format_seconds_human(rem_secs)
+                    );
+                    let raw_msg = if !rule.message.trim().is_empty() {
+                        &rule.message
+                    } else {
+                        &default_msg
+                    };
                     let paragraphs =
-                        self.parse_rule_message(&rule.message, &ctx, TextHorizontalAlignment::Left);
+                        self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
                     let dur = rule.notification_duration.to_seconds().max(1);
                     let mode = OverlayMode::HudToast {
                         rule_id: "test_preview".to_string(),
@@ -1955,6 +1970,65 @@ impl Engine {
                     self.show_overlay(mode);
                 }
             },
+            RuleAction::CloseWindow
+            | RuleAction::CloseTab
+            | RuleAction::KillProcess
+            | RuleAction::LockWorkstation => {
+                let grace_secs = rule.grace_duration.to_seconds();
+                if grace_secs > 0 {
+                    let dur = grace_secs.min(15);
+                    let default_msg = format!(
+                        "[color=#f87171 bold] {} in {}s.",
+                        rule.action.as_str(),
+                        grace_secs
+                    );
+                    let raw_msg = if !rule.message.trim().is_empty() {
+                        &rule.message
+                    } else {
+                        &default_msg
+                    };
+                    let paragraphs = self.parse_rule_message(
+                        raw_msg,
+                        &ctx,
+                        TextHorizontalAlignment::Left,
+                    );
+                    let mode = OverlayMode::HudTimer {
+                        rule_id: "test_preview".to_string(),
+                        title: format!("{}: {}", rule.action.as_str(), rule.name),
+                        paragraphs,
+                        duration_seconds: dur,
+                        remaining_seconds: dur,
+                    };
+                    self.show_overlay(mode);
+                } else {
+                    let default_msg = format!(
+                        "[color=#f59e0b bold] {} in {}.",
+                        rule.action.as_str(),
+                        formatter::format_seconds_human(rem_secs)
+                    );
+                    let raw_msg = if !rule.message.trim().is_empty() {
+                        &rule.message
+                    } else {
+                        &default_msg
+                    };
+                    let paragraphs = self.parse_rule_message(
+                        raw_msg,
+                        &ctx,
+                        TextHorizontalAlignment::Left,
+                    );
+                    let dur = rule.notification_duration.to_seconds().max(1);
+                    let mode = OverlayMode::HudToast {
+                        rule_id: "test_preview".to_string(),
+                        title: format!("Upcoming: {}", rule.name),
+                        paragraphs,
+                        snooze_options_minutes: vec![5, 10, 15],
+                        duration_seconds: dur,
+                        remaining_seconds: dur,
+                        show_time_remaining: rule.show_remaining_time,
+                    };
+                    self.show_overlay(mode);
+                }
+            }
             _ => {}
         }
     }
@@ -3474,6 +3548,81 @@ mod tests {
                 assert_eq!(paragraphs[0].text.as_str(), "2m remaining out of 1h");
             }
             other => panic!("Expected HudToast overlay, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_rule_alert_close_window_with_grace_and_warning() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        // 1. CloseWindow rule with grace countdown (> 0) previews HudTimer
+        let mut rule_grace = Rule::default_template(0);
+        rule_grace.id = "rule-cw-grace".to_string();
+        rule_grace.name = "Gaming Limit".to_string();
+        rule_grace.action = RuleAction::CloseWindow;
+        rule_grace.grace_duration = DurationConfig::new(30, TimeUnit::Sec);
+        rule_grace.message = "## Wrap up: {app}\nClosing in {remaining}.".to_string();
+
+        cfg.rules = vec![rule_grace.clone()];
+        let mut engine = Engine::new(cfg, aw_client.clone(), overlay_tx.clone());
+
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_grace)))
+            .await;
+
+        let action = overlay_rx.recv().await.expect("Expected overlay action");
+        match action {
+            OverlayAction::Show(OverlayMode::HudTimer {
+                rule_id,
+                title,
+                paragraphs,
+                duration_seconds,
+                remaining_seconds,
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(title, "Close Window: Gaming Limit");
+                assert_eq!(duration_seconds, 15); // clamped to 15s max
+                assert_eq!(remaining_seconds, 15);
+                assert!(!paragraphs.is_empty());
+                assert!(paragraphs[0].text.contains("Wrap up"));
+            }
+            other => panic!("Expected HudTimer for CloseWindow with grace, got: {other:?}"),
+        }
+
+        // 2. CloseWindow rule with 0 grace duration previews HudToast warning
+        let mut rule_warn = Rule::default_template(1);
+        rule_warn.id = "rule-cw-warn".to_string();
+        rule_warn.name = "Gaming Warning".to_string();
+        rule_warn.action = RuleAction::CloseWindow;
+        rule_warn.grace_duration = DurationConfig::new(0, TimeUnit::Sec);
+        rule_warn.warn_before = DurationConfig::new(5, TimeUnit::Min);
+        rule_warn.notification_duration = DurationConfig::new(10, TimeUnit::Sec);
+        rule_warn.message = "Quota warning for {app}!".to_string();
+
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_warn)))
+            .await;
+
+        let action2 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action2 {
+            OverlayAction::Show(OverlayMode::HudToast {
+                rule_id,
+                title,
+                paragraphs,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(title, "Upcoming: Gaming Warning");
+                assert_eq!(duration_seconds, 10);
+                assert_eq!(remaining_seconds, 10);
+                assert!(!paragraphs.is_empty());
+                assert!(paragraphs[0].text.contains("Quota warning for"));
+            }
+            other => panic!("Expected HudToast for CloseWindow warning, got: {other:?}"),
         }
     }
 
