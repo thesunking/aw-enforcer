@@ -1161,7 +1161,7 @@ export component SettingsWindow inherits Window {
                                 ExecutableSelector {
                                     executables: root.rules[root.selected-rule-idx].target-executables;
                                     known-apps: root.known-apps;
-                                    empty-text: "No executables listed — rule applies to all active screen time (*).";
+                                    empty-text: "All applications monitored (* wildcard) — add specific .exe names below to restrict.";
                                     browse-executable => { root.browse-executable(); }
                                     refresh-known-apps => { root.refresh-known-apps(); }
                                     add-known-app(app) => { root.add-known-app-to-rule(root.selected-rule-idx, app); }

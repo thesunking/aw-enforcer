@@ -502,17 +502,31 @@ fn update_rule_at(
     }
 }
 
-/// Appends a case-insensitively deduplicated executable name to the rule at `rule_idx`.
+/// Normalizes an executable name by trimming whitespace, appending `.exe` if missing,
+/// and returning `None` if the input is empty or wildcard `*`.
+pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
+    let trimmed = exe_name.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+    if trimmed.to_ascii_lowercase().ends_with(".exe") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("{}.exe", trimmed))
+    }
+}
+
+/// Appends a case-insensitively deduplicated executable name to the rule at `rule_idx`,
+/// normalizing executable names without `.exe` (e.g. `"steam"` -> `"steam.exe"`).
 fn add_executable_to_rule(
     rm: &VecModel<RuleView>,
     sw: &slint::Weak<SettingsWindow>,
     rule_idx: i32,
     exe_name: &str,
 ) {
-    let trimmed = exe_name.trim();
-    if trimmed.is_empty() || trimmed == "*" {
+    let Some(normalized) = normalize_executable_name(exe_name) else {
         return;
-    }
+    };
     update_rule_at(rm, sw, rule_idx, |rule_view, win, rm| {
         let mut targets: Vec<slint::SharedString> = rule_view
             .target_executables
@@ -522,8 +536,8 @@ fn add_executable_to_rule(
                 !s.is_empty() && s != "*"
             })
             .collect();
-        if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(trimmed)) {
-            targets.push(trimmed.into());
+        if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(&normalized)) {
+            targets.push(normalized.as_str().into());
             rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
             load_rule_into_editor(win, rule_view, rm);
             return true;
@@ -1804,5 +1818,14 @@ mod tests {
 
         let (valid_good_url, _) = validate_rule_pattern("Urls", "", "(?i)youtube\\.com");
         assert!(valid_good_url);
+    }
+    #[test]
+    fn test_normalize_executable_name() {
+        assert_eq!(normalize_executable_name(""), None);
+        assert_eq!(normalize_executable_name("   "), None);
+        assert_eq!(normalize_executable_name("*"), None);
+        assert_eq!(normalize_executable_name("steam"), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("game.EXE"), Some("game.EXE".to_string()));
+        assert_eq!(normalize_executable_name("  discord.exe  "), Some("discord.exe".to_string()));
     }
 }

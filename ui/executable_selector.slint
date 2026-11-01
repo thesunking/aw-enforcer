@@ -1,9 +1,9 @@
-import { Button, ComboBox, ScrollView } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 
 export component ExecutableSelector inherits VerticalLayout {
     in property <[string]> executables;
     in property <[string]> known-apps;
-    in property <string> empty-text: "No executables selected.";
+    in property <string> empty-text: "All applications monitored (* wildcard) — add specific .exe names below to restrict.";
     in property <color> chip-background: #1e293b;
     in property <color> chip-text-color: #f8fafc;
     in property <color> accent-color: #3b82f6;
@@ -13,9 +13,19 @@ export component ExecutableSelector inherits VerticalLayout {
     callback add-known-app(string /* app_name */);
     callback remove-executable(int /* index */);
 
+    function submit-manual-app() {
+        let raw = manual-input.text;
+        if (raw != "") {
+            let lower = raw.to-lowercase();
+            let app-name = lower.ends-with(".exe") ? raw : (raw + ".exe");
+            root.add-known-app(app-name);
+            manual-input.text = "";
+        }
+    }
+
     spacing: 8px;
 
-    // Action Row (Browse, Refresh, Pick dropdown)
+    // Action Row (Browse, Refresh, Pick dropdown, Type & Add)
     HorizontalLayout {
         spacing: 8px;
         alignment: start;
@@ -41,6 +51,17 @@ export component ExecutableSelector inherits VerticalLayout {
                     self.current-index = -1;
                 }
             }
+        }
+
+        manual-input := LineEdit {
+            placeholder-text: "Type app name (e.g. game.exe)...";
+            width: 190px;
+            accepted => { root.submit-manual-app(); }
+        }
+
+        Button {
+            text: "Add";
+            clicked => { root.submit-manual-app(); }
         }
     }
 
