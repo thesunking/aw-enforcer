@@ -135,6 +135,7 @@ pub struct OverlayManager {
     desired_placements: Vec<Option<Win32Placement>>,
     applied_placements: Vec<Option<Win32Placement>>,
     destroy_windows_on_hide: bool,
+    is_updating_placements: bool,
 }
 
 impl OverlayManager {
@@ -153,6 +154,7 @@ impl OverlayManager {
             desired_placements: Vec::new(),
             applied_placements: Vec::new(),
             destroy_windows_on_hide,
+            is_updating_placements: false,
         }
     }
 
@@ -167,6 +169,11 @@ impl OverlayManager {
     /// Ensures at least `active_count` overlay windows exist and hides or destroys any surplus windows.
     fn prepare_windows(&mut self, active_count: usize) {
         self.ensure_window_count(active_count);
+        for i in 0..active_count {
+            if i < self.windows.len() {
+                self.windows[i].show().ok();
+            }
+        }
         for i in active_count..self.windows.len() {
             if let Some(hwnd) = Self::extract_hwnd(&self.windows[i]) {
                 unsafe {
@@ -277,8 +284,6 @@ impl OverlayManager {
                 extend_dwm_frame,
             },
         );
-
-        self.apply_pending_win32_styles();
     }
 
     /// Applies any unapplied `Win32Placement` styles (`WS_POPUP`, `WS_EX_TOPMOST`, click-through, and DWM blur-behind) to native HWNDs.
@@ -286,7 +291,7 @@ impl OverlayManager {
         if matches!(self.current_mode, OverlayMode::Hidden) {
             return;
         }
-        if matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
+        if !self.is_updating_placements && matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
             let current_monitors = Self::enumerate_monitors();
             let active_placements_count = self.desired_placements.iter().filter(|p| p.is_some()).count();
             let mut monitors_changed = current_monitors.len() != active_placements_count;
@@ -336,6 +341,7 @@ impl OverlayManager {
             }
 
             let win = &self.windows[idx];
+            win.show().ok();
             if let Some(hwnd) = Self::extract_hwnd(win) {
                 let safe_w = desired.width.max(1);
                 let safe_h = desired.height.max(1);
@@ -600,6 +606,7 @@ impl OverlayManager {
     pub fn show_mode(&mut self, mode: OverlayMode) {
         let monitors = Self::enumerate_monitors();
         self.current_mode = mode.clone();
+        self.is_updating_placements = true;
 
         match &mode {
             OverlayMode::Hidden => {
@@ -790,6 +797,9 @@ impl OverlayManager {
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, *click_through, true, false);
             }
         }
+
+        self.is_updating_placements = false;
+        self.apply_pending_win32_styles();
     }
 
     /// Updates the countdown text, progress bar ratio, and user-idle indicator across all active overlay windows.
@@ -971,5 +981,67 @@ mod tests {
             clamp_or_reset_status_pos(pos_disconnected, card_w, card_h, margin, &monitors),
             expected_top_right
         );
+    }
+
+    #[test]
+    fn test_show_mode_multi_monitor_break_and_hud_no_recursion() {
+        let mut mgr = OverlayManager::new(OverlayConfig::default(), None, false);
+
+        // 1. BreakEnforcer should not overflow stack or recurse on multi-monitor
+        let break_mode = OverlayMode::BreakEnforcer {
+            rule_id: "test_break".into(),
+            title: "Test Break".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 300,
+            remaining_seconds: 300,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        };
+        mgr.show_mode(break_mode);
+        assert!(matches!(mgr.current_mode, OverlayMode::BreakEnforcer { .. }));
+        assert!(!mgr.is_updating_placements);
+
+        // 2. HudToast should configure cleanly
+        let toast_mode = OverlayMode::HudToast {
+            rule_id: "test_toast".into(),
+            title: "Test Toast".into(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![5, 10, 15],
+            duration_seconds: 10,
+            remaining_seconds: 10,
+            show_time_remaining: true,
+        };
+        mgr.show_mode(toast_mode);
+        assert!(matches!(mgr.current_mode, OverlayMode::HudToast { .. }));
+
+        // 3. HudTimer should configure cleanly
+        let timer_mode = OverlayMode::HudTimer {
+            rule_id: "test_timer".into(),
+            title: "Test Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 30,
+            remaining_seconds: 30,
+        };
+        mgr.show_mode(timer_mode);
+        assert!(matches!(mgr.current_mode, OverlayMode::HudTimer { .. }));
+
+        // 4. HudStatus should configure cleanly
+        let status_mode = OverlayMode::HudStatus {
+            title: "24h Summary".into(),
+            status_level: "Great".into(),
+            total_active_minutes: 120,
+            target_minutes: 480,
+            bin_values: vec![10.0, 20.0],
+            bin_labels: vec!["01:00".into(), "02:00".into()],
+            is_loading: false,
+            click_through: false,
+        };
+        mgr.show_mode(status_mode);
+        assert!(matches!(mgr.current_mode, OverlayMode::HudStatus { .. }));
+
+        // 5. Hide all cleans up
+        mgr.hide_all();
+        assert!(matches!(mgr.current_mode, OverlayMode::Hidden));
     }
 }

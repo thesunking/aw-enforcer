@@ -52,7 +52,7 @@
 - **Display, HiDPI, Multi-Monitor & DWM Compositing:**
   - **DPI-Aware Overlay Sizing:** Dynamically reads window scale factors to scale HUD card geometry and screen margins accurately on high-DPI displays.
   - **Multi-Monitor Hotplug & Countdown State Preservation:** Dynamically detects monitor connects, disconnects, and resolution changes during active full-screen breaks (`apply_pending_win32_styles`, returning early if `OverlayMode::Hidden`), automatically re-covering all displays without user intervention. Actively synchronizes `remaining_seconds` and `duration_seconds` in `current_mode` across countdown updates so hotplug respawns retain the exact current countdown without resetting.
-  - **Deduplicated Win32 Placement:** Batches window styling, DWM blur-behind, geometry, and visibility into a single authoritative update pipeline, eliminating redundant positioning pre-calls and flickering.
+  - **Deduplicated Win32 Placement & Slint Window Activation:** Batches window styling, DWM blur-behind, geometry, and visibility into a single authoritative update pipeline with re-entrancy guards (`is_updating_placements`), eliminating recursive hotplug checks and stack overflows during multi-monitor break setup while ensuring Slint component presentation (`win.show()`) is activated alongside Win32 window displays for both fullscreen breaks and floating HUD cards (`HudToast`, `HudTimer`, `HudStatus`).
   - **DWM Client Frame Reset:** Properly resets DWM frame client margins (`DwmExtendFrameIntoClientArea`) on reused overlay windows when transitioning from fullscreen break overlays to HUD cards.
 
 - **Performance & Idle Memory Optimization:**
