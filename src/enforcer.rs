@@ -10,7 +10,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
+    VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
@@ -107,7 +108,7 @@ pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
             return None;
         }
 
-        let mut buf = [0u16; 260];
+        let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
         let success = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
         CloseHandle(handle);
@@ -424,6 +425,8 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
                 },
             };
             let inputs = [
+                make_key(VK_SHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_MENU, KEYEVENTF_KEYUP),
                 make_key(VK_CONTROL, 0),
                 make_key(b'W' as u16, 0),
                 make_key(b'W' as u16, KEYEVENTF_KEYUP),
