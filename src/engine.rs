@@ -368,7 +368,7 @@ impl Engine {
     pub fn transition_to_active_countdown_or_hide(&mut self) {
         // 1. Highest priority: BreakEnforcer (active_break > 0)
         let active_break_rule = self.config.rules.iter().find(|r| {
-            self.runtimes
+            r.enabled && self.runtimes
                 .get(&r.id)
                 .and_then(|rt| rt.active_break)
                 .map(|(rem, _)| rem > 0)
@@ -412,7 +412,7 @@ impl Engine {
 
         // 2. Second highest priority: HudTimer (grace_countdown > 0)
         let grace_rule = self.config.rules.iter().find(|r| {
-            self.runtimes
+            r.enabled && self.runtimes
                 .get(&r.id)
                 .and_then(|rt| rt.grace_countdown)
                 .map(|(rem, _)| rem > 0)
@@ -575,7 +575,12 @@ impl Engine {
                 for rule in &self.config.rules {
                     self.runtimes
                         .entry(rule.id.clone())
-                        .and_modify(|rt| rt.update_from_rule(rule))
+                        .and_modify(|rt| {
+                            rt.update_from_rule(rule);
+                            if !rule.enabled {
+                                rt.reset_active_timers();
+                            }
+                        })
                         .or_insert_with(|| RuleRuntime::from_rule(rule));
                 }
                 if paused {
@@ -583,6 +588,17 @@ impl Engine {
                         rt.reset_active_timers();
                     }
                     self.hide_overlay();
+                } else {
+                    let should_clear_overlay = self.active_overlay_mode.rule_id().is_some_and(|active_id| {
+                        !active_id.starts_with("test_")
+                            && match self.config.rules.iter().find(|r| r.id == active_id) {
+                                Some(rule) => !rule.enabled,
+                                None => true,
+                            }
+                    });
+                    if should_clear_overlay {
+                        self.transition_to_active_countdown_or_hide();
+                    }
                 }
                 self.overlay_tx
                     .send(OverlayAction::UpdateTheme(self.config.overlay.clone()))
@@ -913,19 +929,47 @@ impl Engine {
 
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
         let mut evaluated_in_step_4 = std::collections::HashSet::new();
+        let mut should_transition_after_eval = false;
+
         if self.config.general.pause_all_rules || is_globally_snoozed {
-            for rt in self.runtimes.values_mut() {
-                rt.current_session_seconds = 0;
+            for rule in &self.config.rules {
+                if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                    if rt.pending_break_since.is_some()
+                        || rt.grace_countdown.is_some()
+                        || rt.active_break.is_some()
+                    {
+                        rt.reset_active_timers();
+                        if self.is_rule_displayed(&rule.id) {
+                            should_transition_after_eval = true;
+                        }
+                    } else {
+                        rt.current_session_seconds = 0;
+                    }
+                }
             }
         } else {
             for idx in 0..self.config.rules.len() {
-                let rule = self.config.rules[idx].clone();
-                if !rule.enabled || !rule.schedule.is_active(day_index, hour_index) {
-                    if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                        rt.current_session_seconds = 0;
+                if !self.config.rules[idx].enabled
+                    || !self.config.rules[idx].schedule.is_active(day_index, hour_index)
+                {
+                    let rule_id = &self.config.rules[idx].id;
+                    if let Some(rt) = self.runtimes.get_mut(rule_id) {
+                        if rt.pending_break_since.is_some()
+                            || rt.grace_countdown.is_some()
+                            || rt.active_break.is_some()
+                        {
+                            rt.reset_active_timers();
+                            if self.is_rule_displayed(rule_id) {
+                                should_transition_after_eval = true;
+                            }
+                        } else {
+                            rt.current_session_seconds = 0;
+                        }
                     }
                     continue;
                 }
+
+                let rule = self.config.rules[idx].clone();
 
                 let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
                     &web_events
@@ -948,6 +992,10 @@ impl Engine {
                     evaluated_in_step_4.insert(rule.id.clone());
                 }
             }
+        }
+
+        if should_transition_after_eval {
+            self.transition_to_active_countdown_or_hide();
         }
 
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
@@ -1889,7 +1937,7 @@ pub fn calculate_usage_for_rule(
 mod tests {
     use super::*;
     use crate::aw_client::AwEventData;
-    use crate::config::{DurationConfig, TimeUnit};
+    use crate::config::{DurationConfig, RuleSchedule, TimeUnit};
     use chrono::TimeZone;
 
     /// Helper to construct a synthetic `AwEvent` with `app`, `title`, and `url` fields.
@@ -2632,5 +2680,142 @@ mod tests {
         assert_eq!(rt.last_completed_at, Some(completed_time));
         assert!(rt.snoozed_until.is_some());
         assert!(!rt.can_rollback_completion);
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_clears_deleted_or_disabled_rule_overlay() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule1 = Rule::default_template(0);
+        rule1.id = "rule-1".to_string();
+
+        let mut rule2 = Rule::default_template(1);
+        rule2.id = "rule-2".to_string();
+
+        cfg.rules = vec![rule1.clone(), rule2.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. rule-1 has an active break and is displayed as BreakEnforcer
+        engine.runtimes.get_mut("rule-1").unwrap().active_break = Some((300, 300));
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-1".to_string(),
+            title: "Rule 1 Break".to_string(),
+            paragraphs: Vec::new(),
+            remaining_seconds: 300,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        };
+        assert!(engine.is_rule_displayed("rule-1"));
+
+        // Disable rule-1 and reload config
+        let mut new_cfg1 = engine.config.clone();
+        new_cfg1.rules[0].enabled = false;
+        engine.handle_command(DaemonCommand::ReloadConfig(Box::new(new_cfg1))).await;
+
+        // Timers for rule-1 must be reset and overlay hidden
+        assert_eq!(engine.runtimes.get("rule-1").unwrap().active_break, None);
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+
+        // 2. rule-2 has grace countdown and is displayed as HudTimer
+        engine.runtimes.get_mut("rule-2").unwrap().grace_countdown = Some((10, 10));
+        engine.active_overlay_mode = OverlayMode::HudTimer {
+            rule_id: "rule-2".to_string(),
+            title: "Rule 2 Grace".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 10,
+            remaining_seconds: 10,
+        };
+        assert!(engine.is_rule_displayed("rule-2"));
+
+        // Delete rule-2 entirely and reload config
+        let mut new_cfg2 = engine.config.clone();
+        new_cfg2.rules.retain(|r| r.id != "rule-2");
+        engine.handle_command(DaemonCommand::ReloadConfig(Box::new(new_cfg2))).await;
+
+        // rule-2 is removed from runtimes and overlay is hidden
+        assert!(!engine.runtimes.contains_key("rule-2"));
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+
+        // Drain overlay_rx and verify OverlayAction::Hide was sent
+        let mut hide_sent = false;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if matches!(action, OverlayAction::Hide) {
+                hide_sent = true;
+            }
+        }
+        assert!(hide_sent);
+
+        // 3. Deleting active rule transitions to another rule with active countdown
+        let mut new_cfg3 = AppConfig::default();
+        let mut rule_a = Rule::default_template(0);
+        rule_a.id = "rule-a".to_string();
+        let mut rule_b = Rule::default_template(1);
+        rule_b.id = "rule-b".to_string();
+        new_cfg3.rules = vec![rule_a.clone(), rule_b.clone()];
+        engine.handle_command(DaemonCommand::ReloadConfig(Box::new(new_cfg3))).await;
+
+        // rule-a is displayed, but rule-b also has an active break
+        engine.runtimes.get_mut("rule-a").unwrap().active_break = Some((200, 200));
+        engine.runtimes.get_mut("rule-b").unwrap().active_break = Some((150, 150));
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-a".to_string(),
+            title: "Rule A".to_string(),
+            paragraphs: Vec::new(),
+            remaining_seconds: 200,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        };
+
+        // Disable rule-a -> should transition to rule-b's break enforcer
+        let mut new_cfg4 = engine.config.clone();
+        new_cfg4.rules[0].enabled = false;
+        engine.handle_command(DaemonCommand::ReloadConfig(Box::new(new_cfg4))).await;
+
+        assert_eq!(engine.runtimes.get("rule-a").unwrap().active_break, None);
+        assert!(engine.is_rule_displayed("rule-b"));
+        match &engine.active_overlay_mode {
+            OverlayMode::BreakEnforcer { rule_id, remaining_seconds, .. } => {
+                assert_eq!(rule_id, "rule-b");
+                assert_eq!(*remaining_seconds, 150);
+            }
+            other => panic!("Expected BreakEnforcer for rule-b, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_tick_clears_off_schedule_or_disabled_active_timers() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-sched".to_string();
+        // Deactivate all schedule slots
+        rule.schedule = RuleSchedule::from_bool_array(&[false; 168]);
+        cfg.rules = vec![rule];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Rule is off-schedule but has active_break and is displayed
+        engine.runtimes.get_mut("rule-sched").unwrap().active_break = Some((300, 300));
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-sched".to_string(),
+            title: "Rule Break".to_string(),
+            paragraphs: Vec::new(),
+            remaining_seconds: 300,
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+        };
+        assert!(engine.is_rule_displayed("rule-sched"));
+
+        engine.poll_tick().await;
+
+        // After poll_tick, active_break was reset and overlay was hidden
+        assert_eq!(engine.runtimes.get("rule-sched").unwrap().active_break, None);
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
     }
 }
