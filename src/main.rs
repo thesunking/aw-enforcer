@@ -589,6 +589,24 @@ impl Default for LiveUiState {
     }
 }
 
+/// Synchronizes cached live daemon telemetry and rule statuses to the `SettingsWindow` and its rules model.
+fn sync_live_state_to_ui(win: &SettingsWindow, rules_model: &VecModel<RuleView>, ls: &LiveUiState) {
+    win.set_current_session_duration_text(ls.session_duration_text.as_str().into());
+    win.set_today_screentime_text(ls.screentime_text.as_str().into());
+    win.set_current_active_app(ls.active_app.as_str().into());
+    win.set_strict_lock_active(ls.strict_lock_active);
+    for (rule_id, status_text) in &ls.rule_statuses {
+        for idx in 0..rules_model.row_count() {
+            if let Some(mut r) = rules_model.row_data(idx) {
+                if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                    r.status_text = status_text.as_str().into();
+                    rules_model.set_row_data(idx, r);
+                }
+            }
+        }
+    }
+}
+
 /// Lazily instantiates, populates, wires, and displays the `SettingsWindow` (or focuses it if already open).
 /// When closed via the window's `'X'` button, the `SettingsWindow` instance and its GPU surface are dropped
 /// if `destroy_windows_on_hide` is enabled in configuration; otherwise, it is kept hidden in memory.
@@ -607,7 +625,24 @@ fn open_settings_window(
     show: bool,
 ) -> Result<(), slint::PlatformError> {
     if let Some(ref existing) = *settings_slot.borrow() {
+        sync_live_state_to_ui(existing, rules_model, &live_state.borrow());
         if show {
+            scan_and_update_known_apps(existing.as_weak(), rt_handle.clone());
+            {
+                let sw = existing.as_weak();
+                let conn_flag = aw_connected_flag.clone();
+                let client = ui_aw_client.borrow().clone();
+                rt_handle.spawn(async move {
+                    let connected = client.check_connection().await;
+                    conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(win) = sw.upgrade() {
+                            win.set_aw_connected(connected);
+                        }
+                    })
+                    .ok();
+                });
+            }
             existing.show()?;
             if let Some(hwnd) = OverlayManager::extract_window_hwnd(existing.window()) {
                 unsafe {
@@ -626,23 +661,7 @@ fn open_settings_window(
     settings_win.set_rules(ModelRc::from(rules_model.clone()));
     apply_config_to_ui(&settings_win, &current_config.borrow(), rules_model);
     settings_win.set_aw_connected(aw_connected_flag.load(std::sync::atomic::Ordering::Relaxed));
-    {
-        let ls = live_state.borrow();
-        settings_win.set_current_session_duration_text(ls.session_duration_text.as_str().into());
-        settings_win.set_today_screentime_text(ls.screentime_text.as_str().into());
-        settings_win.set_current_active_app(ls.active_app.as_str().into());
-        settings_win.set_strict_lock_active(ls.strict_lock_active);
-        for (rule_id, status_text) in &ls.rule_statuses {
-            for idx in 0..rules_model.row_count() {
-                if let Some(mut r) = rules_model.row_data(idx) {
-                    if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
-                        r.status_text = status_text.as_str().into();
-                        rules_model.set_row_data(idx, r);
-                    }
-                }
-            }
-        }
-    }
+    sync_live_state_to_ui(&settings_win, rules_model, &live_state.borrow());
 
     // Warm known apps and check ActivityWatch connection asynchronously on window open
     scan_and_update_known_apps(settings_weak.clone(), rt_handle.clone());
@@ -758,11 +777,13 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         let cfg_cell = current_config.clone();
         let rm = rules_model.clone();
+        let live_state_cell = live_state.clone();
 
         settings_win.on_discard_changes(move || {
             if let Some(win) = sw.upgrade() {
                 let saved_config = cfg_cell.borrow().clone();
                 apply_config_to_ui(&win, &saved_config, &rm);
+                sync_live_state_to_ui(&win, &rm, &live_state_cell.borrow());
                 tracing::info!("Reverted all settings to last saved configuration.");
             }
         });
