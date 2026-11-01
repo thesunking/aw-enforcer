@@ -1273,13 +1273,18 @@ impl Engine {
                 );
             let matching_ev = events
                 .iter()
-                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                .find(|ev| {
+                .filter(|ev| {
                     let ev_end =
                         ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-                    ev_end >= recency_cutoff
+                    ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
                 })
-                .or_else(|| events.iter().rfind(|ev| event_matches_rule(ev, rule, compiled_re)));
+                .max_by_key(|ev| ev.timestamp)
+                .or_else(|| {
+                    events
+                        .iter()
+                        .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                        .max_by_key(|ev| ev.timestamp)
+                });
 
             if let Some(ev) = matching_ev {
                 if let Some(ref title) = ev.data.title {
@@ -1494,10 +1499,10 @@ impl Engine {
                     enforcer::close_active_browser_tab::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
                     if let Some(ref title) = last_title {
-                        let title_re = Regex::new(&regex::escape(title)).ok();
-                        enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re.as_ref());
-                    } else {
-                        enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, None);
+                        if !title.trim().is_empty() {
+                            let title_re = Regex::new(&regex::escape(title)).ok();
+                            enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re.as_ref());
+                        }
                     }
                 } else {
                     enforcer::close_active_browser_tab(&rule.target_executables, None);
@@ -1515,10 +1520,10 @@ impl Engine {
                     enforcer::close_target_windows::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
                     if let Some(ref title) = last_title {
-                        let title_re = Regex::new(&regex::escape(title)).ok();
-                        enforcer::close_target_windows(enforcer::BROWSER_EXES, title_re.as_ref());
-                    } else {
-                        enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
+                        if !title.trim().is_empty() {
+                            let title_re = Regex::new(&regex::escape(title)).ok();
+                            enforcer::close_target_windows(enforcer::BROWSER_EXES, title_re.as_ref());
+                        }
                     }
                 } else {
                     enforcer::close_target_windows(&rule.target_executables, None);
@@ -1800,32 +1805,45 @@ pub fn find_matching_window_for_rule(
             let recency_cutoff =
                 now_utc - Duration::seconds((poll_interval_secs.max(2) as i64) * 2 + 5);
 
-            let matching_ev = events
-                .iter()
-                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                .find(|ev| {
-                    let ev_end =
-                        ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-                    ev_end >= recency_cutoff
-                });
+            let latest_ev = events.iter().max_by_key(|ev| ev.timestamp);
+            if let Some(ev) = latest_ev {
+                let ev_end =
+                    ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                if ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re) {
+                    let matched_browser = if let Some(ref title) = ev.data.title {
+                        if !title.trim().is_empty() {
+                            let title_re = Regex::new(&regex::escape(title)).ok();
+                            enforcer::find_matching_window(
+                                enforcer::BROWSER_EXES,
+                                title_re.as_ref(),
+                            )
+                            .unwrap_or(browser_match)
+                        } else {
+                            browser_match
+                        }
+                    } else {
+                        browser_match
+                    };
 
-            if let Some(ev) = matching_ev {
-                Some(
-                    ev.data
-                        .url
-                        .as_deref()
-                        .map(|u| {
-                            u.strip_prefix("https://")
-                                .or_else(|| u.strip_prefix("http://"))
-                                .unwrap_or(u)
-                                .split('/')
-                                .next()
-                                .unwrap_or(u)
-                                .to_string()
-                        })
-                        .or_else(|| ev.data.url.clone())
-                        .unwrap_or(browser_match),
-                )
+                    Some(
+                        ev.data
+                            .url
+                            .as_deref()
+                            .map(|u| {
+                                u.strip_prefix("https://")
+                                    .or_else(|| u.strip_prefix("http://"))
+                                    .unwrap_or(u)
+                                    .split('/')
+                                    .next()
+                                    .unwrap_or(u)
+                                    .to_string()
+                            })
+                            .or_else(|| ev.data.url.clone())
+                            .unwrap_or(matched_browser),
+                    )
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -2817,5 +2835,128 @@ mod tests {
         // After poll_tick, active_break was reset and overlay was hidden
         assert_eq!(engine.runtimes.get("rule-sched").unwrap().active_break, None);
         assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+    }
+
+    #[test]
+    fn test_find_matching_window_for_rule_urls_selection() {
+        let now_utc = Utc::now();
+        let mut rule = Rule::default_template(0);
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        let re = Regex::new(&rule.url_regex).ok();
+
+        // 1. If newer non-matching event is the latest, it should return None even if an older matching event is in recency window
+        let ev_old_matching = make_event(
+            now_utc - Duration::seconds(4),
+            2.0,
+            "chrome.exe",
+            "YouTube Video",
+            "https://www.youtube.com/watch?v=123",
+        );
+        let ev_new_non_matching = make_event(
+            now_utc - Duration::seconds(2),
+            2.0,
+            "chrome.exe",
+            "Rust Docs",
+            "https://doc.rust-lang.org/book/",
+        );
+
+        let res_switched = find_matching_window_for_rule(
+            &rule,
+            re.as_ref(),
+            &[ev_old_matching.clone(), ev_new_non_matching],
+            now_utc,
+            5,
+        );
+        assert_eq!(res_switched, None);
+
+        // 2. If the newest event matches the rule within recency window, it selects it
+        let ev_newer_matching = make_event(
+            now_utc - Duration::seconds(1),
+            1.0,
+            "chrome.exe",
+            "YouTube Music",
+            "https://music.youtube.com/watch?v=456",
+        );
+
+        let res_matching = find_matching_window_for_rule(
+            &rule,
+            re.as_ref(),
+            &[ev_old_matching, ev_newer_matching],
+            now_utc,
+            5,
+        );
+        if enforcer::find_matching_window(enforcer::BROWSER_EXES, None).is_some() {
+            assert_eq!(res_matching.as_deref(), Some("music.youtube.com"));
+        } else {
+            assert_eq!(res_matching, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_rule_urls_selects_newest_matching_tab_title() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-newest-title".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now_utc = Utc::now();
+        let ev_older = make_event(
+            now_utc - Duration::seconds(15),
+            5.0,
+            "chrome.exe",
+            "Older Video - YouTube",
+            "https://www.youtube.com/watch?v=old",
+        );
+        let ev_newer = make_event(
+            now_utc - Duration::seconds(2),
+            2.0,
+            "chrome.exe",
+            "Latest Video - YouTube",
+            "https://www.youtube.com/watch?v=new",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+
+        // Populate runtime's last_matched_title using the new logic
+        let recency_cutoff = now_utc
+            - Duration::seconds((engine.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5);
+        let events = [ev_older, ev_newer];
+        let matching_ev = events
+            .iter()
+            .filter(|ev| {
+                let ev_end =
+                    ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                ev_end >= recency_cutoff && event_matches_rule(ev, &rule, re.as_ref())
+            })
+            .max_by_key(|ev| ev.timestamp)
+            .or_else(|| {
+                events
+                    .iter()
+                    .filter(|ev| event_matches_rule(ev, &rule, re.as_ref()))
+                    .max_by_key(|ev| ev.timestamp)
+            });
+
+        let rt = engine.runtimes.get_mut("rule-urls-newest-title").unwrap();
+        if let Some(ev) = matching_ev {
+            if let Some(ref title) = ev.data.title {
+                if !title.trim().is_empty() {
+                    rt.last_matched_title = Some(title.clone());
+                }
+            }
+        }
+
+        assert_eq!(
+            engine.runtimes.get("rule-urls-newest-title").unwrap().last_matched_title.as_deref(),
+            Some("Latest Video - YouTube")
+        );
     }
 }
