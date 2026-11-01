@@ -112,6 +112,7 @@ impl MessageContext {
     }
 
     /// Interpolates placeholders and strips formatting markup into clean plain text for native notifications.
+    #[allow(dead_code)]
     pub fn interpolate_plain(&self, template: &str) -> String {
         format_plain_message(template, self)
     }

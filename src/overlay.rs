@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, PostMessageW, SendMessageW,
     SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
     GWL_STYLE, HTCAPTION, HWND_TOPMOST, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_MOUSEMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_NCLBUTTONDOWN, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
     WS_THICKFRAME,
@@ -187,9 +187,34 @@ impl OverlayManager {
     }
 
     /// Computes top-right coordinates `(x, y)` inset by `margin` inside the primary monitor's work area.
-    fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
+    pub fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
         let m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
         (m.work_rect.right - card_w - margin, m.work_rect.top + margin)
+    }
+
+    /// Positions window `idx` onto `(target_x, target_y)` before reading its DPI scale factor,
+    /// ensuring HUD overlays are never sized using a secondary monitor's stale scale factor.
+    fn prepare_target_scale(&mut self, idx: usize, target_x: i32, target_y: i32) -> f32 {
+        if let Some(win) = self.windows.get(idx) {
+            win.window()
+                .set_position(slint::PhysicalPosition::new(target_x, target_y));
+            if let Some(hwnd) = Self::extract_hwnd(win) {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        target_x,
+                        target_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                }
+            }
+            win.window().scale_factor().max(1.0)
+        } else {
+            1.0
+        }
     }
 
     /// Updates the stored `OverlayConfig` and immediately applies the new colors/opacity to all managed windows.
@@ -677,7 +702,8 @@ impl OverlayManager {
                     win.set_selected_snooze_index(0);
                 }
 
-                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+                let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
                 let (card_w, card_h, margin) = scale_card_bounds(scale, 480.0, 280.0, 20.0);
                 let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
@@ -706,7 +732,8 @@ impl OverlayManager {
                     set_window_paragraphs(win, paragraphs);
                 }
 
-                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+                let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
                 let (card_w, card_h, margin) = scale_card_bounds(scale, 420.0, 180.0, 20.0);
                 let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
@@ -724,8 +751,20 @@ impl OverlayManager {
             } => {
                 self.prepare_windows(1);
 
-                let scale = self.windows[0].window().scale_factor().max(1.0);
+                let visible_pos = self.windows.first().and_then(Self::extract_hwnd).and_then(|hwnd| unsafe {
+                    let mut r: RECT = std::mem::zeroed();
+                    (IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left)
+                        .then_some((r.left, r.top))
+                });
+                let candidate_pos = visible_pos
+                    .or_else(|| *self.status_pos.borrow())
+                    .unwrap_or_else(|| Self::primary_top_right(&monitors, 540, 20));
+                let (target_x, target_y) = clamp_or_reset_status_pos(candidate_pos, 540, 270, 20, &monitors);
+                let scale = self.prepare_target_scale(0, target_x, target_y);
                 let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
+
+                let (x, y) = clamp_or_reset_status_pos((target_x, target_y), card_w, card_h, margin, &monitors);
+                *self.status_pos.borrow_mut() = Some((x, y));
 
                 let win = &self.windows[0];
                 Self::apply_theme_to_window(win, &self.overlay_config);
@@ -745,15 +784,6 @@ impl OverlayManager {
                     bin_labels.iter().map(|s| s.as_str().into()).collect();
                 win.set_histogram_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
 
-                let visible_pos = Self::extract_hwnd(win).and_then(|hwnd| unsafe {
-                    let mut r: RECT = std::mem::zeroed();
-                    (IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left)
-                        .then_some((r.left, r.top))
-                });
-                let (x, y) = visible_pos
-                    .or_else(|| *self.status_pos.borrow())
-                    .unwrap_or_else(|| Self::primary_top_right(&monitors, card_w, margin));
-
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, *click_through, true, false);
             }
         }
@@ -761,6 +791,15 @@ impl OverlayManager {
 
     /// Updates the countdown text, progress bar ratio, and user-idle indicator across all active overlay windows.
     pub fn update_countdown(&mut self, remaining_seconds: u32, total_seconds: u32, is_user_idle: bool) {
+        match &mut self.current_mode {
+            OverlayMode::BreakEnforcer { remaining_seconds: ref mut rem, .. }
+            | OverlayMode::HudToast { remaining_seconds: ref mut rem, .. }
+            | OverlayMode::HudTimer { remaining_seconds: ref mut rem, .. } => {
+                *rem = remaining_seconds;
+            }
+            _ => {}
+        }
+
         let is_hud = matches!(self.current_mode, OverlayMode::HudTimer { .. } | OverlayMode::HudToast { .. });
         let countdown_str = format_countdown(remaining_seconds, is_hud);
         let ratio = compute_progress_ratio(remaining_seconds, total_seconds);
@@ -802,8 +841,131 @@ fn scale_card_bounds(scale: f32, w: f32, h: f32, margin: f32) -> (i32, i32, i32)
     )
 }
 
+/// Checks whether a card rectangle at `pos` has a visible intersection of at least 100x60 pixels
+/// with at least one monitor's work area. If not (e.g. after a monitor was disconnected or moved offscreen),
+/// resets the coordinates to `OverlayManager::primary_top_right`.
+pub fn clamp_or_reset_status_pos(
+    pos: (i32, i32),
+    card_w: i32,
+    card_h: i32,
+    margin: i32,
+    monitors: &[MonitorBounds],
+) -> (i32, i32) {
+    if monitors.is_empty() {
+        return pos;
+    }
+
+    let card_left = pos.0;
+    let card_top = pos.1;
+    let card_right = pos.0 + card_w;
+    let card_bottom = pos.1 + card_h;
+
+    let has_visible_intersection = monitors.iter().any(|mon| {
+        let inter_left = card_left.max(mon.work_rect.left);
+        let inter_right = card_right.min(mon.work_rect.right);
+        let inter_top = card_top.max(mon.work_rect.top);
+        let inter_bottom = card_bottom.min(mon.work_rect.bottom);
+
+        let inter_w = inter_right - inter_left;
+        let inter_h = inter_bottom - inter_top;
+
+        inter_w >= 100 && inter_h >= 60
+    });
+
+    if has_visible_intersection {
+        pos
+    } else {
+        OverlayManager::primary_top_right(monitors, card_w, margin)
+    }
+}
+
 /// Sets formatted message paragraphs on an `OverlayWindow`.
 fn set_window_paragraphs(win: &OverlayWindow, paragraphs: &[FormattedParagraph]) {
     let para_models = Rc::new(VecModel::from(paragraphs.to_vec()));
     win.set_message_paragraphs(ModelRc::from(para_models));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::RECT;
+
+    fn mock_monitor(left: i32, top: i32, right: i32, bottom: i32, is_primary: bool) -> MonitorBounds {
+        MonitorBounds {
+            monitor_rect: RECT { left, top, right, bottom },
+            work_rect: RECT { left, top, right, bottom },
+            is_primary,
+        }
+    }
+
+    #[test]
+    fn test_clamp_or_reset_status_pos_single_monitor() {
+        let monitors = vec![mock_monitor(0, 0, 1920, 1080, true)];
+        let card_w = 540;
+        let card_h = 270;
+        let margin = 20;
+
+        // 1. Fully visible inside monitor -> preserves position
+        let pos_inside = (100, 100);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_inside, card_w, card_h, margin, &monitors),
+            pos_inside
+        );
+
+        // 2. Sufficient intersection (e.g. 150px wide, 100px high visible) -> preserves position
+        let pos_edge = (1920 - 150, 100);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_edge, card_w, card_h, margin, &monitors),
+            pos_edge
+        );
+
+        // 3. Insufficient intersection (<100px wide visible) -> resets to primary top right
+        let pos_too_far_right = (1920 - 50, 100);
+        let expected_top_right = (1920 - card_w - margin, margin);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_too_far_right, card_w, card_h, margin, &monitors),
+            expected_top_right
+        );
+
+        // 4. Insufficient intersection (<60px high visible) -> resets to primary top right
+        let pos_too_far_bottom = (100, 1080 - 30);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_too_far_bottom, card_w, card_h, margin, &monitors),
+            expected_top_right
+        );
+    }
+
+    #[test]
+    fn test_clamp_or_reset_status_pos_multi_monitor() {
+        let monitors = vec![
+            mock_monitor(0, 0, 1920, 1080, true),
+            mock_monitor(1920, 0, 3840, 1080, false),
+        ];
+        let card_w = 540;
+        let card_h = 270;
+        let margin = 20;
+
+        // Valid on secondary monitor -> preserves position
+        let pos_secondary = (2200, 150);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_secondary, card_w, card_h, margin, &monitors),
+            pos_secondary
+        );
+    }
+
+    #[test]
+    fn test_clamp_or_reset_status_pos_disconnected_monitor() {
+        // Was on secondary monitor (2500, 200), but secondary monitor disconnected, only primary remains
+        let monitors = vec![mock_monitor(0, 0, 1920, 1080, true)];
+        let card_w = 540;
+        let card_h = 270;
+        let margin = 20;
+
+        let pos_disconnected = (2500, 200);
+        let expected_top_right = (1920 - card_w - margin, margin);
+        assert_eq!(
+            clamp_or_reset_status_pos(pos_disconnected, card_w, card_h, margin, &monitors),
+            expected_top_right
+        );
+    }
 }
