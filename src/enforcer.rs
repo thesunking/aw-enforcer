@@ -200,9 +200,7 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     }
     let ctx = &mut *(lparam as *mut EnumMatchContext<'_, S>);
 
-    let mut matches = false;
     let mut title = String::new();
-
     if ctx.compiled_regex.is_some() || ctx.close_matched {
         let mut title_buf = [0u16; 512];
         let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
@@ -211,29 +209,41 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
         }
     }
 
-    if let Some(re) = ctx.compiled_regex {
-        if !title.is_empty() && re.is_match(&title) {
-            matches = true;
-            if ctx.matched_name.is_none() {
-                ctx.matched_name = Some(title.clone());
-            }
-        }
-    }
+    let title_matches = match ctx.compiled_regex {
+        Some(re) => !title.is_empty() && re.is_match(&title),
+        None => false,
+    };
 
-    if !matches && ctx.has_exe_targets {
+    let mut exe_name_opt: Option<String> = None;
+    let exe_matches = if ctx.has_exe_targets {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if let Some(exe_name) = get_process_name_by_pid(pid) {
-            if exe_name_matches_targets(&exe_name, ctx.target_executables) {
-                matches = true;
-                if ctx.matched_name.is_none() {
-                    ctx.matched_name = Some(exe_name);
-                }
-            }
+            let matched = exe_name_matches_targets(&exe_name, ctx.target_executables);
+            exe_name_opt = Some(exe_name);
+            matched
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
+
+    let matches = match (ctx.compiled_regex.is_some(), ctx.has_exe_targets) {
+        (true, true) => title_matches && exe_matches,
+        (true, false) => title_matches,
+        (false, true) => exe_matches,
+        (false, false) => false,
+    };
 
     if matches {
+        if ctx.matched_name.is_none() {
+            ctx.matched_name = if !title.is_empty() {
+                Some(title.clone())
+            } else {
+                exe_name_opt
+            };
+        }
         ctx.matched_count += 1;
         if ctx.close_matched {
             tracing::info!(
@@ -367,29 +377,45 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
             return false;
         }
 
-        let mut matches = false;
-        if let Some(re) = compiled_regex {
+        let has_wildcard = target_executables.iter().any(|t| t.as_ref().trim() == "*");
+        let has_exe_targets = target_executables
+            .iter()
+            .any(|t| {
+                let s = t.as_ref().trim();
+                !s.is_empty() && s != "*"
+            });
+
+        let title_matches = if let Some(re) = compiled_regex {
             let mut title_buf = [0u16; 512];
             let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
             if len > 0 {
                 let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-                if re.is_match(&title) {
-                    matches = true;
-                }
-            }
-        }
-
-        if !matches && !target_executables.is_empty() {
-            if target_executables.iter().any(|t| t.as_ref().trim() == "*") {
-                matches = true;
+                re.is_match(&title)
             } else {
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                if let Some(exe_name) = get_process_name_by_pid(pid) {
-                    matches = exe_name_matches_targets(&exe_name, target_executables);
-                }
+                false
             }
-        }
+        } else {
+            false
+        };
+
+        let exe_matches = if has_exe_targets {
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if let Some(exe_name) = get_process_name_by_pid(pid) {
+                exe_name_matches_targets(&exe_name, target_executables)
+            } else {
+                false
+            }
+        } else {
+            has_wildcard
+        };
+
+        let matches = match (compiled_regex.is_some(), has_exe_targets) {
+            (true, true) => title_matches && exe_matches,
+            (true, false) => title_matches && (exe_matches || target_executables.is_empty()),
+            (false, true) => exe_matches,
+            (false, false) => has_wildcard,
+        };
 
         if matches {
             let make_key = |vk: u16, flags: u32| INPUT {
@@ -431,5 +457,15 @@ mod tests {
         // Must return 0 and not close foreground window
         let closed = close_target_windows::<&str>(&[], None);
         assert_eq!(closed, 0);
+    }
+
+    #[test]
+    fn test_browser_exes_matching() {
+        assert!(exe_name_matches_targets("chrome.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("CHROME.EXE", BROWSER_EXES));
+        assert!(exe_name_matches_targets("msedge.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("firefox.exe", BROWSER_EXES));
+        assert!(!exe_name_matches_targets("notepad.exe", BROWSER_EXES));
+        assert!(!exe_name_matches_targets("code.exe", BROWSER_EXES));
     }
 }

@@ -1469,7 +1469,7 @@ impl Engine {
                 } else if rule.monitor_selection == MonitorSelection::Urls {
                     if let Some(ref title) = last_title {
                         let title_re = Regex::new(&regex::escape(title)).ok();
-                        enforcer::close_active_browser_tab::<&str>(&[], title_re.as_ref());
+                        enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re.as_ref());
                     } else {
                         enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, None);
                     }
@@ -1490,7 +1490,7 @@ impl Engine {
                 } else if rule.monitor_selection == MonitorSelection::Urls {
                     if let Some(ref title) = last_title {
                         let title_re = Regex::new(&regex::escape(title)).ok();
-                        enforcer::close_target_windows::<&str>(&[], title_re.as_ref());
+                        enforcer::close_target_windows(enforcer::BROWSER_EXES, title_re.as_ref());
                     } else {
                         enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
                     }

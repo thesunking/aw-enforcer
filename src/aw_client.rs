@@ -90,13 +90,28 @@ impl AwClient {
         };
 
         if let Ok(Value::Object(map)) = resp.json::<Value>().await {
-            let window_bucket = map.keys().find(|k| k.starts_with("aw-watcher-window_")).cloned();
-            let afk_bucket = map.keys().find(|k| k.starts_with("aw-watcher-afk_")).cloned();
+            let window_bucket = map
+                .keys()
+                .find(|k| k.starts_with("aw-watcher-window_") && !k.contains("-synced"))
+                .or_else(|| map.keys().find(|k| k.starts_with("aw-watcher-window_")))
+                .cloned();
+            let afk_bucket = map
+                .keys()
+                .find(|k| k.starts_with("aw-watcher-afk_") && !k.contains("-synced"))
+                .or_else(|| map.keys().find(|k| k.starts_with("aw-watcher-afk_")))
+                .cloned();
             let mut web_buckets: Vec<String> = map
                 .keys()
-                .filter(|k| k.starts_with("aw-watcher-web"))
+                .filter(|k| k.starts_with("aw-watcher-web") && !k.contains("-synced"))
                 .cloned()
                 .collect();
+            if web_buckets.is_empty() {
+                web_buckets = map
+                    .keys()
+                    .filter(|k| k.starts_with("aw-watcher-web"))
+                    .cloned()
+                    .collect();
+            }
             web_buckets.sort();
 
             let has_window = window_bucket.is_some();
