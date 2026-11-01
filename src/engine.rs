@@ -857,12 +857,13 @@ impl Engine {
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let target_window = if rule.monitor_selection == MonitorSelection::Urls {
-                    let title_re = self
+                    let maybe_title_re = self
                         .runtimes
                         .get(&rule.id)
                         .and_then(|r| r.last_matched_title_regex.as_ref());
-                    let matched = enforcer::find_matching_window(enforcer::BROWSER_EXES, title_re);
-                    if matched.is_none() {
+                    if let Some(title_re) = maybe_title_re {
+                        enforcer::find_matching_window(enforcer::BROWSER_EXES, Some(title_re))
+                    } else {
                         let browser_open = enforcer::find_matching_window(enforcer::BROWSER_EXES, None);
                         let app_matched = self
                             .runtimes
@@ -875,8 +876,6 @@ impl Engine {
                         } else {
                             None
                         }
-                    } else {
-                        matched
                     }
                 } else {
                     find_matching_window_for_rule(
@@ -1302,29 +1301,31 @@ impl Engine {
                         - Duration::seconds(
                             (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
                         );
-                    let matching_ev = events
+                    let latest_ev = events
                         .iter()
-                        .filter(|ev| {
-                            let ev_end = event_end_utc(ev);
-                            ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
-                        })
+                        .filter(|ev| event_end_utc(ev) >= recency_cutoff)
                         .max_by_key(|ev| (event_end_utc(ev), ev.timestamp));
 
-                    if let Some(ev) = matching_ev {
-                        if let Some(url_str) = ev.data.url.as_deref() {
-                            let host = url_str
-                                .strip_prefix("https://")
-                                .or_else(|| url_str.strip_prefix("http://"))
-                                .unwrap_or(url_str)
-                                .split('/')
-                                .next()
-                                .unwrap_or(url_str);
-                            rt.last_matched_app = Some(host.to_string());
-                        }
-                        if let Some(ref title) = ev.data.title {
-                            if !title.trim().is_empty() {
-                                rt.set_last_matched_title(Some(title.clone()));
+                    if let Some(ev) = latest_ev {
+                        if event_matches_rule(ev, rule, compiled_re) {
+                            if let Some(url_str) = ev.data.url.as_deref() {
+                                let host = url_str
+                                    .strip_prefix("https://")
+                                    .or_else(|| url_str.strip_prefix("http://"))
+                                    .unwrap_or(url_str)
+                                    .split('/')
+                                    .next()
+                                    .unwrap_or(url_str);
+                                rt.last_matched_app = Some(host.to_string());
                             }
+                            if let Some(ref title) = ev.data.title {
+                                if !title.trim().is_empty() {
+                                    rt.set_last_matched_title(Some(title.clone()));
+                                }
+                            }
+                        } else {
+                            rt.last_matched_app = None;
+                            rt.set_last_matched_title(None);
                         }
                     }
                 }
@@ -1621,11 +1622,9 @@ impl Engine {
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_active_browser_tab::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    let mut closed = false;
                     if let Some(ref re) = last_title_re {
-                        closed = enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, Some(re));
-                    }
-                    if !closed {
+                        enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, Some(re));
+                    } else {
                         let app_matched = last_app
                             .as_deref()
                             .map(|app| matched_app_matches_url_rule(app, compiled_re))
@@ -1653,11 +1652,9 @@ impl Engine {
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_target_windows::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    let mut closed_count = 0;
                     if let Some(ref re) = last_title_re {
-                        closed_count = enforcer::close_target_windows(enforcer::BROWSER_EXES, Some(re));
-                    }
-                    if closed_count == 0 {
+                        enforcer::close_target_windows(enforcer::BROWSER_EXES, Some(re));
+                    } else {
                         let app_matched = last_app
                             .as_deref()
                             .map(|app| matched_app_matches_url_rule(app, compiled_re))
@@ -3006,6 +3003,7 @@ mod tests {
         let mut rule = Rule::default_template(0);
         rule.id = "rule-urls".to_string();
         rule.monitor_selection = MonitorSelection::Urls;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
         rule.action = RuleAction::CloseTab;
         rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
         rule.trigger = TriggerType::Limit;
@@ -3014,9 +3012,10 @@ mod tests {
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
         let rt = engine.runtimes.get_mut("rule-urls").unwrap();
+        assert!(rt.compiled_regex.is_some());
         rt.grace_countdown = Some((1, 5));
         rt.last_matched_app = Some("youtube.com".to_string());
-        rt.last_matched_title = Some("NonExistentTabTitle12345XYZ".to_string());
+        rt.set_last_matched_title(Some("NonExistentTabTitle12345XYZ".to_string()));
 
         // Tick realtime: grace countdown finishes (1 -> 0).
         // Since no browser window matches "NonExistentTabTitle12345XYZ", destructive action CloseTab is skipped,
@@ -3600,6 +3599,75 @@ mod tests {
         engine.realtime_tick().await;
 
         let rt_done = engine.runtimes.get("rule-urls-grace-spa").unwrap();
+        assert_eq!(rt_done.grace_countdown, None);
+        assert!(rt_done.action_executed_today);
+    }
+
+    #[tokio::test]
+    async fn test_urls_rule_grace_countdown_navigating_away_clears_title_and_skips_enforcement() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-nav-away".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.action = RuleAction::CloseTab;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // 1. Initially in grace countdown with active youtube title
+        let rt = engine.runtimes.get_mut("rule-urls-nav-away").unwrap();
+        rt.grace_countdown = Some((3, 5));
+        rt.last_matched_app = Some("youtube.com".to_string());
+        rt.set_last_matched_title(Some("Distracting Video - YouTube".to_string()));
+
+        assert_eq!(
+            rt.last_matched_title.as_deref(),
+            Some("Distracting Video - YouTube")
+        );
+        assert!(rt.last_matched_title_regex.is_some());
+
+        // 2. While in grace countdown, user navigates away to a non-matching URL
+        let ev_other = make_event(
+            now_utc - Duration::seconds(1),
+            2.0,
+            "chrome.exe",
+            "Rust Documentation",
+            "https://doc.rust-lang.org/book/",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[ev_other],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_after_eval = engine.runtimes.get("rule-urls-nav-away").unwrap();
+        assert_eq!(rt_after_eval.last_matched_app, None);
+        assert_eq!(rt_after_eval.last_matched_title, None);
+        assert!(rt_after_eval.last_matched_title_regex.is_none());
+
+        // 3. Grace countdown reaches 0: because title and app are cleared, destructive enforcement is skipped
+        engine.runtimes.get_mut("rule-urls-nav-away").unwrap().grace_countdown = Some((1, 5));
+        engine.realtime_tick().await;
+
+        let rt_done = engine.runtimes.get("rule-urls-nav-away").unwrap();
         assert_eq!(rt_done.grace_countdown, None);
         assert!(rt_done.action_executed_today);
     }
