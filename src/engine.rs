@@ -514,14 +514,14 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.snooze(until);
                 }
-                if !self.any_countdown_active() {
-                    self.hide_overlay();
+                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 tracing::debug!("Acknowledged app warning for rule {rule_id}");
-                if !self.any_countdown_active() {
-                    self.hide_overlay();
+                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
             DaemonCommand::SkipBreak { rule_id } => {
@@ -534,8 +534,8 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.complete_cycle(Local::now());
                 }
-                if !self.any_countdown_active() {
-                    self.hide_overlay();
+                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
+                    self.transition_to_active_countdown_or_hide();
                 }
             }
             DaemonCommand::DismissBreakOverlay => {
@@ -562,7 +562,11 @@ impl Engine {
                 let now = Local::now();
                 let until = now + Duration::minutes(minutes as i64);
                 self.global_snoozed_until = Some(until);
-                for rt in self.runtimes.values_mut() {
+                let displayed_rule_id = self.active_overlay_mode.rule_id().map(|s| s.to_string());
+                for (rule_id, rt) in self.runtimes.iter_mut() {
+                    if rt.active_break.is_none() && displayed_rule_id.as_deref() != Some(rule_id.as_str()) {
+                        rt.can_rollback_completion = false;
+                    }
                     rt.snooze(until);
                 }
                 self.hide_overlay();
@@ -762,6 +766,10 @@ impl Engine {
             }
         }
 
+        if grace_displayed_finished {
+            self.active_overlay_mode = OverlayMode::Hidden;
+        }
+
         for rule_id in completed_enforcements {
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
@@ -808,10 +816,8 @@ impl Engine {
             }
         }
 
-        if grace_displayed_finished {
-            if !matches!(self.active_overlay_mode, OverlayMode::BreakEnforcer { .. }) {
-                self.transition_to_active_countdown_or_hide();
-            }
+        if grace_displayed_finished && matches!(self.active_overlay_mode, OverlayMode::Hidden) {
+            self.transition_to_active_countdown_or_hide();
         }
 
         // 3. Check active test / HUD overlays
@@ -1161,6 +1167,12 @@ impl Engine {
         start_of_day_utc: DateTime<Utc>,
         now_utc: DateTime<Utc>,
     ) -> bool {
+        if !self.is_rule_displayed(&rule.id) {
+            if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                rt.can_rollback_completion = false;
+            }
+        }
+
         // 1. Skip if currently in break, waiting for natural pause, in grace countdown, or snoozed
         {
             let Some(rt) = self.runtimes.get_mut(&rule.id) else { return false; };
@@ -1899,6 +1911,7 @@ pub fn calculate_usage_for_rule(
 mod tests {
     use super::*;
     use crate::aw_client::AwEventData;
+    use crate::config::{DurationConfig, TimeUnit};
     use chrono::TimeZone;
 
     /// Helper to construct a synthetic `AwEvent` with `app`, `title`, and `url` fields.
@@ -2468,5 +2481,100 @@ mod tests {
         let ev3 = make_event(base_time, 1800.0, "code.exe", "Project A (Window 2)", "");
         let usage_identical = calculate_usage_for_rule(&[ev1, ev3], &rule, None, start_of_day, now_utc);
         assert_eq!(usage_identical, 1800); // exactly 30 minutes (1800s), not 3600s
+    }
+
+    #[tokio::test]
+    async fn test_post_grace_hud_toast_preserved_on_realtime_tick() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-hud-notify".to_string();
+        rule.action = RuleAction::ShowNotification;
+        rule.notification_method = NotificationMethod::Hud;
+        rule.notification_duration = DurationConfig::new(10, TimeUnit::Sec);
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Simulate that the rule is in its final grace countdown second, displayed as HudTimer
+        engine.runtimes.get_mut("rule-hud-notify").unwrap().grace_countdown = Some((1, 5));
+        engine.active_overlay_mode = OverlayMode::HudTimer {
+            rule_id: "rule-hud-notify".to_string(),
+            title: "Grace Timer".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 5,
+            remaining_seconds: 1,
+        };
+
+        while overlay_rx.try_recv().is_ok() {}
+
+        // Tick realtime: grace countdown finishes (1 -> 0), triggering execute_rule_action
+        engine.realtime_tick().await;
+
+        // The active overlay mode should now be HudToast for rule-hud-notify, NOT Hidden!
+        match &engine.active_overlay_mode {
+            OverlayMode::HudToast {
+                rule_id,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            } => {
+                assert_eq!(rule_id, "rule-hud-notify");
+                assert_eq!(*duration_seconds, 10);
+                assert_eq!(*remaining_seconds, 9);
+            }
+            other => panic!("Expected OverlayMode::HudToast, got {:?}", other),
+        }
+
+        // Overlay action should have received Show with HudToast
+        let mut received_toast_show = false;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::Show(OverlayMode::HudToast { rule_id, .. }) = action {
+                if rule_id == "rule-hud-notify" {
+                    received_toast_show = true;
+                }
+            }
+        }
+        assert!(
+            received_toast_show,
+            "OverlayAction::Show(HudToast) should have been dispatched and preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snooze_all_preserves_completed_cycle_when_not_displayed() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-1".to_string();
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let completed_time = Local::now() - Duration::minutes(20);
+        let rt = engine.runtimes.get_mut("rule-1").unwrap();
+        rt.complete_cycle(completed_time);
+        assert_eq!(rt.last_completed_at, Some(completed_time));
+        assert!(rt.can_rollback_completion);
+
+        // Ensure rule is not currently displayed (active_overlay_mode is Hidden)
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+        assert!(!engine.is_rule_displayed("rule-1"));
+
+        // User triggers SnoozeAll from system tray mid-cycle
+        engine
+            .handle_command(DaemonCommand::SnoozeAll { minutes: 15 })
+            .await;
+
+        let rt = engine.runtimes.get("rule-1").unwrap();
+        // last_completed_at MUST be preserved and not rolled back to prev_completed_at (which was None)!
+        assert_eq!(rt.last_completed_at, Some(completed_time));
+        assert!(rt.snoozed_until.is_some());
+        assert!(!rt.can_rollback_completion);
     }
 }
