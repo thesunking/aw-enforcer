@@ -189,6 +189,7 @@ pub struct RuleRuntime {
     pub live_status_badge: String,
     pub last_matched_app: Option<String>,
     pub last_matched_title: Option<String>,
+    pub last_matched_title_regex: Option<Regex>,
 }
 
 impl RuleRuntime {
@@ -210,7 +211,17 @@ impl RuleRuntime {
             live_status_badge: String::new(),
             last_matched_app: None,
             last_matched_title: None,
+            last_matched_title_regex: None,
         }
+    }
+
+    /// Sets `last_matched_title` and updates `last_matched_title_regex`.
+    pub fn set_last_matched_title(&mut self, title: Option<String>) {
+        self.last_matched_title_regex = title
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .and_then(|t| Regex::new(&regex::escape(t)).ok());
+        self.last_matched_title = title;
     }
 
     /// Clears active break, grace countdown, pending break, and warning flags for the current cycle.
@@ -232,6 +243,7 @@ impl RuleRuntime {
         self.action_executed_today = true;
         self.last_matched_app = None;
         self.last_matched_title = None;
+        self.last_matched_title_regex = None;
     }
 
     /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
@@ -840,9 +852,24 @@ impl Engine {
                     let title_re = self
                         .runtimes
                         .get(&rule.id)
-                        .and_then(|r| r.last_matched_title.as_ref())
-                        .and_then(|title| Regex::new(&regex::escape(title)).ok());
-                    enforcer::find_matching_window(enforcer::BROWSER_EXES, title_re.as_ref())
+                        .and_then(|r| r.last_matched_title_regex.as_ref());
+                    let matched = enforcer::find_matching_window(enforcer::BROWSER_EXES, title_re);
+                    if matched.is_none() {
+                        let browser_open = enforcer::find_matching_window(enforcer::BROWSER_EXES, None);
+                        let app_matched = self
+                            .runtimes
+                            .get(&rule.id)
+                            .and_then(|r| r.last_matched_app.as_deref())
+                            .map(|app| matched_app_matches_url_rule(app, re.as_ref()))
+                            .unwrap_or(false);
+                        if app_matched {
+                            browser_open
+                        } else {
+                            None
+                        }
+                    } else {
+                        matched
+                    }
                 } else {
                     find_matching_window_for_rule(
                         &rule,
@@ -911,6 +938,7 @@ impl Engine {
                 rt.can_rollback_completion = false;
                 rt.last_matched_app = None;
                 rt.last_matched_title = None;
+                rt.last_matched_title_regex = None;
             }
         }
 
@@ -1046,7 +1074,7 @@ impl Engine {
 
         let active_app = all_events
             .iter()
-            .max_by_key(|e| e.timestamp)
+            .max_by_key(|e| (event_end_utc(e), e.timestamp))
             .and_then(|e| e.data.app.as_deref())
             .unwrap_or("None")
             .to_string();
@@ -1257,10 +1285,41 @@ impl Engine {
         // 1. Skip if currently in break, waiting for natural pause, in grace countdown, or snoozed
         {
             let Some(rt) = self.runtimes.get_mut(&rule.id) else { return false; };
-            if rt.active_break.is_some()
-                || rt.pending_break_since.is_some()
-                || rt.grace_countdown.is_some()
-            {
+            if rt.active_break.is_some() || rt.pending_break_since.is_some() {
+                return false;
+            }
+            if rt.grace_countdown.is_some() {
+                if rule.monitor_selection == MonitorSelection::Urls {
+                    let recency_cutoff = now_utc
+                        - Duration::seconds(
+                            (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
+                        );
+                    let matching_ev = events
+                        .iter()
+                        .filter(|ev| {
+                            let ev_end = event_end_utc(ev);
+                            ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
+                        })
+                        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp));
+
+                    if let Some(ev) = matching_ev {
+                        if let Some(url_str) = ev.data.url.as_deref() {
+                            let host = url_str
+                                .strip_prefix("https://")
+                                .or_else(|| url_str.strip_prefix("http://"))
+                                .unwrap_or(url_str)
+                                .split('/')
+                                .next()
+                                .unwrap_or(url_str);
+                            rt.last_matched_app = Some(host.to_string());
+                        }
+                        if let Some(ref title) = ev.data.title {
+                            if !title.trim().is_empty() {
+                                rt.set_last_matched_title(Some(title.clone()));
+                            }
+                        }
+                    }
+                }
                 return false;
             }
             if let Some(until) = rt.snoozed_until {
@@ -1326,22 +1385,21 @@ impl Engine {
             let matching_ev = events
                 .iter()
                 .filter(|ev| {
-                    let ev_end =
-                        ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                    let ev_end = event_end_utc(ev);
                     ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
                 })
-                .max_by_key(|ev| ev.timestamp)
+                .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
                 .or_else(|| {
                     events
                         .iter()
                         .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                        .max_by_key(|ev| ev.timestamp)
+                        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
                 });
 
             if let Some(ev) = matching_ev {
                 if let Some(ref title) = ev.data.title {
                     if !title.trim().is_empty() {
-                        rt.last_matched_title = Some(title.clone());
+                        rt.set_last_matched_title(Some(title.clone()));
                     }
                 }
             }
@@ -1541,20 +1599,31 @@ impl Engine {
                 enforcer::lock_workstation();
             }
             RuleAction::CloseTab => {
-                let last_title = self
+                let last_title_re = self
                     .runtimes
                     .get(&rule.id)
-                    .and_then(|r| r.last_matched_title.clone());
+                    .and_then(|r| r.last_matched_title_regex.clone());
+                let last_app = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|r| r.last_matched_app.clone());
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.complete_cycle(now);
                 }
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_active_browser_tab::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    if let Some(ref title) = last_title {
-                        if !title.trim().is_empty() {
-                            let title_re = Regex::new(&regex::escape(title)).ok();
-                            enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, title_re.as_ref());
+                    let mut closed = false;
+                    if let Some(ref re) = last_title_re {
+                        closed = enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, Some(re));
+                    }
+                    if !closed {
+                        let app_matched = last_app
+                            .as_deref()
+                            .map(|app| matched_app_matches_url_rule(app, compiled_re))
+                            .unwrap_or(false);
+                        if app_matched {
+                            enforcer::close_active_browser_tab(enforcer::BROWSER_EXES, None);
                         }
                     }
                 } else {
@@ -1562,20 +1631,31 @@ impl Engine {
                 }
             }
             RuleAction::CloseWindow => {
-                let last_title = self
+                let last_title_re = self
                     .runtimes
                     .get(&rule.id)
-                    .and_then(|r| r.last_matched_title.clone());
+                    .and_then(|r| r.last_matched_title_regex.clone());
+                let last_app = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|r| r.last_matched_app.clone());
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.complete_cycle(now);
                 }
                 if rule.monitor_selection == MonitorSelection::Titles {
                     enforcer::close_target_windows::<&str>(&[], compiled_re);
                 } else if rule.monitor_selection == MonitorSelection::Urls {
-                    if let Some(ref title) = last_title {
-                        if !title.trim().is_empty() {
-                            let title_re = Regex::new(&regex::escape(title)).ok();
-                            enforcer::close_target_windows(enforcer::BROWSER_EXES, title_re.as_ref());
+                    let mut closed_count = 0;
+                    if let Some(ref re) = last_title_re {
+                        closed_count = enforcer::close_target_windows(enforcer::BROWSER_EXES, Some(re));
+                    }
+                    if closed_count == 0 {
+                        let app_matched = last_app
+                            .as_deref()
+                            .map(|app| matched_app_matches_url_rule(app, compiled_re))
+                            .unwrap_or(false);
+                        if app_matched {
+                            enforcer::close_target_windows(enforcer::BROWSER_EXES, None);
                         }
                     }
                 } else {
@@ -1869,6 +1949,24 @@ impl Engine {
     }
 }
 
+/// Returns the end timestamp of an ActivityWatch event in UTC.
+pub fn event_end_utc(ev: &AwEvent) -> DateTime<Utc> {
+    ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64)
+}
+
+/// Helper checking whether a rule's URL regex matches the hostname or URL representation in `last_matched_app`.
+pub fn matched_app_matches_url_rule(app: &str, compiled_re: Option<&Regex>) -> bool {
+    if let Some(re) = compiled_re {
+        re.is_match(app)
+            || re.is_match(&format!("https://{app}"))
+            || re.is_match(&format!("http://{app}"))
+            || re.is_match(&format!("https://{app}/"))
+            || re.is_match(&format!("http://{app}/"))
+    } else {
+        false
+    }
+}
+
 /// Helper function to check if an event matches a unified rule's monitor criteria.
 pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>) -> bool {
     match rule.monitor_selection {
@@ -1917,10 +2015,9 @@ pub fn find_matching_window_for_rule(
             let recency_cutoff =
                 now_utc - Duration::seconds((poll_interval_secs.max(2) as i64) * 2 + 5);
 
-            let latest_ev = events.iter().max_by_key(|ev| ev.timestamp);
+            let latest_ev = events.iter().max_by_key(|ev| (event_end_utc(ev), ev.timestamp));
             if let Some(ev) = latest_ev {
-                let ev_end =
-                    ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                let ev_end = event_end_utc(ev);
                 if ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re) {
                     let matched_browser = if let Some(ref title) = ev.data.title {
                         if !title.trim().is_empty() {
@@ -3097,23 +3194,22 @@ mod tests {
         let matching_ev = events
             .iter()
             .filter(|ev| {
-                let ev_end =
-                    ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+                let ev_end = event_end_utc(ev);
                 ev_end >= recency_cutoff && event_matches_rule(ev, &rule, re.as_ref())
             })
-            .max_by_key(|ev| ev.timestamp)
+            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
             .or_else(|| {
                 events
                     .iter()
                     .filter(|ev| event_matches_rule(ev, &rule, re.as_ref()))
-                    .max_by_key(|ev| ev.timestamp)
+                    .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
             });
 
         let rt = engine.runtimes.get_mut("rule-urls-newest-title").unwrap();
         if let Some(ev) = matching_ev {
             if let Some(ref title) = ev.data.title {
                 if !title.trim().is_empty() {
-                    rt.last_matched_title = Some(title.clone());
+                    rt.set_last_matched_title(Some(title.clone()));
                 }
             }
         }
@@ -3282,5 +3378,126 @@ mod tests {
             }
         }
         assert!(received_show, "OverlayAction::Show(BreakEnforcer) should be received");
+    }
+
+    #[test]
+    fn test_find_matching_window_selects_ongoing_event_over_shorter_later_started_event() {
+        let now_utc = Utc::now();
+        let mut rule = Rule::default_template(0);
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        let re = Regex::new(&rule.url_regex).ok();
+
+        // ev_ongoing started 10s ago with 30s duration (ends at now_utc + 20s)
+        let ev_ongoing = make_event(
+            now_utc - Duration::seconds(10),
+            30.0,
+            "chrome.exe",
+            "Long Ongoing Video - YouTube",
+            "https://www.youtube.com/watch?v=ongoing",
+        );
+        // ev_short started later (5s ago) but only lasted 2s (ended at now_utc - 3s)
+        let ev_short = make_event(
+            now_utc - Duration::seconds(5),
+            2.0,
+            "chrome.exe",
+            "Short Blip - Other Site",
+            "https://www.example.com",
+        );
+
+        let events = [ev_ongoing.clone(), ev_short.clone()];
+        let best_ev = events
+            .iter()
+            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+            .unwrap();
+
+        // ev_ongoing should be picked because its end time is newer
+        assert_eq!(
+            best_ev.data.title.as_deref(),
+            Some("Long Ongoing Video - YouTube")
+        );
+
+        let res = find_matching_window_for_rule(&rule, re.as_ref(), &events, now_utc, 10);
+        if enforcer::find_matching_window(enforcer::BROWSER_EXES, None).is_some() {
+            assert_eq!(res.as_deref(), Some("youtube.com"));
+        } else {
+            assert_eq!(res, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_urls_rule_grace_countdown_tracks_in_site_title_changes() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-grace-spa".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.action = RuleAction::CloseTab;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // 1. Initially in grace countdown with an old video title
+        let rt = engine.runtimes.get_mut("rule-urls-grace-spa").unwrap();
+        rt.grace_countdown = Some((3, 5));
+        rt.last_matched_app = Some("youtube.com".to_string());
+        rt.set_last_matched_title(Some("Old Video 1 - YouTube".to_string()));
+
+        assert_eq!(
+            rt.last_matched_title.as_deref(),
+            Some("Old Video 1 - YouTube")
+        );
+
+        // 2. While in grace countdown, user navigates to another YouTube video (SPA title change)
+        let ev_updated = make_event(
+            now_utc - Duration::seconds(1),
+            2.0,
+            "chrome.exe",
+            "New Video 2 - YouTube",
+            "https://www.youtube.com/watch?v=new_vid_2",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+        // evaluate_rule during active grace_countdown still refreshes last_matched_title
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[ev_updated],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_after_eval = engine.runtimes.get("rule-urls-grace-spa").unwrap();
+        assert_eq!(
+            rt_after_eval.last_matched_title.as_deref(),
+            Some("New Video 2 - YouTube")
+        );
+        assert!(rt_after_eval.last_matched_title_regex.is_some());
+        assert!(rt_after_eval
+            .last_matched_title_regex
+            .as_ref()
+            .unwrap()
+            .is_match("New Video 2 - YouTube"));
+
+        // 3. Grace countdown reaches 0: verification succeeds or completes cycle
+        engine.runtimes.get_mut("rule-urls-grace-spa").unwrap().grace_countdown = Some((1, 5));
+        engine.realtime_tick().await;
+
+        let rt_done = engine.runtimes.get("rule-urls-grace-spa").unwrap();
+        assert_eq!(rt_done.grace_countdown, None);
+        assert!(rt_done.action_executed_today);
     }
 }
