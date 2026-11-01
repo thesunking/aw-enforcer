@@ -16,9 +16,7 @@ export component ExecutableSelector inherits VerticalLayout {
     function submit-manual-app() {
         let raw = manual-input.text;
         if (raw != "") {
-            let lower = raw.to-lowercase();
-            let app-name = lower.ends-with(".exe") ? raw : (raw + ".exe");
-            root.add-known-app(app-name);
+            root.add-known-app(raw);
             manual-input.text = "";
         }
     }

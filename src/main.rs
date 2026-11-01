@@ -503,6 +503,7 @@ fn update_rule_at(
 }
 
 /// Normalizes an executable name by trimming whitespace, appending `.exe` if missing,
+/// cleanly handling internal or trailing `.exe` with surrounding spaces,
 /// and returning `None` if the input is empty or wildcard `*`.
 pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
     let trimmed = exe_name.trim();
@@ -510,7 +511,15 @@ pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
         return None;
     }
     if trimmed.to_ascii_lowercase().ends_with(".exe") {
-        Some(trimmed.to_string())
+        let mut stem = trimmed[..trimmed.len() - 4].trim();
+        while stem.to_ascii_lowercase().ends_with(".exe") {
+            stem = stem[..stem.len() - 4].trim();
+        }
+        if stem.is_empty() || stem == "*" {
+            return None;
+        }
+        let ext = &trimmed[trimmed.len() - 4..];
+        Some(format!("{}{}", stem, ext))
     } else {
         Some(format!("{}.exe", trimmed))
     }
@@ -1824,8 +1833,16 @@ mod tests {
         assert_eq!(normalize_executable_name(""), None);
         assert_eq!(normalize_executable_name("   "), None);
         assert_eq!(normalize_executable_name("*"), None);
+        assert_eq!(normalize_executable_name(".exe"), None);
+        assert_eq!(normalize_executable_name("  .exe  "), None);
         assert_eq!(normalize_executable_name("steam"), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("  steam  "), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("steam.exe   "), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("   steam.exe"), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("  steam   .exe  "), Some("steam.exe".to_string()));
+        assert_eq!(normalize_executable_name("steam.exe   .exe"), Some("steam.exe".to_string()));
         assert_eq!(normalize_executable_name("game.EXE"), Some("game.EXE".to_string()));
+        assert_eq!(normalize_executable_name("  game.EXE  "), Some("game.EXE".to_string()));
         assert_eq!(normalize_executable_name("  discord.exe  "), Some("discord.exe".to_string()));
     }
 }
