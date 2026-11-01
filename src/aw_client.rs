@@ -3,8 +3,14 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Predicate checking if an ActivityWatch bucket key represents a local (non-synchronized) bucket.
+pub fn is_local_bucket(key: &str) -> bool {
+    !key.contains("-synced") && !key.contains("_synced")
+}
 
 /// Typed payload for ActivityWatch window, web, and afk events.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,6 +41,7 @@ pub struct AwClient {
     client: reqwest::Client,
     buckets_verified: Arc<AtomicBool>,
     has_web_bucket: Arc<AtomicBool>,
+    last_web_bucket_check: Arc<Mutex<Option<Instant>>>,
     pub window_bucket_id: Arc<RwLock<Option<String>>>,
     pub afk_bucket_id: Arc<RwLock<Option<String>>>,
     pub web_bucket_ids: Arc<RwLock<Vec<String>>>,
@@ -61,6 +68,7 @@ impl AwClient {
             client,
             buckets_verified: Arc::new(AtomicBool::new(false)),
             has_web_bucket: Arc::new(AtomicBool::new(false)),
+            last_web_bucket_check: Arc::new(Mutex::new(None)),
             window_bucket_id: Arc::new(RwLock::new(None)),
             afk_bucket_id: Arc::new(RwLock::new(None)),
             web_bucket_ids: Arc::new(RwLock::new(Vec::new())),
@@ -92,26 +100,17 @@ impl AwClient {
         if let Ok(Value::Object(map)) = resp.json::<Value>().await {
             let window_bucket = map
                 .keys()
-                .find(|k| k.starts_with("aw-watcher-window_") && !k.contains("-synced"))
-                .or_else(|| map.keys().find(|k| k.starts_with("aw-watcher-window_")))
+                .find(|k| k.starts_with("aw-watcher-window_") && is_local_bucket(k))
                 .cloned();
             let afk_bucket = map
                 .keys()
-                .find(|k| k.starts_with("aw-watcher-afk_") && !k.contains("-synced"))
-                .or_else(|| map.keys().find(|k| k.starts_with("aw-watcher-afk_")))
+                .find(|k| k.starts_with("aw-watcher-afk_") && is_local_bucket(k))
                 .cloned();
             let mut web_buckets: Vec<String> = map
                 .keys()
-                .filter(|k| k.starts_with("aw-watcher-web") && !k.contains("-synced"))
+                .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
                 .cloned()
                 .collect();
-            if web_buckets.is_empty() {
-                web_buckets = map
-                    .keys()
-                    .filter(|k| k.starts_with("aw-watcher-web"))
-                    .cloned()
-                    .collect();
-            }
             web_buckets.sort();
 
             let has_window = window_bucket.is_some();
@@ -182,8 +181,17 @@ impl AwClient {
 
     /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
-        if !self.buckets_verified.load(Ordering::Relaxed) || !self.has_web_bucket.load(Ordering::Relaxed) {
-            self.buckets_verified.store(false, Ordering::Relaxed);
+        let mut should_refresh = !self.buckets_verified.load(Ordering::Relaxed);
+        if !should_refresh && !self.has_web_bucket.load(Ordering::Relaxed) {
+            let last_check = *self.last_web_bucket_check.lock().unwrap();
+            if last_check.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+                should_refresh = true;
+                self.buckets_verified.store(false, Ordering::Relaxed);
+            }
+        }
+
+        if should_refresh {
+            *self.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
             self.has_required_buckets().await;
         }
 
@@ -257,23 +265,156 @@ impl AwClient {
             }
         };
 
-        let body: Value = match resp.json().await {
+        let batches = match resp.json::<Vec<Vec<AwEvent>>>().await {
             Ok(b) => b,
             Err(_) => return Ok(Vec::new()),
         };
 
-        Ok(parse_query_response_events(&body))
+        Ok(parse_query_response_events(batches))
     }
 }
 
-/// Extracts `Vec<AwEvent>` from an ActivityWatch `/api/0/query/` response body array (`[[events]]`).
-fn parse_query_response_events(body: &Value) -> Vec<AwEvent> {
-    if let Some(arr) = body.as_array() {
-        if let Some(first_period_events) = arr.first() {
-            if let Ok(events) = serde_json::from_value::<Vec<AwEvent>>(first_period_events.clone()) {
-                return events;
-            }
-        }
+/// Extracts `Vec<AwEvent>` from an ActivityWatch `/api/0/query/` response batch array (`[[events]]`).
+pub fn parse_query_response_events(batches: Vec<Vec<AwEvent>>) -> Vec<AwEvent> {
+    batches.into_iter().next().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_is_local_bucket_filtering() {
+        // Local buckets allowed
+        assert!(is_local_bucket("aw-watcher-window_DESKTOP-123"));
+        assert!(is_local_bucket("aw-watcher-afk_DESKTOP-123"));
+        assert!(is_local_bucket("aw-watcher-web-chrome"));
+        assert!(is_local_bucket("aw-watcher-web-firefox"));
+        assert!(is_local_bucket("aw-watcher-web-edge"));
+        assert!(is_local_bucket("aw-watcher-web-brave"));
+
+        // Remote/synced buckets excluded (-synced and _synced)
+        assert!(!is_local_bucket("aw-watcher-window_DESKTOP-123-synced"));
+        assert!(!is_local_bucket("aw-watcher-window_DESKTOP-123_synced"));
+        assert!(!is_local_bucket("aw-watcher-afk_DESKTOP-123-synced"));
+        assert!(!is_local_bucket("aw-watcher-afk_DESKTOP-123_synced"));
+        assert!(!is_local_bucket("aw-watcher-web-chrome-synced"));
+        assert!(!is_local_bucket("aw-watcher-web-firefox_synced"));
+        assert!(!is_local_bucket("aw-watcher-web-edge-synced"));
     }
-    Vec::new()
+
+    #[test]
+    fn test_bucket_selection_excludes_synced() {
+        let keys = vec![
+            "aw-watcher-window_DESKTOP_synced".to_string(),
+            "aw-watcher-window_LOCAL".to_string(),
+            "aw-watcher-afk_DESKTOP-synced".to_string(),
+            "aw-watcher-afk_LOCAL".to_string(),
+            "aw-watcher-web-chrome_synced".to_string(),
+            "aw-watcher-web-firefox-synced".to_string(),
+            "aw-watcher-web-edge".to_string(),
+            "aw-watcher-web-brave".to_string(),
+        ];
+
+        let window_bucket = keys
+            .iter()
+            .find(|k| k.starts_with("aw-watcher-window_") && is_local_bucket(k))
+            .cloned();
+        assert_eq!(window_bucket.as_deref(), Some("aw-watcher-window_LOCAL"));
+
+        let afk_bucket = keys
+            .iter()
+            .find(|k| k.starts_with("aw-watcher-afk_") && is_local_bucket(k))
+            .cloned();
+        assert_eq!(afk_bucket.as_deref(), Some("aw-watcher-afk_LOCAL"));
+
+        let mut web_buckets: Vec<String> = keys
+            .iter()
+            .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
+            .cloned()
+            .collect();
+        web_buckets.sort();
+        assert_eq!(web_buckets, vec!["aw-watcher-web-brave", "aw-watcher-web-edge"]);
+
+        // When only synced web buckets exist, web_buckets should be empty (no fallback)
+        let keys_only_synced_web = vec![
+            "aw-watcher-web-chrome_synced".to_string(),
+            "aw-watcher-web-firefox-synced".to_string(),
+        ];
+        let web_only_synced: Vec<String> = keys_only_synced_web
+            .iter()
+            .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
+            .cloned()
+            .collect();
+        assert!(web_only_synced.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_response_events() {
+        // 1. Empty batches
+        let empty_batches: Vec<Vec<AwEvent>> = Vec::new();
+        assert!(parse_query_response_events(empty_batches).is_empty());
+
+        // 2. Batches with empty first batch
+        let batches_empty_first: Vec<Vec<AwEvent>> = vec![Vec::new()];
+        assert!(parse_query_response_events(batches_empty_first).is_empty());
+
+        // 3. Batches with multiple events in first batch and another batch
+        let ev1 = AwEvent {
+            timestamp: Utc.with_ymd_and_hms(2026, 11, 1, 10, 0, 0).unwrap(),
+            duration: 10.0,
+            data: AwEventData {
+                app: Some("chrome.exe".to_string()),
+                title: Some("Google Search".to_string()),
+                url: Some("https://google.com".to_string()),
+                status: None,
+            },
+        };
+        let ev2 = AwEvent {
+            timestamp: Utc.with_ymd_and_hms(2026, 11, 1, 10, 0, 10).unwrap(),
+            duration: 20.0,
+            data: AwEventData {
+                app: Some("code.exe".to_string()),
+                title: Some("VS Code".to_string()),
+                url: None,
+                status: None,
+            },
+        };
+        let ev3 = AwEvent {
+            timestamp: Utc.with_ymd_and_hms(2026, 11, 1, 10, 1, 0).unwrap(),
+            duration: 30.0,
+            data: AwEventData::default(),
+        };
+
+        let batches = vec![vec![ev1.clone(), ev2.clone()], vec![ev3]];
+        let extracted = parse_query_response_events(batches);
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].data.app.as_deref(), Some("chrome.exe"));
+        assert_eq!(extracted[1].data.app.as_deref(), Some("code.exe"));
+
+        // 4. Deserialization directly from JSON string to Vec<Vec<AwEvent>>
+        let json_data = r#"
+        [
+            [
+                {
+                    "timestamp": "2026-11-01T10:00:00Z",
+                    "duration": 42.5,
+                    "data": {
+                        "app": "firefox.exe",
+                        "title": "Rust Documentation",
+                        "url": "https://doc.rust-lang.org"
+                    }
+                }
+            ]
+        ]
+        "#;
+        let deserialized: Vec<Vec<AwEvent>> = serde_json::from_str(json_data).expect("valid JSON");
+        let parsed_events = parse_query_response_events(deserialized);
+        assert_eq!(parsed_events.len(), 1);
+        assert_eq!(parsed_events[0].duration, 42.5);
+        assert_eq!(parsed_events[0].data.app.as_deref(), Some("firefox.exe"));
+        assert_eq!(parsed_events[0].data.title.as_deref(), Some("Rust Documentation"));
+        assert_eq!(parsed_events[0].data.url.as_deref(), Some("https://doc.rust-lang.org"));
+    }
 }
