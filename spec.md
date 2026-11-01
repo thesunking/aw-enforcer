@@ -194,9 +194,9 @@ pub struct Rule {
 
 ```
 
-`Rule::sanitize(&mut self)` enforces safety invariants on both config load (`Config::sanitize_rules`) and UI save (`view_to_rule`), automatically downgrading `RuleAction::KillProcess` to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard `.exe` target is configured.
+`Rule::sanitize(&mut self)` enforces safety and timing invariants on both config load and UI save (`view_to_rule`), automatically downgrading `RuleAction::KillProcess` to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard `.exe` target is configured, while clamping `period.value`, `reset_after_afk.value`, `break_duration.value`, and `notification_duration.value` to at least `1`. `Rule::trigger_threshold_seconds()` returns `period.to_seconds().max(1)` for `TriggerType::Period`.
 
-`Config::load_from_path(path: &Path) -> Result<Self, Box<dyn Error>>` and `Config::save_to_path(&self, path: &Path) -> Result<(), Box<dyn Error>>` enforce full validation (`validate_strftime_format`, opacity clamping to `[0.1, 1.0]`, `threshold_excessive_minutes` clamping to at least `daily_screentime_target_minutes`, and `sanitize_rules()`), powering default persistence (`try_load`/`save`) as well as user-initiated configuration import and export.
+`Config::sanitize(&mut self)` unifies all application configuration invariants, validating `histogram_time_format` (falling back to `"%H:%M"`), clamping `aw_port` (\ge 1), `poll_interval_seconds` (\ge 2), `day_start_hour` (\le 23), normalizing `slint_renderer` (`"software"` vs `"femtovg"`), clamping `overlay.opacity` to `[0.1, 1.0]`, clamping stats thresholds (`daily_screentime_target_minutes` \ge 1, `threshold_excessive_minutes` \ge target, histogram bin size \ge 1, bin count \ge 1), and invoking `sanitize_rules()`. Both `Config::load_from_path` and `Config::save_to_path` invoke `Config::sanitize()`, ensuring identical invariants across disk persistence and configuration export/import.
 
 ### C. Example `config.toml` (v1.0.0)
 
@@ -369,7 +369,7 @@ Adding a rule (`on_add_rule`) scans existing rules in `rules_model` to generate 
 2. **Global Sidebar Validation Error Indicator:**
    - Displays a red warning text block (`#f87171`) above the `Save & Apply Changes` button in the sidebar footer whenever `!root.time-format-valid || !root.rule-regex-valid`:
      - Highlights invalid strftime syntax in General Settings (`"⚠ Invalid time format in General Settings"`).
-     - Highlights specific rule regex errors across any rule (`"⚠ Rule '{name}': {error}"`), ensuring users understand why saving is disabled even while navigating other tabs.
+     - Highlights specific rule regex errors across any enabled rule (`"⚠ Rule '{name}': {error}"`), ensuring users understand why saving is disabled even while navigating other tabs. When editing a rule, regex errors are only evaluated if the rule is enabled (`win.get_rule_enabled() == true`), matching the Overview tab's enabled check so disabling an invalid rule in the editor immediately clears validation errors and unblocks saving.
 3. **Two-Way Binding Synchronization:**
    - ComboBox components for Slint renderer display (`slint-renderer-display`), line color selection (`line-color-display`), and line size selection (`line-size-display`) are bound using two-way syntax (`current-value <=> property;`), preventing user selections from severing UI synchronization.
 

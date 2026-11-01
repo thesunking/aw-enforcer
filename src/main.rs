@@ -158,7 +158,7 @@ fn rule_to_view(rule: &Rule) -> RuleView {
 
 /// Converts a Slint `RuleView` from the Settings UI back into a sanitized domain `Rule`.
 fn view_to_rule(view: &RuleView) -> Rule {
-    let mut slots = [true; 168];
+    let mut slots = [false; 168];
     for (i, val) in view.schedule_slots.iter().enumerate() {
         if i < 168 {
             slots[i] = val;
@@ -190,11 +190,11 @@ fn view_to_rule(view: &RuleView) -> Rule {
         url_regex: view.url_regex.to_string(),
         trigger,
         period: DurationConfig::new(
-            view.period_val.max(0) as u32,
+            view.period_val.max(1) as u32,
             TimeUnit::from_str_lossy(view.period_unit.as_str()),
         ),
         reset_after_afk: DurationConfig::new(
-            view.reset_afk_val.max(0) as u32,
+            view.reset_afk_val.max(1) as u32,
             TimeUnit::from_str_lossy(view.reset_afk_unit.as_str()),
         ),
         limit: DurationConfig::new(
@@ -211,7 +211,7 @@ fn view_to_rule(view: &RuleView) -> Rule {
             TimeUnit::from_str_lossy(view.grace_unit.as_str()),
         ),
         break_duration: DurationConfig::new(
-            view.break_val.max(0) as u32,
+            view.break_val.max(1) as u32,
             TimeUnit::from_str_lossy(view.break_unit.as_str()),
         ),
         click_through: view.click_through,
@@ -359,7 +359,7 @@ pub fn validate_rule_pattern(mode: &str, title_re: &str, url_re: &str) -> (bool,
 /// and `rule-regex-error` on `win`.
 fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) {
     let cur_idx = win.get_selected_rule_idx();
-    if cur_idx >= 0 {
+    if cur_idx >= 0 && win.get_rule_enabled() {
         let mode = win.get_rule_monitor_selection();
         let title_re = win.get_rule_title_regex();
         let url_re = win.get_rule_url_regex();
@@ -437,9 +437,9 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<Ru
 fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
     let mut updated_config = base_cfg.clone();
 
-    updated_config.general.aw_port = win.get_aw_port().max(1000) as u16;
+    updated_config.general.aw_port = win.get_aw_port().clamp(1000, 65535) as u16;
     updated_config.general.poll_interval_seconds =
-        win.get_poll_interval_seconds().max(1) as u64;
+        win.get_poll_interval_seconds().max(2) as u64;
     updated_config.general.autostart = win.get_autostart();
     updated_config.general.api_key = win.get_api_key().to_string();
     updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
@@ -469,7 +469,7 @@ fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
         }
     }
     updated_config.rules = rules;
-    updated_config.sanitize_rules();
+    updated_config.sanitize();
 
     updated_config
 }
@@ -1917,5 +1917,49 @@ mod tests {
         assert_eq!(normalize_executable_name("game.EXE"), Some("game.EXE".to_string()));
         assert_eq!(normalize_executable_name("  game.EXE  "), Some("game.EXE".to_string()));
         assert_eq!(normalize_executable_name("  discord.exe  "), Some("discord.exe".to_string()));
+    }
+
+    #[test]
+    fn test_view_to_rule_and_config_sanitize() {
+        let view = RuleView {
+            id: "rule-test".into(),
+            enabled: false,
+            name: "Test Rule".into(),
+            monitor_selection: "Executables".into(),
+            target_executables: ModelRc::new(VecModel::from(vec![slint::SharedString::from("*")])),
+            title_regex: "".into(),
+            url_regex: "".into(),
+            status_text: "".into(),
+            trigger: "Period".into(),
+            period_val: 0,
+            period_unit: "Min".into(),
+            reset_afk_val: 0,
+            reset_afk_unit: "Min".into(),
+            limit_val: 0,
+            limit_unit: "Hr".into(),
+            action: "Kill Process".into(),
+            warn_before_val: 0,
+            warn_before_unit: "Min".into(),
+            grace_val: 0,
+            grace_unit: "Sec".into(),
+            break_val: 0,
+            break_unit: "Min".into(),
+            click_through: false,
+            strict_mode: false,
+            notification_method: "HUD".into(),
+            notification_duration_val: 0,
+            notification_duration_unit: "Sec".into(),
+            show_remaining_time: false,
+            message: "".into(),
+            schedule_slots: ModelRc::new(VecModel::from(vec![])),
+        };
+
+        let rule = view_to_rule(&view);
+        assert_eq!(rule.period.value, 1);
+        assert_eq!(rule.reset_after_afk.value, 1);
+        assert_eq!(rule.break_duration.value, 1);
+        assert_eq!(rule.notification_duration.value, 1);
+        assert_eq!(rule.action, RuleAction::CloseWindow);
+        assert_eq!(rule.schedule.to_bool_array(), [false; 168]);
     }
 }

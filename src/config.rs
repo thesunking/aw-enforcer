@@ -397,17 +397,22 @@ impl Rule {
     /// Returns the threshold duration in seconds configured for this rule's trigger (`Period` or `Limit`).
     pub fn trigger_threshold_seconds(&self) -> u32 {
         match self.trigger {
-            TriggerType::Period => self.period.to_seconds(),
+            TriggerType::Period => self.period.to_seconds().max(1),
             TriggerType::Limit => self.limit.to_seconds(),
         }
     }
 
-    /// Enforces safety invariants on this rule, downgrading `KillProcess` to `CloseWindow`
-    /// whenever the rule does not target at least one specific executable name.
+    /// Enforces safety and timing invariants on this rule, downgrading `KillProcess` to `CloseWindow`
+    /// whenever the rule does not target at least one specific executable name, and clamping
+    /// non-zero duration parameters to a minimum value of 1.
     pub fn sanitize(&mut self) {
         if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
             self.action = RuleAction::CloseWindow;
         }
+        self.period.value = self.period.value.max(1);
+        self.reset_after_afk.value = self.reset_after_afk.value.max(1);
+        self.break_duration.value = self.break_duration.value.max(1);
+        self.notification_duration.value = self.notification_duration.value.max(1);
     }
 
     /// Creates a new rule populated with sensible ergonomic defaults for the UI "+ Add Rule" action.
@@ -666,30 +671,41 @@ impl Config {
         }
     }
 
+    /// Enforces full application configuration invariants and sanitization across general, overlay, stats, and rule configs.
+    pub fn sanitize(&mut self) {
+        let (valid, _) = validate_strftime_format(&self.stats.histogram_time_format);
+        if !valid {
+            self.stats.histogram_time_format = "%H:%M".to_string();
+        }
+
+        self.general.aw_port = self.general.aw_port.max(1);
+        self.general.poll_interval_seconds = self.general.poll_interval_seconds.max(2);
+        self.general.day_start_hour = self.general.day_start_hour.min(23);
+
+        self.general.slint_renderer = if self.general.slint_renderer.eq_ignore_ascii_case("software") {
+            "software".to_string()
+        } else {
+            "femtovg".to_string()
+        };
+
+        self.overlay.opacity = self.overlay.opacity.clamp(0.1, 1.0);
+
+        self.stats.daily_screentime_target_minutes = self.stats.daily_screentime_target_minutes.max(1);
+        self.stats.threshold_excessive_minutes = self
+            .stats
+            .threshold_excessive_minutes
+            .max(self.stats.daily_screentime_target_minutes);
+        self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.max(1);
+        self.stats.histogram_bin_count = self.stats.histogram_bin_count.max(1);
+
+        self.sanitize_rules();
+    }
+
     /// Loads, parses, validates, and sanitizes a configuration from `path`.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&content)?;
-
-        // Validate time format code
-        let (valid, _) = validate_strftime_format(&cfg.stats.histogram_time_format);
-        if !valid {
-            tracing::warn!(
-                "Invalid histogram_time_format '{}' in config; falling back to '%H:%M'",
-                cfg.stats.histogram_time_format
-            );
-            cfg.stats.histogram_time_format = "%H:%M".to_string();
-        }
-
-        cfg.overlay.opacity = cfg.overlay.opacity.clamp(0.1, 1.0);
-
-        cfg.stats.threshold_excessive_minutes = cfg
-            .stats
-            .threshold_excessive_minutes
-            .max(cfg.stats.daily_screentime_target_minutes);
-
-        cfg.sanitize_rules();
-
+        cfg.sanitize();
         Ok(cfg)
     }
 
@@ -719,21 +735,7 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         let mut to_save = self.clone();
-
-        let (valid, _) = validate_strftime_format(&to_save.stats.histogram_time_format);
-        if !valid {
-            to_save.stats.histogram_time_format = "%H:%M".to_string();
-        }
-
-        to_save.overlay.opacity = to_save.overlay.opacity.clamp(0.1, 1.0);
-
-        to_save.stats.threshold_excessive_minutes = to_save
-            .stats
-            .threshold_excessive_minutes
-            .max(to_save.stats.daily_screentime_target_minutes);
-
-        to_save.sanitize_rules();
-
+        to_save.sanitize();
         let serialized = toml::to_string_pretty(&to_save)?;
         fs::write(path, serialized)?;
         Ok(())
@@ -886,6 +888,52 @@ mod tests {
         assert_eq!(cfg.rules[1].action, RuleAction::KillProcess);
         assert_eq!(cfg.rules[2].action, RuleAction::CloseTab);
         assert_eq!(cfg.rules[3].action, RuleAction::CloseWindow);
+    }
+
+    /// Verifies `Config::sanitize()` and `Rule::sanitize()` enforce bounds and timing parameter minimums.
+    #[test]
+    fn test_config_and_rule_sanitize_clamping() {
+        let mut cfg = Config::default();
+        cfg.stats.histogram_time_format = "%Q_invalid".to_string();
+        cfg.general.aw_port = 0;
+        cfg.general.poll_interval_seconds = 0;
+        cfg.general.day_start_hour = 99;
+        cfg.general.slint_renderer = "SOFTWARE".to_string();
+        cfg.overlay.opacity = 0.05;
+        cfg.stats.daily_screentime_target_minutes = 0;
+        cfg.stats.threshold_excessive_minutes = 0;
+        cfg.stats.histogram_bin_size_minutes = 0;
+        cfg.stats.histogram_bin_count = 0;
+
+        let mut rule = Rule::default_template(0);
+        rule.period.value = 0;
+        rule.reset_after_afk.value = 0;
+        rule.break_duration.value = 0;
+        rule.notification_duration.value = 0;
+        rule.action = RuleAction::KillProcess;
+        rule.target_executables = vec!["*".to_string()];
+
+        cfg.rules = vec![rule];
+        cfg.sanitize();
+
+        assert_eq!(cfg.stats.histogram_time_format, "%H:%M");
+        assert_eq!(cfg.general.aw_port, 1);
+        assert_eq!(cfg.general.poll_interval_seconds, 2);
+        assert_eq!(cfg.general.day_start_hour, 23);
+        assert_eq!(cfg.general.slint_renderer, "software");
+        assert!((cfg.overlay.opacity - 0.1).abs() < f32::EPSILON);
+        assert_eq!(cfg.stats.daily_screentime_target_minutes, 1);
+        assert_eq!(cfg.stats.threshold_excessive_minutes, 1);
+        assert_eq!(cfg.stats.histogram_bin_size_minutes, 1);
+        assert_eq!(cfg.stats.histogram_bin_count, 1);
+
+        let sanitized_rule = &cfg.rules[0];
+        assert_eq!(sanitized_rule.action, RuleAction::CloseWindow);
+        assert_eq!(sanitized_rule.period.value, 1);
+        assert_eq!(sanitized_rule.reset_after_afk.value, 1);
+        assert_eq!(sanitized_rule.break_duration.value, 1);
+        assert_eq!(sanitized_rule.notification_duration.value, 1);
+        assert_eq!(sanitized_rule.trigger_threshold_seconds(), 60);
     }
 
     /// Verifies TOML serialization and deserialization roundtrip for `Rule::default_template`.

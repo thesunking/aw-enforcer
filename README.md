@@ -9,7 +9,7 @@
 - **Configuration Import & Export (Backup & Transfer):**
   - Back up, restore, and share entire rule sets and daemon preferences as clean `.toml` files.
   - The Settings **General Settings** tab provides dedicated **"Export Config..."** and **"Import Config..."** buttons backed by native `rfd::FileDialog` pickers.
-  - Imported configurations automatically run through full safety validation (`validate_strftime_format`, opacity clamping, excessive threshold clamping, and `sanitize_rules()`) and are loaded into the UI with an unsaved changes flag so you can review imported rules before saving and applying them.
+  - Imported configurations automatically run through full safety validation (`Config::sanitize()`, including port clamping, minimum 2s poll intervals, opacity clamping, excessive threshold clamping, duration minimums, and `sanitize_rules()`) and are loaded into the UI with an unsaved changes flag so you can review imported rules before saving and applying them.
 
 - **Orthogonal Rule Engine (`Monitor` × `Trigger` × `Action`):**
   - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or active browser tab URL regular expressions (`Urls` dynamically discovered across all installed browsers via `aw-watcher-web*`, strictly excluding non-local synced buckets ending with `-synced` or `_synced`).
@@ -78,7 +78,7 @@
 - **Interactive Rule Management & Real-Time Validation:**
   - **Manual Executable Input & Wildcard Guidance:** In addition to browsing and selecting from active processes, `ExecutableSelector` provides a manual text input field with Enter/Add button support, automatic `.exe` suffix normalization, and case-insensitive deduplication, alongside an informative wildcard indicator (`"All applications monitored (* wildcard) — add specific .exe names below to restrict."`).
   - **Live State & Telemetry Synchronization:** Reopening a cached Settings window immediately synchronizes current active apps, session duration, screentime, and per-rule live status badges from cached engine state, and restores live status badges upon discarding unsaved changes.
-  - **Multi-Rule Syntax Validation:** Live regex syntax checking on `Titles` and `Urls` rules with real-time error messages in the editor and an aggregate warning banner in the left sidebar above `Save & Apply Changes`.
+  - **Multi-Rule Syntax Validation & Disabled Rule Bypass:** Live regex syntax checking on `Titles` and `Urls` rules with real-time error messages in the editor and an aggregate warning banner in the left sidebar above `Save & Apply Changes`. Regex errors on disabled rules are ignored, so unchecking "Rule Enabled" in either the Rule Editor or Overview immediately clears validation errors and unblocks saving.
   - **Overview Rule Management (Toggle, Duplicate & Delete):** Toggle rule activation directly from the Overview list via two-way bindings, duplicate rules with all properties cloned and view automatically switched to the new rule's editor, and revalidate regexes on rule deletion to instantly clear blocking validation errors.
   - **7×24 Weekly Active Hours Schedule:** Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
 
@@ -201,7 +201,7 @@ sun = "000000000000000000000000"
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
-| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and `Rule::sanitize()` safety invariants |
+| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery and `filter_period_intersect` queries) |
 | `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, interval-coalesced session/quota calculation, and 3-stage rule evaluation |
 | `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |
