@@ -323,11 +323,13 @@ export component OverlayWindow inherits Window {
             padding-top: 16px;
             padding-bottom: 16px;
             spacing: 12px;
+            alignment: space-between;
 
             // Header & Evaluation Badge
             HorizontalLayout {
                 alignment: space-between;
                 spacing: 12px;
+                height: 28px;
 
                 Text {
                     text: "📊 " + (root.title-text != "" ? root.title-text : "24-Hour Screen Time Activity");
@@ -338,23 +340,28 @@ export component OverlayWindow inherits Window {
                 }
 
                 // Status Badge
-                Rectangle {
-                    border-radius: 4px;
-                    background: status-color.with-alpha(0.2);
-                    border-width: 1px;
-                    border-color: status-color;
+                VerticalLayout {
+                    alignment: center;
 
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        padding-top: 2px;
-                        padding-bottom: 2px;
+                    Rectangle {
+                        height: 24px;
+                        border-radius: 4px;
+                        background: status-color.with-alpha(0.2);
+                        border-width: 1px;
+                        border-color: status-color;
 
-                        Text {
-                            text: root.is-loading ? "Loading..." : root.status-level;
-                            font-size: 12px;
-                            font-weight: 700;
-                            color: status-color;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: center;
+
+                            Text {
+                                text: root.is-loading ? "Loading..." : root.status-level;
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: status-color;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
@@ -435,6 +442,7 @@ export component OverlayWindow inherits Window {
             HorizontalLayout {
                 alignment: space-between;
                 spacing: 12px;
+                height: 32px;
 
                 Text {
                     text: root.is-loading ? "Fetching activity from ActivityWatch server..." : ("Active: " + Math.floor(root.total-active-minutes / 60) + "h " + Math.mod(root.total-active-minutes, 60) + "m  /  Target: " + Math.floor(root.target-minutes / 60) + "h " + Math.mod(root.target-minutes, 60) + "m");
@@ -443,10 +451,15 @@ export component OverlayWindow inherits Window {
                     vertical-alignment: center;
                 }
 
-                if !root.click-through : Button {
-                    text: "Close";
-                    clicked => {
-                        root.close-status-clicked();
+                if !root.click-through : VerticalLayout {
+                    alignment: center;
+
+                    Button {
+                        height: 28px;
+                        text: "Close";
+                        clicked => {
+                            root.close-status-clicked();
+                        }
                     }
                 }
             }

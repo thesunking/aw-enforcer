@@ -726,7 +726,7 @@ impl OverlayManager {
 
                 let scale = self.windows[0].window().scale_factor().max(1.0);
                 let card_w = (540.0 * scale).round() as i32;
-                let card_h = (330.0 * scale).round() as i32;
+                let card_h = (270.0 * scale).round() as i32;
                 let margin = (20.0 * scale).round() as i32;
 
                 let win = &self.windows[0];
