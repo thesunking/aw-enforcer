@@ -300,6 +300,8 @@ export component SettingsWindow inherits Window {
     // Callbacks to Rust daemon
     callback save-config();
     callback discard-changes();
+    callback export-config();
+    callback import-config();
     callback test-overlay(string /* mode */);
     callback preview-rule-alert();
     callback show-activity-stats();
@@ -826,6 +828,37 @@ export component SettingsWindow inherits Window {
                                 text: "Open 24-Hour Activity HUD";
                                 clicked => {
                                     root.show-activity-stats();
+                                }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "Configuration Backup & Transfer";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: #f8fafc;
+                    }
+
+                    SectionCard {
+                        card-padding: 20px;
+                        card-spacing: 16px;
+
+                        FormRow {
+                            label: "Import / Export:";
+                            label-width: 220px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                alignment: start;
+                                Button {
+                                    text: "Export Config...";
+                                    enabled: !root.ui-locked-by-strict;
+                                    clicked => { root.export-config(); }
+                                }
+                                Button {
+                                    text: "Import Config...";
+                                    enabled: !root.ui-locked-by-strict;
+                                    clicked => { root.import-config(); }
                                 }
                             }
                         }

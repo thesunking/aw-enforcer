@@ -433,6 +433,47 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<Ru
     refresh_rule_regex_validation(win, rm);
 }
 
+/// Extracts the current configuration from `SettingsWindow` and `rules_model`, applying safety sanitization.
+fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
+    let mut updated_config = base_cfg.clone();
+
+    updated_config.general.aw_port = win.get_aw_port().max(1000) as u16;
+    updated_config.general.poll_interval_seconds =
+        win.get_poll_interval_seconds().max(1) as u64;
+    updated_config.general.autostart = win.get_autostart();
+    updated_config.general.api_key = win.get_api_key().to_string();
+    updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
+    updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
+    updated_config.general.pause_all_rules = win.get_pause_all_rules();
+    updated_config.general.destroy_windows_on_hide = win.get_destroy_windows_on_hide();
+    updated_config.general.slint_renderer = win.get_slint_renderer().to_string();
+
+    updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
+    updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
+
+    updated_config.stats.daily_screentime_target_minutes =
+        win.get_daily_target_minutes().max(1) as u32;
+    let raw_excessive = win.get_threshold_excessive_minutes().max(1) as u32;
+    let clamped_excessive =
+        raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
+    updated_config.stats.threshold_excessive_minutes = clamped_excessive;
+    updated_config.stats.histogram_time_format =
+        win.get_time_format_code().to_string();
+
+    // Convert rules
+    let r_model = win.get_rules();
+    let mut rules = Vec::new();
+    for i in 0..r_model.row_count() {
+        if let Some(v) = r_model.row_data(i) {
+            rules.push(view_to_rule(&v));
+        }
+    }
+    updated_config.rules = rules;
+    updated_config.sanitize_rules();
+
+    updated_config
+}
+
 /// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
 fn apply_config_to_ui(
     win: &SettingsWindow,
@@ -735,53 +776,25 @@ fn open_settings_window(
                 if !win.get_time_format_valid() || !win.get_rule_regex_valid() {
                     return;
                 }
-                let mut updated_config = cfg_cell.borrow().clone();
-
-                updated_config.general.aw_port = win.get_aw_port().max(1000) as u16;
-                updated_config.general.poll_interval_seconds =
-                    win.get_poll_interval_seconds().max(1) as u64;
-                updated_config.general.autostart = win.get_autostart();
-                updated_config.general.api_key = win.get_api_key().to_string();
-                updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
-                updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
-                updated_config.general.pause_all_rules = win.get_pause_all_rules();
-                let was_destroy = updated_config.general.destroy_windows_on_hide;
-                let new_destroy = win.get_destroy_windows_on_hide();
-                updated_config.general.destroy_windows_on_hide = new_destroy;
+                let was_destroy = cfg_cell.borrow().general.destroy_windows_on_hide;
+                let updated_config = config_from_ui(&win, &cfg_cell.borrow());
+                let new_destroy = updated_config.general.destroy_windows_on_hide;
                 if was_destroy != new_destroy {
                     overlay_mgr_cell.borrow_mut().set_destroy_windows_on_hide(new_destroy);
                 }
-                updated_config.general.slint_renderer = win.get_slint_renderer().to_string();
                 item_pause.set_text(if updated_config.general.pause_all_rules {
                     "Resume All Rules"
                 } else {
                     "Pause All Rules"
                 });
 
-                updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
-                updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
-
-                updated_config.stats.daily_screentime_target_minutes =
-                    win.get_daily_target_minutes().max(1) as u32;
-                let raw_excessive = win.get_threshold_excessive_minutes().max(1) as u32;
-                let clamped_excessive =
-                    raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
-                if clamped_excessive != raw_excessive {
-                    win.set_threshold_excessive_minutes(clamped_excessive as i32);
+                if updated_config.stats.threshold_excessive_minutes
+                    != win.get_threshold_excessive_minutes().max(1) as u32
+                {
+                    win.set_threshold_excessive_minutes(
+                        updated_config.stats.threshold_excessive_minutes as i32,
+                    );
                 }
-                updated_config.stats.threshold_excessive_minutes = clamped_excessive;
-                updated_config.stats.histogram_time_format =
-                    win.get_time_format_code().to_string();
-
-                // Convert rules
-                let r_model = win.get_rules();
-                let mut rules = Vec::new();
-                for i in 0..r_model.row_count() {
-                    if let Some(v) = r_model.row_data(i) {
-                        rules.push(view_to_rule(&v));
-                    }
-                }
-                updated_config.rules = rules;
 
                 // Persist config to disk
                 if let Err(e) = updated_config.save() {
@@ -821,6 +834,59 @@ fn open_settings_window(
                 apply_config_to_ui(&win, &saved_config, &rm);
                 sync_live_state_to_ui(&win, &rm, &live_state_cell.borrow());
                 tracing::info!("Reverted all settings to last saved configuration.");
+            }
+        });
+    }
+
+    // Export configuration
+    {
+        let sw = settings_weak.clone();
+        let cfg_cell = current_config.clone();
+
+        settings_win.on_export_config(move || {
+            if let Some(win) = sw.upgrade() {
+                let current_cfg = config_from_ui(&win, &cfg_cell.borrow());
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("aw-enforcer-config.toml")
+                    .add_filter("TOML Configuration", &["toml"])
+                    .save_file()
+                {
+                    match current_cfg.save_to_path(&path) {
+                        Ok(()) => tracing::info!("Exported configuration to {:?}", path),
+                        Err(e) => tracing::error!("Failed to export config to {:?}: {e}", path),
+                    }
+                }
+            }
+        });
+    }
+
+    // Import configuration
+    {
+        let sw = settings_weak.clone();
+        let rm = rules_model.clone();
+        let live_state_cell = live_state.clone();
+
+        settings_win.on_import_config(move || {
+            if let Some(win) = sw.upgrade() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("TOML Configuration", &["toml"])
+                    .pick_file()
+                {
+                    match AppConfig::load_from_path(&path) {
+                        Ok(imported_cfg) => {
+                            apply_config_to_ui(&win, &imported_cfg, &rm);
+                            sync_live_state_to_ui(&win, &rm, &live_state_cell.borrow());
+                            win.set_has_unsaved_changes(true);
+                            tracing::info!(
+                                "Imported configuration from {:?}; unsaved changes pending review.",
+                                path
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to import config from {:?}: {e}", path);
+                        }
+                    }
+                }
             }
         });
     }

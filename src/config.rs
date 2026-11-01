@@ -666,16 +666,9 @@ impl Config {
         }
     }
 
-    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
-    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = Self::config_path();
-        if !path.exists() {
-            let default_cfg = Self::default();
-            default_cfg.save()?;
-            return Ok(default_cfg);
-        }
-
-        let content = fs::read_to_string(&path)?;
+    /// Loads, parses, validates, and sanitizes a configuration from `path`.
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&content)?;
 
         // Validate time format code
@@ -700,6 +693,18 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
+    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = Self::config_path();
+        if !path.exists() {
+            let default_cfg = Self::default();
+            default_cfg.save()?;
+            return Ok(default_cfg);
+        }
+
+        Self::load_from_path(&path)
+    }
+
     /// Enforces safety invariants on rules, downgrading `KillProcess` to `CloseWindow`
     /// whenever a rule does not target at least one specific executable name.
     pub fn sanitize_rules(&mut self) {
@@ -708,15 +713,36 @@ impl Config {
         }
     }
 
-    /// Serializes and writes the configuration to `config.toml`, creating parent directories as needed.
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::config_path();
+    /// Serializes, validates, sanitizes, and writes the configuration to `path`, creating parent directories as needed.
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let serialized = toml::to_string_pretty(self)?;
+        let mut to_save = self.clone();
+
+        let (valid, _) = validate_strftime_format(&to_save.stats.histogram_time_format);
+        if !valid {
+            to_save.stats.histogram_time_format = "%H:%M".to_string();
+        }
+
+        to_save.overlay.opacity = to_save.overlay.opacity.clamp(0.1, 1.0);
+
+        to_save.stats.threshold_excessive_minutes = to_save
+            .stats
+            .threshold_excessive_minutes
+            .max(to_save.stats.daily_screentime_target_minutes);
+
+        to_save.sanitize_rules();
+
+        let serialized = toml::to_string_pretty(&to_save)?;
         fs::write(path, serialized)?;
         Ok(())
+    }
+
+    /// Serializes and writes the configuration to `config.toml`, creating parent directories as needed.
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::config_path();
+        self.save_to_path(&path)
     }
 }
 
@@ -989,5 +1015,46 @@ mod tests {
             .threshold_excessive_minutes
             .max(cfg.stats.daily_screentime_target_minutes);
         assert_eq!(cfg.stats.threshold_excessive_minutes, 480);
+    }
+
+    #[test]
+    fn test_save_and_load_from_path_roundtrip_and_sanitization() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aw_enforcer_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_file = temp_dir.join("test_config.toml");
+
+        let mut cfg = Config::default();
+        // Set values that require sanitization / clamping
+        cfg.overlay.opacity = 2.5; // should clamp to 1.0
+        cfg.stats.daily_screentime_target_minutes = 300;
+        cfg.stats.threshold_excessive_minutes = 100; // should be clamped to max(daily_target) -> 300
+        cfg.stats.histogram_time_format = "invalid%Q".to_string(); // invalid format -> fallback to "%H:%M"
+
+        // Add a rule that requires sanitization: KillProcess without specific executables
+        let mut rule = Rule::default_template(0);
+        rule.target_executables = vec!["*".to_string()];
+        rule.action = RuleAction::KillProcess; // should be sanitized to CloseWindow
+        cfg.rules = vec![rule];
+
+        // Save to path
+        cfg.save_to_path(&config_file).expect("Failed to save config to path");
+        assert!(config_file.exists());
+
+        // Load from path
+        let loaded = Config::load_from_path(&config_file).expect("Failed to load config from path");
+
+        assert!((loaded.overlay.opacity - 1.0).abs() < f32::EPSILON);
+        assert_eq!(loaded.stats.threshold_excessive_minutes, 300);
+        assert_eq!(loaded.stats.histogram_time_format, "%H:%M");
+        assert_eq!(loaded.rules.len(), 1);
+        assert_eq!(loaded.rules[0].action, RuleAction::CloseWindow);
+
+        // Clean up
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
