@@ -1322,6 +1322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
     let tokio_rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("Failed to build Tokio runtime"),
@@ -1466,7 +1467,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         item_snooze.set_enabled(!strict_lock_active);
                         item_pause.set_enabled(!strict_lock_active);
 
-                        if settings_slot_ref.borrow().is_some() {
+                        if settings_slot_ref
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|w| w.window().is_visible())
+                        {
                             for (rule_id, status_text) in rule_statuses {
                                 for idx in 0..rules_model_ref.row_count() {
                                     if let Some(mut r) = rules_model_ref.row_data(idx) {
@@ -1629,21 +1634,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if conn_check_counter >= 12 {
                     conn_check_counter = 0;
                     if let Some(win) = settings_slot_ref.borrow().as_ref() {
-                        let sw = win.as_weak();
-                        let conn_flag = aw_connected_flag_ref.clone();
-                        let client = ui_client_cell.borrow().clone();
+                        if win.window().is_visible() {
+                            let sw = win.as_weak();
+                            let conn_flag = aw_connected_flag_ref.clone();
+                            let client = ui_client_cell.borrow().clone();
 
-                        handle.spawn(async move {
-                            let connected = client.check_connection().await;
-                            conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
+                            handle.spawn(async move {
+                                let connected = client.check_connection().await;
+                                conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
 
-                            slint::invoke_from_event_loop(move || {
-                                if let Some(w) = sw.upgrade() {
-                                    w.set_aw_connected(connected);
-                                }
-                            })
-                            .ok();
-                        });
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(w) = sw.upgrade() {
+                                        w.set_aw_connected(connected);
+                                    }
+                                })
+                                .ok();
+                            });
+                        }
                     }
                 }
             },
