@@ -6,6 +6,11 @@
 
 ## Key Features
 
+- **Configuration Import & Export (Backup & Transfer):**
+  - Back up, restore, and share entire rule sets and daemon preferences as clean `.toml` files.
+  - The Settings **General Settings** tab provides dedicated **"Export Config..."** and **"Import Config..."** buttons backed by native `rfd::FileDialog` pickers.
+  - Imported configurations automatically run through full safety validation (`validate_strftime_format`, opacity clamping, excessive threshold clamping, and `sanitize_rules()`) and are loaded into the UI with an unsaved changes flag so you can review imported rules before saving and applying them.
+
 - **Orthogonal Rule Engine (`Monitor` × `Trigger` × `Action`):**
   - **3 Monitor Modes:** Match all screen time (`*`), specific process executables (`.exe`), window title regular expressions (`Titles`), or active browser tab URL regular expressions (`Urls` dynamically discovered across all installed browsers via `aw-watcher-web*`, strictly excluding non-local synced buckets ending with `-synced` or `_synced`).
   - **2 Trigger Types:**
@@ -21,8 +26,8 @@
     - **`Kill Process`:** Terminates matching background and foreground processes (restricted to rules targeting specific `.exe` names).
 
 - **Three-Stage Enforcement Pipeline:**
-  1. **Stage 1 — Pre-Action Warning (`Warn Before Action`):** Alerts you ahead of time (via HUD toast or Windows notification) before a break or quota enforcement triggers. Snoozing a warning preserves cycle state so snooze expiration does not re-emit duplicate warnings for the same cycle while below threshold.
-  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. For URL and executable rules, closing or navigating away from the target tab or app during the grace period safely aborts destructive actions (continuously refreshing tab titles during in-site navigation, such as single-page app browsing).
+  1. **Stage 1 — Pre-Action Warning (`Warn Before Action`):** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Supports custom formatted message templates across all rule actions (preserving unambiguous upcoming-break countdown toasts for `Show Overlay`). Snoozing a warning preserves cycle state so snooze expiration does not re-emit duplicate warnings for the same cycle while below threshold.
+  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work, rendering custom message templates across quota enforcement actions (`Close Window`, `Close Tab`, `Kill Process`, `Lock Workstation`). For URL and executable rules, closing or navigating away from the target tab or app during the grace period safely aborts destructive actions (continuously refreshing tab titles during in-site navigation, such as single-page app browsing).
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes. Newly spawned HUD cards and break overlays retain their full duration without same-tick countdown decrement, with initial progress bar ratios correctly rendered immediately on launch.
 
 - **Ergonomic, Shell & Anti-Bypass Safeguards:**
@@ -37,6 +42,11 @@
   - **Protected Process & Windows Shell Guards:** Automatically excludes the `aw-enforcer` process and Windows shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) from wildcard window closing, tab closing, and process termination.
   - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
+  - **Sub-Second Session Interval Accumulation & Clamping:** Continuous session duration calculation accumulates sub-second intervals in milliseconds before converting to seconds and clamps event boundaries to current UTC time, preventing sub-second event truncation.
+  - **Dismissing Pending Breaks Completes Cycle:** Dismissing a break during its natural 1.5-second idle pause marks the cycle completed (`rt.complete_cycle(now)`), preventing it from immediately re-triggering on the next poll tick.
+  - **Strict Mode Unlock Reset on Window Close:** When `destroy_windows_on_hide = false`, closing the Settings window immediately resets `strict_unlocked = false` so strict mode lockouts cannot be bypassed across window re-openings.
+  - **Action Center Plain-Text Sanitization:** Formats native Windows Action Center toasts as clean plain text via `formatter::format_plain_message`, stripping Markdown heading prefixes (`# `, `## `) and attribute blocks (`[color=... size=... bold]`) while preserving interpolated placeholders.
+  - **Off-Screen HUD Clamping:** Pure positioning helper `clamp_or_reset_status_pos` detects if the 24h Stats HUD window has drifted off-screen (e.g. after disconnecting a secondary display) and resets it to the primary display top-right corner.
 
 - **Display, HiDPI, Multi-Monitor & DWM Compositing:**
   - **DPI-Aware Overlay Sizing:** Dynamically reads window scale factors to scale HUD card geometry and screen margins accurately on high-DPI displays.
@@ -53,11 +63,15 @@
   - **Zero-Allocation Win32 Process Resolution & Matching:** Uses `QueryFullProcessImageNameW` on stack buffers and zero-allocation `.exe` stem matching (`exe_name_matches_targets`). Process termination and running-app discovery share a single lightweight Win32 ToolHelp snapshot iterator (`for_each_process`) with zero external process-enumeration crates.
   - **Typed Event Schema (`AwEventData`):** Deserializes ActivityWatch event payloads into compact, strongly-typed Rust structs (`app`, `title`, `url`, `status`) rather than dynamic JSON maps, minimizing heap allocation and memory fragmentation over 24-hour periods.
   - **Optimized Release Profile:** Compiled with Link-Time Optimization (`lto = true`), single codegen units, debug symbol stripping, and size-optimized code generation (`opt-level = "s"`) to minimize resident memory page mapping in RAM.
+  - **Bucket Discovery Deduplication & Query Escaping:** `AwClient::refresh_buckets` immediately timestamps `last_web_bucket_check` on entry, eliminating redundant back-to-back `/api/0/buckets/` calls during poll ticks. Bucket identifiers escape backslashes and double quotes (`escape_bucket_id`) before query string interpolation.
+  - **Zero-Allocation Protected Window Class Check:** Window class inspection compares UTF-16 buffers directly against static UTF-16 constants for shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), eliminating heap `String` allocations during `EnumWindows`.
+  - **Immediate Telemetry & Badge Refresh on Reload:** Applying settings or reloading configuration triggers an immediate `self.poll_tick().await`, refreshing live status badges and tray tooltip instantly without waiting for the next polling interval.
 
 - **Rich Message Editor & Live Preview:**
   - Customize break and notification messages with Markdown headings (`#`, `##`) with full inline formatting attribute support (e.g. `# [color=#38bdf8 italic] Heading`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}` (retaining URL hostnames for URL rules), `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
   - **Live Preview Placeholder & Alignment Parity:** The live message editor preview formats duration placeholders using clean short-string notation (`DurationConfig::to_short_string()`, e.g. `"50m"`, `"10m"`, `"1h"`, `"5m"`) matching runtime overlays 1:1, formats realistic `{remaining}` quota durations, and reflects left alignment for notifications and center alignment for full-screen breaks.
-  - **"Preview This Rule's Alert" Button:** Test the selected rule's exact custom template, styling, click-through, and countdown duration with one click without having to wait for actual rule thresholds.
+  - **Universal Message Templates & Live Formatting Toolbar:** Customize message templates across all rule actions — visible whenever `cur-action == "Show Overlay" || cur-action == "Show Notification" || root.rule-warn-before-val > 0 || root.rule-grace-val > 0`, enabling custom warning and grace countdown templates for quota enforcement rules (like Rule 2, *"Weeknight Gaming Limit"*).
+  - **"Preview This Rule's Alert" Button:** Test the selected rule's exact custom template, styling, click-through, and countdown duration with one click without having to wait for actual rule thresholds. Automatically previews `HudTimer` for enforcement actions with grace countdowns, `HudToast` for notifications and pre-action warnings, and `BreakEnforcer` for full-screen breaks.
 
 - **Interactive Rule Management & Real-Time Validation:**
   - **Manual Executable Input & Wildcard Guidance:** In addition to browsing and selecting from active processes, `ExecutableSelector` provides a manual text input field with Enter/Add button support, automatic `.exe` suffix normalization, and case-insensitive deduplication, alongside an informative wildcard indicator (`"All applications monitored (* wildcard) — add specific .exe names below to restrict."`).

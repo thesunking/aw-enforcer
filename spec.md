@@ -11,20 +11,24 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - Any trigger (`Period` or `Limit`) can be paired with any of the 7 actions, with universal pre-action warnings (`Warn Before Action`) and pre-execution countdowns (`Grace Countdown`).
 2. **Unified Three-Stage Evaluation Pipeline (`src/engine.rs`):**
    - Replaces separate frequency/limit evaluation paths with a single `evaluate_rule()` pipeline:
-     - **Stage 1 (Warn Before Action):** Fires when `warn_before > 0` and `remaining <= warn_before`.
-     - **Stage 2 (Grace Countdown):** Displays a top-right `HudTimer` countdown when `grace_duration > 0` before executing the configured action.
+     - **Stage 1 (Warn Before Action):** Fires when `warn_before > 0` and `remaining <= warn_before`. Supports custom formatted message templates across all rule actions (preserving unambiguous upcoming-break countdowns for `ShowOverlay`).
+     - **Stage 2 (Grace Countdown):** Displays a top-right `HudTimer` countdown when `grace_duration > 0` before executing the configured action, rendering the rule's custom message template.
      - **Stage 3 (Action Execution):** Executes `Show Overlay`, `Show Notification` (`HUD` or `Windows`), `Show Statistics`, `Lock Workstation`, `Close Tab`, `Close Window`, or `Kill Process`.
    - Centralizes cycle state transitions on `RuleRuntime` (`reset_active_timers()`, `complete_cycle(now)`, and `snooze(until)` with `prev_completed_at` tracking) so snoozing on any cycle pauses enforcement for `minutes` and then re-evaluates without losing pre-snooze session progress.
-3. **Five-Section Rule Editor (`ui/settings.slint`):**
+3. **Five-Section Rule Editor & Preview Alerts (`ui/settings.slint`):**
    - Each rule's configuration page is organized into five clean sections with headers placed outside their cards: **1. General Settings**, **2. Monitor Target**, **3. Trigger**, **4. Action**, and **5. Active Hours Schedule** (each enclosed in a dedicated `SectionCard`).
-   - The Message Template & Formatting Toolbar section is hosted in a dedicated sub-card within the **4. Action** card and live-updates its preview whenever rule names, targets, monitor modes, triggers, or durations change. It includes a dedicated **"Preview This Rule's Alert"** button that dispatches a 15-second overlay or toast test alert matching the rule's exact custom template, formatting, click-through, and notification parameters.
-4. **Single-Instance IPC, Window Activation & System Tray UX:**
+   - The Message Template & Formatting Toolbar section is hosted in a dedicated sub-card within the **4. Action** card (visible when `action == ShowOverlay || action == ShowNotification || warn_before > 0 || grace_duration > 0`) and live-updates its preview whenever rule names, targets, monitor modes, triggers, or durations change.
+   - Includes a dedicated **"Preview This Rule's Alert"** button that dispatches a preview alert matching the rule's exact custom template, formatting, click-through, and notification parameters (previewing `BreakEnforcer` for `ShowOverlay`, `HudToast` for `ShowNotification` or zero-grace warnings, and `HudTimer` for actions with `grace_duration > 0`).
+4. **Configuration Import & Export (`src/config.rs`, `ui/settings.slint`, `src/main.rs`):**
+   - Users can export their complete configuration to a `.toml` file (`aw-enforcer-config.toml`) or import an existing configuration file via native `rfd::FileDialog` pickers in General Settings.
+   - Import automatically executes full validation (`validate_strftime_format`, opacity clamping, excessive threshold clamping, and `sanitize_rules()`), loads the rules and settings into the UI, synchronizes live badges, and sets `has-unsaved-changes = true` for user review before committing. Both controls are disabled during active strict mode (`ui-locked-by-strict`).
+5. **Single-Instance IPC, Window Activation & System Tray UX:**
    - Enforces single-instance execution via a named Win32 mutex (`Local\AW_Enforcer_SingleInstance_Mutex`).
    - Pairs with a named Win32 auto-reset activation event (`Local\AW_Enforcer_Activate_Event`): when a second instance is launched without `--autostart` or `--minimized`, it signals the activation event and exits immediately.
    - The primary instance's 250ms UI timer detects the event, calls `ShowWindow(hwnd, SW_RESTORE)`, and `SetForegroundWindow(hwnd)` to focus the existing `SettingsWindow`.
    - Double-clicking the system tray icon (`TrayIconEvent::DoubleClick`) opens or restores the `SettingsWindow`.
    - The system tray tooltip dynamically displays active snooze countdowns (e.g. `AW-Enforcer (Snoozed 15m) — Today: 2h 15m`), and rule status badges in the overview display `"Snoozed ({rem}m)"` during active global or per-rule snooze intervals.
-5. **Ergonomic, Shell & Anti-Bypass Safeguards:**
+6. **Ergonomic, Shell & Anti-Bypass Safeguards:**
    - **Double-Counting Prevention via Interval Coalescing (`merge_overlapping_intervals`):** Eliminates double-counted screen time from concurrent browser windows, nested activity events, and overlapping ActivityWatch records across continuous session tracking, daily quota usage calculations, and 24-hour histogram binning.
    - **Multi-Browser Web Watcher Integration & Resilient Bucket Selection:** Dynamically discovers all local browser buckets (Chrome, Edge, Firefox, Brave) while strictly excluding non-local synchronized buckets (`-synced` and `_synced`) across window, AFK, and web watchers, querying unioned and `not-afk` intersected web activity. Periodically refreshes web bucket discovery every 60 seconds so newly opened browsers are detected at runtime. When multiple local window or AFK buckets exist (e.g., across hostname migrations), deterministically selects the bucket matching the local machine's hostname or with the latest `last_updated`/`created` timestamp.
    - **URL Tab-Level Target Verification & Dynamic Title Tracking:** In Stage 2/3 and break countdowns, matches open browser windows against the specific tab title regex (`rt.last_matched_title_regex`, falling back to regex-escaped `rt.last_matched_title`), ensuring that closing or navigating away from the target tab during a grace period safely skips destructive closing. Navigating between pages matching `rule.url_regex` while a grace period is actively ticking continuously updates `rt.last_matched_app`, `rt.last_matched_title`, and `rt.last_matched_title_regex`. Event selection orders by end-time and start-time (`(event_end_utc(ev), ev.timestamp)`) across active window discovery, rule evaluation, and active app polling so long-running active sessions are never shadowed by shorter finished intervals. The `{app}` message placeholder accurately extracts and retains the URL hostname (e.g. `youtube.com`).
@@ -36,7 +40,12 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - **Fullscreen / Presentation DND (`SHQueryUserNotificationState`):** Automatically downgrades `Show Overlay` breaks to passive Windows notifications during fullscreen D3D games, presentations, or Focus Assist.
    - **Strict Mode Lockout & Overlay Priority Hierarchy:** `OverlayMode::priority()` enforces `BreakEnforcer (4) > HudTimer (3) > HudToast (2) > HudStatus (1) > Hidden (0)`. When `Strict Mode` is enabled on a `Show Overlay` rule, it hides Skip/Snooze buttons on the overlay, disables tray bypass items, blocks `SnoozeBreak`/`SkipBreak`/`CloseOverlay`/`TriggerTestOverlay` commands in the engine, and locks rule/settings edits (including `Pause All Rules` and `Test Overlays` buttons) behind a 15-second confirmation timer while actively enforcing. Test and preview alerts can replace preceding test overlays without priority lockouts.
    - **Protected Window & Shell Guards (`enforcer::is_protected_window`):** Excludes the `aw-enforcer` process (`GetCurrentProcessId()`) and Windows shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) from window enumeration, wildcard `WM_CLOSE`, `Ctrl+W` synthesis, and process termination.
-6. **Performance, Renderer & GPU Memory Management:**
+   - **Sub-Second Session Interval Accumulation & Clamping:** Continuous session calculation accumulates millisecond intervals before integer second conversion and clamps event boundaries to `now_utc`, preventing up to 999ms per-interval truncation.
+   - **Dismissing Pending Breaks Completes Cycle:** Dismissing a break during its natural 1.5s pause marks the cycle completed (`rt.complete_cycle(now)`), preventing it from immediately re-triggering on the next poll tick.
+   - **Strict Unlock Reset on Window Close:** When `destroy_windows_on_hide = false`, closing the Settings window immediately resets `strict_unlocked = false` so strict mode lockouts cannot be bypassed across window re-openings.
+   - **Action Center Plain-Text Sanitization:** `formatter::format_plain_message` cleanly strips Markdown heading prefixes (`# `, `## `) and valid attribute blocks (`[color=... size=... bold]`) before sending native WinRT toasts to the Windows Action Center.
+   - **Off-Screen HUD Clamping:** `clamp_or_reset_status_pos` detects if the 24h Stats HUD window has drifted off-screen (e.g. after monitor disconnection) and resets it to the primary display's top-right corner.
+7. **Performance, Renderer & GPU Memory Management:**
    - **Worker Thread Optimization:** Tokio runtime is configured with `.worker_threads(2)` to minimize idle background thread overhead on high-core CPUs.
    - **Direct JSON Event Stream Deserialization:** `AwClient` executes queries and deserializes directly into `Vec<Vec<AwEvent>>`, eliminating intermediate `serde_json::Value` allocations and cloning.
    - **Multi-Hour 24h Histogram Bin Rollover:** Stats histogram aligns hour boundaries to multiples of `(bin_size_mins / 60)` and computes coalesced overlap for intermediate bins during multi-bin transitions.
@@ -51,6 +60,9 @@ Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer
    - **Per-Tick Usage Caching (`RuleRuntime::daily_usage_seconds`):** Caches daily quota calculations during `evaluate_rule` so `poll_tick` reuses the cached value when formatting Live Status badges instead of scanning events twice.
    - **Zero-Allocation Win32 Process Resolution & Shared Snapshot Iterator:** Uses `QueryFullProcessImageNameW` on stack buffers and zero-allocation `.exe` stem matching (`enforcer::exe_name_matches_targets`). Process termination (`kill_target_processes`) and known-app discovery (`scan_and_update_known_apps`) share `enforcer::for_each_process` over Win32 ToolHelp snapshots.
    - **Typed Event Schema (`AwEventData`) & Optimized Release Profile:** Deserializes ActivityWatch event payloads into strongly-typed Rust structs and compiles release binaries with `lto = true`, `codegen-units = 1`, `strip = true`, and `opt-level = "s"`.
+   - **Bucket Discovery Deduplication & Query Escaping:** `AwClient::refresh_buckets` immediately timestamps `last_web_bucket_check` upon start of discovery, preventing redundant back-to-back `/api/0/buckets/` calls during poll ticks. Bucket identifiers escape backslashes and double quotes (`escape_bucket_id`) before query string interpolation.
+   - **Zero-Allocation Protected Window Class Check:** Window class inspection compares UTF-16 buffers directly against static UTF-16 constants for shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`), eliminating heap `String` allocations during `EnumWindows`.
+   - **Immediate Telemetry & Badge Refresh on Reload:** Applying settings or reloading configuration triggers an immediate `self.poll_tick().await`, refreshing live badges and tray tooltip instantly without waiting for the next polling interval.
 
 ---
 
@@ -173,7 +185,7 @@ pub struct Rule {
     #[serde(default)]
     pub show_remaining_time: bool,           // Live countdown timer on HUD notification
     #[serde(default)]
-    pub message: String,                     // Rich formatted message template (when action == ShowOverlay || ShowNotification)
+    pub message: String,                     // Rich formatted message template (used when action == ShowOverlay || ShowNotification, or as custom warning/grace alert across all actions)
 
     // 5. Schedule
     #[serde(default)]
@@ -183,6 +195,8 @@ pub struct Rule {
 ```
 
 `Rule::sanitize(&mut self)` enforces safety invariants on both config load (`Config::sanitize_rules`) and UI save (`view_to_rule`), automatically downgrading `RuleAction::KillProcess` to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard `.exe` target is configured.
+
+`Config::load_from_path(path: &Path) -> Result<Self, Box<dyn Error>>` and `Config::save_to_path(&self, path: &Path) -> Result<(), Box<dyn Error>>` enforce full validation (`validate_strftime_format`, opacity clamping to `[0.1, 1.0]`, `threshold_excessive_minutes` clamping to at least `daily_screentime_target_minutes`, and `sanitize_rules()`), powering default persistence (`try_load`/`save`) as well as user-initiated configuration import and export.
 
 ### C. Example `config.toml` (v1.0.0)
 
@@ -286,16 +300,15 @@ sun = "000000000000000000000000"
 
 ### A. Tab 0: General Settings (`active-tab == 0`)
 
-The General Settings tab organizes application-wide preferences into four structured `SectionCard` panels:
+The General Settings tab organizes application-wide preferences into five structured `SectionCard` panels:
 
 1. **General Settings:** ActivityWatch Port (`aw_port`), Polling Interval in seconds (`poll_interval_seconds`), Start on Windows Login (`autostart`), API Key (`api_key`), Logical Day Start Hour (`day_start_hour`), Fullscreen/Presentation DND (`suppress_fullscreen_d3d`), and Pause All Rules (`pause_all_rules`, disabled when `ui-locked-by-strict` is active).
 2. **Performance:**
 * **Slint Renderer (`slint-renderer`):** ComboBox selecting between OpenGL (`OpenGL (renderer-femtovg)`) and CPU Software (`CPU Software (renderer-software)`). Includes an interactive `InfoBadge` tooltip on hover/click (requires application restart).
 * **Destroy Windows when Hidden (`destroy-windows-on-hide`):** Checkbox controlling whether `OverlayWindow` and `SettingsWindow` instances and their OpenGL/GPU contexts are destroyed when hidden or closed (`true`), or kept resident in memory for instantaneous zero-latency display (`false`).
-
-
 3. **Overlay Theme & Appearance:** Overlay Opacity slider (`overlay_opacity`), Accent Color hex input (`accent_color_hex`), and test overlay trigger buttons (`Test Break Screen`, `Test HUD Toast`, `Test HUD Timer`, `Test 24h Stats HUD` — all disabled when `ui-locked-by-strict` is active).
 4. **Activity Statistics & 24h HUD Configuration:** Daily Target Screen Time (`daily_screentime_target_minutes`), Excessive Threshold (`threshold_excessive_minutes`), and Histogram Strftime Code (`histogram_time_format`) with live preview validation.
+5. **Configuration Backup & Transfer:** Dedicated card with **Export Config...** and **Import Config...** buttons (disabled during active strict mode via `ui-locked-by-strict`). Exports the active configuration via `rfd::FileDialog` to `.toml` format; imports external `.toml` files, runs full validation (`load_from_path`), synchronizes the UI and live telemetry, and marks `has-unsaved-changes = true` for user review before committing.
 
 ### B. Tab 1: Rule Child Tab Sections & Conditional Visibility Matrix (`active-tab == 1 && selected-rule-idx >= 0`)
 
@@ -339,7 +352,7 @@ Adding a rule (`on_add_rule`) scans existing rules in `rules_model` to generate 
 | **Break Duration:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-action == "Show Overlay"`** | Required physical idle duration to complete the full-screen break overlay. |
 | **Click-through Overlay:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Applies `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` so mouse/keyboard pass through the overlay. |
 | **Strict Mode:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Hides Skip/Snooze buttons on the overlay and locks tray bypasses & settings edits behind a 15s confirmation delay while enforcing. |
-| **Message Template & Formatting Toolbar** | `TextEdit` + Gutter + Toolbar + `FormattedText` Preview | **`cur-action == "Show Overlay" || cur-action == "Show Notification"`** | Hosted in a dedicated sub-card inside Section 4 with rich formatted message editor, toolbar, line gutter, and live formatted preview. Dynamically formats preview placeholders (`{session_duration}`, `{break_time}`, `{limit}`, `{remaining}`) with concise units (e.g. `"50m"`, `"10m"`, `"1h"`, `"5m"`) matching runtime overlay formatting, with text alignment matching notification (left) and overlay (center) actions. |
+| **Message Template & Formatting Toolbar** | `TextEdit` + Gutter + Toolbar + `FormattedText` Preview | **`cur-action == "Show Overlay" || cur-action == "Show Notification" || root.rule-warn-before-val > 0 || root.rule-grace-val > 0`** | Hosted in a dedicated sub-card inside Section 4 with rich formatted message editor, toolbar, line gutter, and live formatted preview. Allows configuring custom alert templates for quota enforcement actions (`Close Window`, `Close Tab`, `Kill Process`, `Lock Workstation`) in addition to Break and Notification actions. Dynamically formats preview placeholders (`{session_duration}`, `{break_time}`, `{limit}`, `{remaining}`) with concise units matching runtime overlay formatting. |
 
 ### Section 5: Active Hours Schedule
 
@@ -383,7 +396,7 @@ For each enabled rule active in the current `(day_index, hour_index)` schedule s
 
 2. **Stage 1 — Pre-Action Warning (`warn_before > 0`):**
 * When `threshold > 0 && warn_secs > 0 && warn_secs < threshold && elapsed >= threshold - warn_secs && elapsed < threshold`:
-* Fires a pre-action warning once per cycle/day (`warned_current_cycle = true`).
+* Fires a pre-action warning once per cycle/day (`warned_current_cycle = true`). For `ShowNotification`, `CloseWindow`, `CloseTab`, `KillProcess`, and `LockWorkstation`, uses `&rule.message` whenever configured (falling back to default warning text if empty). For `ShowOverlay`, dispatches a clear upcoming-break countdown toast to keep pre-break warnings and fullscreen break screens distinct.
 
 
 3. **Stage 2 — Grace Countdown (`grace_duration > 0`):**
