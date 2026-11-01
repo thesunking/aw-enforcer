@@ -21,13 +21,15 @@
     - **`Kill Process`:** Terminates matching background and foreground processes (restricted to rules targeting specific `.exe` names).
 
 - **Three-Stage Enforcement Pipeline:**
-  1. **Stage 1 — Pre-Action Warning (`Warn Before Action`):** Alerts you ahead of time (via HUD toast or Windows notification) before a break or quota enforcement triggers.
-  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. For URL and executable rules, closing or navigating away from the target tab or app during the grace period safely aborts destructive actions.
-  3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes. Newly spawned HUD cards retain their full duration without same-tick countdown decrement.
+  1. **Stage 1 — Pre-Action Warning (`Warn Before Action`):** Alerts you ahead of time (via HUD toast or Windows notification) before a break or quota enforcement triggers. Snoozing a warning preserves cycle state so snooze expiration does not re-emit duplicate warnings for the same cycle while below threshold.
+  2. **Stage 2 — Grace Countdown (`Grace Countdown`):** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. For URL and executable rules, closing or navigating away from the target tab or app during the grace period safely aborts destructive actions (continuously refreshing tab titles during in-site navigation, such as single-page app browsing).
+  3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes. Newly spawned HUD cards and break overlays retain their full duration without same-tick countdown decrement, with initial progress bar ratios correctly rendered immediately on launch.
 
 - **Ergonomic, Shell & Anti-Bypass Safeguards:**
   - **Single-Instance IPC, Window Activation & Tray UX:** Enforces a persistent Win32 mutex (`Local\AW_Enforcer_SingleInstance_Mutex`) and signals a named Win32 event (`Local\AW_Enforcer_Activate_Event`) when a second instance is launched, automatically restoring and focusing the running instance's Settings window. Double-clicking the system tray icon immediately opens or restores the Settings window. The tray tooltip displays live snooze countdowns (e.g., `AW-Enforcer (Snoozed 15m) — Today: 2h 15m`), and rule status badges in the overview display `"Snoozed ({rem}m)"` during active snoozes.
-  - **Double-Counting Prevention (Interval Coalescing):** Automatically sorts and merges overlapping or adjacent ActivityWatch events (`merge_overlapping_intervals`) across continuous session calculations, cumulative daily usage quotas, and 24-hour histogram binning.
+  - **Dynamic Multi-Browser Web Discovery & Periodic Refresh:** `AwClient` discovers local `aw-watcher-web*` buckets across Chrome, Edge, Firefox, and Brave, periodically refreshing bucket discovery every 60 seconds to detect newly opened browsers on the fly while strictly ignoring synchronized remote buckets (`-synced` and `_synced`).
+  - **Resilient Local Bucket Selection:** When multiple local window or AFK buckets exist (e.g. after computer renames), automatically compares `last_updated` and `created` metadata timestamps and local machine hostname (`COMPUTERNAME`) to select the active bucket deterministically.
+  - **Double-Counting Prevention & Event Recency Ordering:** Automatically sorts and merges overlapping or adjacent ActivityWatch events (`merge_overlapping_intervals`) across continuous session calculations, cumulative daily usage quotas, and 24-hour histogram binning. Evaluates event recency based on `(event_end_utc, timestamp)` to ensure active sessions are never masked by shorter, already-ended background intervals.
   - **Idle-Aware Break Timer:** Full-screen breaks wait for a natural 1.5-second pause in typing/mouse movement before appearing and pause their countdown (`⏸ Input detected — timer paused until you step away`) whenever physical input is detected.
   - **Fullscreen / D3D Presentation Suppression:** Optionally detects fullscreen Direct3D games, presentations, or Windows Focus Assist (`SHQueryUserNotificationState`) and downgrades intrusive overlays to passive notifications.
   - **Strict Mode & Top-Priority Break Lockout:** When enabled on a `Show Overlay` rule, gives `BreakEnforcer` the highest overlay priority (preventing grace timers or test cards from replacing it), hides Skip/Snooze buttons on the break screen, disables system tray and command bypasses, and requires a 15-second confirmation countdown before unlocking settings edits during an active break.
@@ -36,8 +38,10 @@
   - **Pause All Rules Indefinitely:** Toggleable from both General Settings (`pause_all_rules`) and the system tray context menu (`Pause All Rules` / `Resume All Rules`).
   - **Click-Through Overlays:** Optionally allows mouse clicks and keystrokes to pass through the `Show Overlay` screen (`WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`).
 
-- **Display, HiDPI & DWM Compositing:**
+- **Display, HiDPI, Multi-Monitor & DWM Compositing:**
   - **DPI-Aware Overlay Sizing:** Dynamically reads window scale factors to scale HUD card geometry and screen margins accurately on high-DPI displays.
+  - **Multi-Monitor Hotplug & Resolution Sync:** Dynamically detects monitor connects, disconnects, and resolution changes during active full-screen breaks (`apply_pending_win32_styles`), automatically re-covering all displays without user intervention.
+  - **Deduplicated Win32 Placement:** Batches window styling, DWM blur-behind, geometry, and visibility into a single authoritative update pipeline, eliminating redundant positioning pre-calls and flickering.
   - **DWM Client Frame Reset:** Properly resets DWM frame client margins (`DwmExtendFrameIntoClientArea`) on reused overlay windows when transitioning from fullscreen break overlays to HUD cards.
 
 - **Performance & Idle Memory Optimization:**
@@ -52,9 +56,12 @@
 
 - **Rich Message Editor & Live Preview:**
   - Customize break and notification messages with Markdown headings (`#`, `##`) with full inline formatting attribute support (e.g. `# [color=#38bdf8 italic] Heading`), line-level styling (`[bold italic underline color=#38bdf8 size=18]`), and dynamic runtime placeholders: `{rule_name}`, `{app}` (retaining URL hostnames for URL rules), `{session_duration}`, `{break_time}`, `{used}`, `{limit}`, and `{remaining}`.
+  - **Live Preview Placeholder & Alignment Parity:** The live message editor preview formats duration placeholders using clean short-string notation (`DurationConfig::to_short_string()`, e.g. `"50m"`, `"10m"`, `"1h"`, `"5m"`) matching runtime overlays 1:1, formats realistic `{remaining}` quota durations, and reflects left alignment for notifications and center alignment for full-screen breaks.
   - **"Preview This Rule's Alert" Button:** Test the selected rule's exact custom template, styling, click-through, and countdown duration with one click without having to wait for actual rule thresholds.
 
 - **Interactive Rule Management & Real-Time Validation:**
+  - **Manual Executable Input & Wildcard Guidance:** In addition to browsing and selecting from active processes, `ExecutableSelector` provides a manual text input field with Enter/Add button support, automatic `.exe` suffix normalization, and case-insensitive deduplication, alongside an informative wildcard indicator (`"All applications monitored (* wildcard) — add specific .exe names below to restrict."`).
+  - **Live State & Telemetry Synchronization:** Reopening a cached Settings window immediately synchronizes current active apps, session duration, screentime, and per-rule live status badges from cached engine state, and restores live status badges upon discarding unsaved changes.
   - **Multi-Rule Syntax Validation:** Live regex syntax checking on `Titles` and `Urls` rules with real-time error messages in the editor and an aggregate warning banner in the left sidebar above `Save & Apply Changes`.
   - **Overview Rule Management (Toggle, Duplicate & Delete):** Toggle rule activation directly from the Overview list via two-way bindings, duplicate rules with all properties cloned and view automatically switched to the new rule's editor, and revalidate regexes on rule deletion to instantly clear blocking validation errors.
   - **7×24 Weekly Active Hours Schedule:** Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
