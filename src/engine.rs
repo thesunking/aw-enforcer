@@ -1371,7 +1371,11 @@ impl Engine {
                             if let Some(ref title) = ev.data.title {
                                 if !title.trim().is_empty() {
                                     rt.set_last_matched_title(Some(title.clone()));
+                                } else {
+                                    rt.set_last_matched_title(None);
                                 }
+                            } else {
+                                rt.set_last_matched_title(None);
                             }
                         } else {
                             rt.last_matched_app = None;
@@ -1459,7 +1463,11 @@ impl Engine {
                 if let Some(ref title) = ev.data.title {
                     if !title.trim().is_empty() {
                         rt.set_last_matched_title(Some(title.clone()));
+                    } else {
+                        rt.set_last_matched_title(None);
                     }
+                } else {
+                    rt.set_last_matched_title(None);
                 }
             }
         }
@@ -2153,21 +2161,6 @@ pub fn find_matching_window_for_rule(
             if let Some(ev) = latest_ev {
                 let ev_end = event_end_utc(ev);
                 if ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re) {
-                    let matched_browser = if let Some(ref title) = ev.data.title {
-                        if !title.trim().is_empty() {
-                            let title_re = Regex::new(&regex::escape(title)).ok();
-                            enforcer::find_matching_window(
-                                enforcer::BROWSER_EXES,
-                                title_re.as_ref(),
-                            )
-                            .unwrap_or(browser_match)
-                        } else {
-                            browser_match
-                        }
-                    } else {
-                        browser_match
-                    };
-
                     Some(
                         ev.data
                             .url
@@ -2182,7 +2175,7 @@ pub fn find_matching_window_for_rule(
                                     .to_string()
                             })
                             .or_else(|| ev.data.url.clone())
-                            .unwrap_or(matched_browser),
+                            .unwrap_or(browser_match),
                     )
                 } else {
                     None
@@ -2195,7 +2188,18 @@ pub fn find_matching_window_for_rule(
             if rule.target_executables.is_empty()
                 || rule.target_executables.iter().any(|t| t.trim() == "*")
             {
-                Some("Active Application".to_string())
+                let fg_app = enforcer::get_foreground_app_name();
+                if matches!(rule.action, RuleAction::CloseWindow | RuleAction::CloseTab) {
+                    fg_app
+                } else {
+                    let latest_app = events
+                        .iter()
+                        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                        .and_then(|ev| ev.data.app.clone());
+                    fg_app
+                        .or(latest_app)
+                        .or_else(|| Some("Active Application".to_string()))
+                }
             } else {
                 enforcer::find_matching_window(&rule.target_executables, None)
             }
@@ -3959,6 +3963,85 @@ mod tests {
         let rt_done = engine.runtimes.get("rule-urls-nav-away").unwrap();
         assert_eq!(rt_done.grace_countdown, None);
         assert!(rt_done.action_executed_today);
+    }
+
+    #[tokio::test]
+    async fn test_urls_rule_clears_stale_title_when_newer_matching_event_has_empty_title() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-clear-title".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.action = RuleAction::CloseTab;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // 1. Test during active grace countdown: previous title is set, then newer matching event has empty/whitespace title
+        let rt = engine.runtimes.get_mut("rule-urls-clear-title").unwrap();
+        rt.grace_countdown = Some((3, 5));
+        rt.last_matched_app = Some("youtube.com".to_string());
+        rt.set_last_matched_title(Some("Stale Video - YouTube".to_string()));
+        assert_eq!(rt.last_matched_title.as_deref(), Some("Stale Video - YouTube"));
+        assert!(rt.last_matched_title_regex.is_some());
+
+        let ev_empty_title = make_event(
+            now_utc - Duration::seconds(1),
+            2.0,
+            "chrome.exe",
+            "   ",
+            "https://www.youtube.com/watch?v=empty_title",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[ev_empty_title.clone()],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_after_grace = engine.runtimes.get("rule-urls-clear-title").unwrap();
+        assert_eq!(rt_after_grace.last_matched_title, None);
+        assert!(rt_after_grace.last_matched_title_regex.is_none());
+
+        // 2. Test during normal evaluation (without grace countdown):
+        if enforcer::find_matching_window(enforcer::BROWSER_EXES, None).is_some() {
+            let rt_mut = engine.runtimes.get_mut("rule-urls-clear-title").unwrap();
+            rt_mut.grace_countdown = None;
+            rt_mut.set_last_matched_title(Some("Another Stale Title - YouTube".to_string()));
+            assert_eq!(rt_mut.last_matched_title.as_deref(), Some("Another Stale Title - YouTube"));
+            assert!(rt_mut.last_matched_title_regex.is_some());
+
+            engine
+                .evaluate_rule(
+                    &rule,
+                    re.as_ref(),
+                    now,
+                    &[ev_empty_title],
+                    start_of_day_utc,
+                    now_utc,
+                )
+                .await;
+
+            let rt_after_normal = engine.runtimes.get("rule-urls-clear-title").unwrap();
+            assert_eq!(rt_after_normal.last_matched_title, None);
+            assert!(rt_after_normal.last_matched_title_regex.is_none());
+        }
     }
 
     #[tokio::test]

@@ -30,7 +30,45 @@ pub const BROWSER_EXES: &[&str] = &[
     "brave.exe",
     "opera.exe",
     "vivaldi.exe",
+    "chromium.exe",
+    "arc.exe",
+    "zen.exe",
+    "librewolf.exe",
+    "waterfox.exe",
+    "floorp.exe",
+    "thorium.exe",
 ];
+
+/// Returns the process executable name (or non-empty title fallback) of the current foreground window,
+/// returning None if there is no foreground window, or if it is a protected shell / application window.
+pub fn get_foreground_app_name() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if is_protected_window(hwnd) {
+            return None;
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if let Some(exe_name) = get_process_name_by_pid(pid) {
+            if !exe_name.trim().is_empty() {
+                return Some(exe_name);
+            }
+        }
+
+        let mut title_buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
+        if len > 0 {
+            let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        None
+    }
+}
 
 /// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`).
 pub fn exe_name_matches_targets<S: AsRef<str>>(
@@ -236,6 +274,10 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
         None => false,
     };
 
+    if ctx.compiled_regex.is_some() && !title_matches {
+        return 1;
+    }
+
     let mut exe_name_opt: Option<String> = None;
     let exe_matches = if ctx.has_exe_targets {
         let mut pid: u32 = 0;
@@ -413,6 +455,10 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
             false
         };
 
+        if compiled_regex.is_some() && !title_matches {
+            return false;
+        }
+
         let exe_matches = if has_exe_targets {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
@@ -487,6 +533,13 @@ mod tests {
         assert!(exe_name_matches_targets("CHROME.EXE", BROWSER_EXES));
         assert!(exe_name_matches_targets("msedge.exe", BROWSER_EXES));
         assert!(exe_name_matches_targets("firefox.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("chromium.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("arc.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("zen.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("librewolf.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("waterfox.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("floorp.exe", BROWSER_EXES));
+        assert!(exe_name_matches_targets("thorium.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("notepad.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("code.exe", BROWSER_EXES));
 
