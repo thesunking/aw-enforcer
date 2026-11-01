@@ -12,6 +12,11 @@ pub fn is_local_bucket(key: &str) -> bool {
     !key.contains("-synced") && !key.contains("_synced")
 }
 
+/// Escapes backslashes and double quotes in bucket IDs for safe interpolation into aw-server query strings.
+pub fn escape_bucket_id(id: &str) -> String {
+    id.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Helper to parse an ISO 8601 / RFC 3339 timestamp from a JSON value field.
 fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
     val.get(field)
@@ -164,6 +169,7 @@ impl AwClient {
     /// Fetches all buckets from `/api/0/buckets/`, updates cached window, afk, and web bucket IDs,
     /// and sets `buckets_verified` if both window and afk buckets exist.
     pub async fn refresh_buckets(&self) -> bool {
+        *self.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
         let url = format!("{}/api/0/buckets/", self.base_url);
         let resp = match self.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
@@ -229,11 +235,11 @@ impl AwClient {
         let afk_bucket = self.afk_bucket_id.read().await.clone();
 
         let window_line = match window_bucket {
-            Some(ref id) => format!("events = flood(query_bucket(\"{id}\"));"),
+            Some(ref id) => format!("events = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
             None => "events = flood(query_bucket(find_bucket(\"aw-watcher-window_\")));".to_string(),
         };
         let afk_line = match afk_bucket {
-            Some(ref id) => format!("not_afk = flood(query_bucket(\"{id}\"));"),
+            Some(ref id) => format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
             None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
         };
 
@@ -277,11 +283,11 @@ impl AwClient {
         let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
 
         let web_expr = if web_buckets.len() == 1 {
-            format!("query_bucket(\"{}\")", web_buckets[0])
+            format!("query_bucket(\"{}\")", escape_bucket_id(&web_buckets[0]))
         } else {
             let concat_args = web_buckets
                 .iter()
-                .map(|b| format!("query_bucket(\"{b}\")"))
+                .map(|b| format!("query_bucket(\"{}\")", escape_bucket_id(b)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("sort_by_timestamp(concat({concat_args}))")
@@ -290,7 +296,7 @@ impl AwClient {
 
         let afk_bucket = self.afk_bucket_id.read().await.clone();
         let afk_line = match afk_bucket {
-            Some(ref id) => format!("not_afk = flood(query_bucket(\"{id}\"));"),
+            Some(ref id) => format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(id)),
             None => "not_afk = flood(query_bucket(find_bucket(\"aw-watcher-afk_\")));".to_string(),
         };
 
@@ -554,5 +560,14 @@ mod tests {
 
         let selected = select_best_bucket("aw-watcher-window_", buckets);
         assert_eq!(selected.as_deref(), Some("aw-watcher-window_LATER"));
+    }
+
+    #[test]
+    fn test_escape_bucket_id() {
+        assert_eq!(escape_bucket_id("aw-watcher-window_HOST"), "aw-watcher-window_HOST");
+        assert_eq!(
+            escape_bucket_id("aw-watcher-web-chrome_\"test\"\\pc"),
+            "aw-watcher-web-chrome_\\\"test\\\"\\\\pc"
+        );
     }
 }

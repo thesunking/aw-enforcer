@@ -159,6 +159,31 @@ pub fn lock_workstation() -> bool {
     unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
 }
 
+/// Returns true if the UTF-16 class name corresponds to a protected Windows shell class without heap allocation.
+pub fn is_protected_window_class(class_name: &[u16]) -> bool {
+    const PROGMAN: &[u16] = &[
+        b'P' as u16, b'r' as u16, b'o' as u16, b'g' as u16, b'm' as u16, b'a' as u16, b'n' as u16,
+    ];
+    const WORKERW: &[u16] = &[
+        b'W' as u16, b'o' as u16, b'r' as u16, b'k' as u16, b'e' as u16, b'r' as u16, b'W' as u16,
+    ];
+    const SHELL_TRAY: &[u16] = &[
+        b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'_' as u16,
+        b'T' as u16, b'r' as u16, b'a' as u16, b'y' as u16, b'W' as u16, b'n' as u16, b'd' as u16,
+    ];
+    const SHELL_SECONDARY_TRAY: &[u16] = &[
+        b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'_' as u16,
+        b'S' as u16, b'e' as u16, b'c' as u16, b'o' as u16, b'n' as u16, b'd' as u16,
+        b'a' as u16, b'r' as u16, b'y' as u16, b'T' as u16, b'r' as u16, b'a' as u16,
+        b'y' as u16, b'W' as u16, b'n' as u16, b'd' as u16,
+    ];
+
+    class_name == PROGMAN
+        || class_name == WORKERW
+        || class_name == SHELL_TRAY
+        || class_name == SHELL_SECONDARY_TRAY
+}
+
 /// Returns true if the window is invalid, invisible, minimized, owned by current process, or a Windows shell surface.
 unsafe fn is_protected_window(hwnd: HWND) -> bool {
     if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
@@ -173,12 +198,8 @@ unsafe fn is_protected_window(hwnd: HWND) -> bool {
 
     let mut class_buf = [0u16; 256];
     let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
-    if len > 0 {
-        let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
-        match class_name.as_str() {
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" => return true,
-            _ => {}
-        }
+    if len > 0 && is_protected_window_class(&class_buf[..len as usize]) {
+        return true;
     }
 
     false
@@ -488,5 +509,20 @@ mod tests {
         assert!(!has_specific_targets(&["*"]));
         assert!(!has_specific_targets(&["", "   "]));
         assert!(!has_specific_targets::<&str>(&[]));
+    }
+
+    #[test]
+    fn test_is_protected_window_class() {
+        let to_u16 = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+
+        assert!(is_protected_window_class(&to_u16("Progman")));
+        assert!(is_protected_window_class(&to_u16("WorkerW")));
+        assert!(is_protected_window_class(&to_u16("Shell_TrayWnd")));
+        assert!(is_protected_window_class(&to_u16("Shell_SecondaryTrayWnd")));
+
+        assert!(!is_protected_window_class(&to_u16("Notepad")));
+        assert!(!is_protected_window_class(&to_u16("Chrome_WidgetWin_1")));
+        assert!(!is_protected_window_class(&to_u16("ProgmanExtra")));
+        assert!(!is_protected_window_class(&[]));
     }
 }

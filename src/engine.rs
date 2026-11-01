@@ -634,6 +634,7 @@ impl Engine {
                 self.overlay_tx
                     .send(OverlayAction::UpdateTheme(self.config.overlay.clone()))
                     .ok();
+                self.poll_tick().await;
             }
             DaemonCommand::TriggerTestOverlay { mode } => {
                 if self.is_strict_lock_active(Local::now()) {
@@ -3190,8 +3191,10 @@ mod tests {
         let mut new_cfg3 = AppConfig::default();
         let mut rule_a = Rule::default_template(0);
         rule_a.id = "rule-a".to_string();
+        rule_a.schedule = RuleSchedule::from_bool_array(&[true; 168]);
         let mut rule_b = Rule::default_template(1);
         rule_b.id = "rule-b".to_string();
+        rule_b.schedule = RuleSchedule::from_bool_array(&[true; 168]);
         new_cfg3.rules = vec![rule_a.clone(), rule_b.clone()];
         engine.handle_command(DaemonCommand::ReloadConfig(Box::new(new_cfg3))).await;
 
