@@ -1325,6 +1325,7 @@ fn open_settings_window(
             } else if let Some(win) = slot_inner.borrow().as_ref() {
                 apply_config_to_ui(win, &cfg_for_close.borrow(), &rm_inner);
                 win.set_strict_unlock_countdown(0);
+                win.set_strict_unlocked(false);
             }
             slint::CloseRequestResponse::HideWindow
         });

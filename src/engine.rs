@@ -548,11 +548,8 @@ impl Engine {
                 }
                 let now = Local::now();
                 for rt in self.runtimes.values_mut() {
-                    if rt.active_break.is_some() {
+                    if rt.active_break.is_some() || rt.pending_break_since.is_some() {
                         rt.complete_cycle(now);
-                    } else if rt.pending_break_since.is_some() {
-                        rt.warned_current_cycle = false;
-                        rt.pending_break_since = None;
                     }
                 }
                 self.hide_overlay();
@@ -2104,7 +2101,7 @@ pub fn calculate_continuous_session_for_rule(
             } else {
                 ev.timestamp
             };
-            let end_utc = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+            let end_utc = (ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64)).min(now_utc);
             if end_utc > start_utc {
                 Some((start_utc, end_utc))
             } else {
@@ -2123,7 +2120,7 @@ pub fn calculate_continuous_session_for_rule(
         return 0;
     }
 
-    let mut session_seconds = 0i64;
+    let mut session_millis = 0i64;
     let mut prev_start: Option<DateTime<Utc>> = None;
 
     for (start, end) in merged.iter().rev() {
@@ -2133,11 +2130,11 @@ pub fn calculate_continuous_session_for_rule(
                 break;
             }
         }
-        session_seconds += (*end - *start).num_milliseconds() / 1000;
+        session_millis += (*end - *start).num_milliseconds();
         prev_start = Some(*start);
     }
 
-    session_seconds.max(0) as u32
+    ((session_millis.max(0) as f64) / 1000.0).round() as u32
 }
 
 /// Calculates total active usage seconds for a rule from a list of events.
@@ -2267,6 +2264,42 @@ mod tests {
             None,
         );
         assert_eq!(session, 1200);
+    }
+
+    #[test]
+    fn test_continuous_session_subsecond_interval_accumulation() {
+        let now = Local.with_ymd_and_hms(2026, 10, 29, 12, 0, 0).unwrap();
+        let now_utc = now.with_timezone(&Utc);
+        let rule = Rule::default_template(0);
+        let reset_gap_secs = 300;
+
+        // Three 800ms intervals = 2400ms. In old code each did 800/1000 = 0.
+        // With millisecond accumulation: 2400ms -> 2 seconds.
+        let ev1 = make_event(now_utc - Duration::milliseconds(2400), 0.8, "code.exe", "", "");
+        let ev2 = make_event(now_utc - Duration::milliseconds(1600), 0.8, "code.exe", "", "");
+        let ev3 = make_event(now_utc - Duration::milliseconds(800), 0.8, "code.exe", "", "");
+
+        let session = calculate_continuous_session_for_rule(
+            &[ev1, ev2, ev3],
+            now,
+            None,
+            reset_gap_secs,
+            &rule,
+            None,
+        );
+        assert_eq!(session, 2);
+
+        // Also verify clamping to now_utc: event starts 1s ago with duration 10s (extends into future)
+        let ev_future = make_event(now_utc - Duration::seconds(1), 10.0, "code.exe", "", "");
+        let session_clamped = calculate_continuous_session_for_rule(
+            &[ev_future],
+            now,
+            None,
+            reset_gap_secs,
+            &rule,
+            None,
+        );
+        assert_eq!(session_clamped, 1);
     }
 
     /// Verifies `calculate_usage_for_rule` clips cross-boundary events at `start_of_day_utc` and matches executables/URLs.
@@ -2421,6 +2454,31 @@ mod tests {
         let rt3 = engine.runtimes.get(&rule_id).unwrap();
         assert!(rt3.action_executed_today);
         assert!(rt3.active_break.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_break_overlay_completes_cycle_when_pending_break_active() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.rules = vec![Rule::default_template(0)];
+        let rule_id = cfg.rules[0].id.clone();
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        if let Some(rt) = engine.runtimes.get_mut(&rule_id) {
+            rt.pending_break_since = Some(now - Duration::seconds(1));
+            rt.warned_current_cycle = true;
+            rt.action_executed_today = false;
+        }
+
+        engine.handle_command(DaemonCommand::DismissBreakOverlay).await;
+
+        let rt = engine.runtimes.get(&rule_id).unwrap();
+        assert!(rt.pending_break_since.is_none());
+        assert!(rt.last_completed_at.is_some());
+        assert!(rt.action_executed_today);
+        assert!(!rt.warned_current_cycle);
     }
 
     #[tokio::test]
