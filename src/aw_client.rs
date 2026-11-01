@@ -4,12 +4,80 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Predicate checking if an ActivityWatch bucket key represents a local (non-synchronized) bucket.
 pub fn is_local_bucket(key: &str) -> bool {
     !key.contains("-synced") && !key.contains("_synced")
+}
+
+/// Helper to parse an ISO 8601 / RFC 3339 timestamp from a JSON value field.
+fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
+    val.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Selects the best bucket matching `prefix` among candidate local buckets.
+///
+/// When multiple local buckets exist (e.g. following a hostname change), metadata is inspected:
+/// 1. Prefer the bucket with the latest effective timestamp (`last_updated` or `created`).
+/// 2. If effective timestamps are equal, prefer the one with `last_updated`.
+/// 3. If timestamps are still equal or missing, prefer a bucket matching the local machine hostname (`COMPUTERNAME`).
+/// 4. Fall back to deterministic ascending lexicographical key order.
+pub fn select_best_bucket<'a>(
+    prefix: &str,
+    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<String> {
+    let local_hostname = std::env::var("COMPUTERNAME").ok();
+
+    struct Candidate<'a> {
+        key: &'a str,
+        effective_time: Option<DateTime<Utc>>,
+        last_updated: Option<DateTime<Utc>>,
+        hostname_matches: bool,
+    }
+
+    let mut candidates: Vec<Candidate<'a>> = buckets
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(prefix) && is_local_bucket(key))
+        .map(|(key, val)| {
+            let last_updated = parse_bucket_time(val, "last_updated");
+            let created = parse_bucket_time(val, "created");
+            let effective_time = last_updated.or(created);
+
+            let hostname_matches = if let Some(ref local_h) = local_hostname {
+                val.get("hostname")
+                    .and_then(|h| h.as_str())
+                    .map_or(false, |h| h.eq_ignore_ascii_case(local_h))
+            } else {
+                false
+            };
+
+            Candidate {
+                key,
+                effective_time,
+                last_updated,
+                hostname_matches,
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.effective_time
+            .cmp(&a.effective_time)
+            .then_with(|| b.last_updated.cmp(&a.last_updated))
+            .then_with(|| b.hostname_matches.cmp(&a.hostname_matches))
+            .then_with(|| a.key.cmp(b.key))
+    });
+
+    candidates.first().map(|c| c.key.to_string())
 }
 
 /// Typed payload for ActivityWatch window, web, and afk events.
@@ -90,22 +158,24 @@ impl AwClient {
         if self.buckets_verified.load(Ordering::Relaxed) {
             return true;
         }
+        self.refresh_buckets().await
+    }
 
+    /// Fetches all buckets from `/api/0/buckets/`, updates cached window, afk, and web bucket IDs,
+    /// and sets `buckets_verified` if both window and afk buckets exist.
+    pub async fn refresh_buckets(&self) -> bool {
         let url = format!("{}/api/0/buckets/", self.base_url);
         let resp = match self.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
-            _ => return false,
+            _ => {
+                self.buckets_verified.store(false, Ordering::Relaxed);
+                return false;
+            }
         };
 
         if let Ok(Value::Object(map)) = resp.json::<Value>().await {
-            let window_bucket = map
-                .keys()
-                .find(|k| k.starts_with("aw-watcher-window_") && is_local_bucket(k))
-                .cloned();
-            let afk_bucket = map
-                .keys()
-                .find(|k| k.starts_with("aw-watcher-afk_") && is_local_bucket(k))
-                .cloned();
+            let window_bucket = select_best_bucket("aw-watcher-window_", map.iter().map(|(k, v)| (k.as_str(), v)));
+            let afk_bucket = select_best_bucket("aw-watcher-afk_", map.iter().map(|(k, v)| (k.as_str(), v)));
             let mut web_buckets: Vec<String> = map
                 .keys()
                 .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
@@ -133,9 +203,11 @@ impl AwClient {
                 self.buckets_verified.store(true, Ordering::Relaxed);
                 true
             } else {
+                self.buckets_verified.store(false, Ordering::Relaxed);
                 false
             }
         } else {
+            self.buckets_verified.store(false, Ordering::Relaxed);
             false
         }
     }
@@ -181,18 +253,15 @@ impl AwClient {
 
     /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
-        let mut should_refresh = !self.buckets_verified.load(Ordering::Relaxed);
-        if !should_refresh && !self.has_web_bucket.load(Ordering::Relaxed) {
+        let is_verified = self.buckets_verified.load(Ordering::Relaxed);
+        let elapsed_60s = {
             let last_check = *self.last_web_bucket_check.lock().unwrap();
-            if last_check.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(60)) {
-                should_refresh = true;
-                self.buckets_verified.store(false, Ordering::Relaxed);
-            }
-        }
+            last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
+        };
 
-        if should_refresh {
+        if !is_verified || elapsed_60s {
             *self.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
-            self.has_required_buckets().await;
+            self.refresh_buckets().await;
         }
 
         if !self.has_web_bucket.load(Ordering::Relaxed) {
@@ -416,5 +485,74 @@ mod tests {
         assert_eq!(parsed_events[0].data.app.as_deref(), Some("firefox.exe"));
         assert_eq!(parsed_events[0].data.title.as_deref(), Some("Rust Documentation"));
         assert_eq!(parsed_events[0].data.url.as_deref(), Some("https://doc.rust-lang.org"));
+    }
+
+    #[test]
+    fn test_select_best_bucket_prefers_latest_timestamp() {
+        let val_old = serde_json::json!({
+            "id": "aw-watcher-window_OLD-PC",
+            "hostname": "OLD-PC",
+            "created": "2026-09-01T10:00:00Z",
+            "last_updated": "2026-10-01T10:00:00Z"
+        });
+        let val_new = serde_json::json!({
+            "id": "aw-watcher-window_NEW-PC",
+            "hostname": "NEW-PC",
+            "created": "2026-10-15T10:00:00Z",
+            "last_updated": "2026-11-01T10:00:00Z"
+        });
+        let val_synced = serde_json::json!({
+            "id": "aw-watcher-window_FUTURE-synced",
+            "hostname": "FUTURE",
+            "created": "2026-11-02T10:00:00Z",
+            "last_updated": "2026-11-02T10:00:00Z"
+        });
+
+        let buckets = [
+            ("aw-watcher-window_OLD-PC", &val_old),
+            ("aw-watcher-window_FUTURE-synced", &val_synced),
+            ("aw-watcher-window_NEW-PC", &val_new),
+        ];
+
+        let selected = select_best_bucket("aw-watcher-window_", buckets);
+        assert_eq!(selected.as_deref(), Some("aw-watcher-window_NEW-PC"));
+    }
+
+    #[test]
+    fn test_select_best_bucket_fallback_lexicographical() {
+        let val1 = serde_json::json!({
+            "created": "2026-10-01T10:00:00Z",
+            "last_updated": "2026-10-01T10:00:00Z"
+        });
+        let val2 = serde_json::json!({
+            "created": "2026-10-01T10:00:00Z",
+            "last_updated": "2026-10-01T10:00:00Z"
+        });
+
+        let buckets = [
+            ("aw-watcher-afk_ZED", &val1),
+            ("aw-watcher-afk_ALPHA", &val2),
+        ];
+
+        let selected = select_best_bucket("aw-watcher-afk_", buckets);
+        assert_eq!(selected.as_deref(), Some("aw-watcher-afk_ALPHA"));
+    }
+
+    #[test]
+    fn test_select_best_bucket_created_timestamp_when_no_last_updated() {
+        let val_old = serde_json::json!({
+            "created": "2026-10-01T10:00:00Z"
+        });
+        let val_new = serde_json::json!({
+            "created": "2026-10-25T10:00:00Z"
+        });
+
+        let buckets = [
+            ("aw-watcher-window_EARLY", &val_old),
+            ("aw-watcher-window_LATER", &val_new),
+        ];
+
+        let selected = select_best_bucket("aw-watcher-window_", buckets);
+        assert_eq!(selected.as_deref(), Some("aw-watcher-window_LATER"));
     }
 }
