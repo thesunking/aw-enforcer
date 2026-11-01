@@ -446,10 +446,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_close_target_windows_empty_targets_no_wildcard() {
-        // Must return 0 and not close foreground window
-        let closed = close_target_windows::<&str>(&[], None);
-        assert_eq!(closed, 0);
+    fn test_safety_guards_empty_and_wildcard_targets() {
+        // Empty targets or empty title regex must safely return 0 without actions
+        assert_eq!(close_target_windows::<&str>(&[], None), 0);
+        assert!(!close_active_browser_tab::<&str>(&[], None));
+
+        // kill_target_processes must refuse to terminate on empty or wildcard targets
+        assert_eq!(kill_target_processes::<&str>(&[]), 0);
+        assert_eq!(kill_target_processes(&["*"]), 0);
+        assert_eq!(kill_target_processes(&["", "   ", "*"]), 0);
     }
 
     #[test]
@@ -460,6 +465,12 @@ mod tests {
         assert!(exe_name_matches_targets("firefox.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("notepad.exe", BROWSER_EXES));
         assert!(!exe_name_matches_targets("code.exe", BROWSER_EXES));
+
+        // Test stem matching without .exe extension
+        assert!(exe_name_matches_targets("chrome.exe", &["chrome"]));
+        assert!(exe_name_matches_targets("code.exe", &["CODE"]));
+        assert!(exe_name_matches_targets("discord.exe", &["discord.exe"]));
+        assert!(!exe_name_matches_targets("notepad.exe", &["*", ""]));
     }
 
     #[test]

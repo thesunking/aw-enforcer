@@ -2005,6 +2005,14 @@ mod tests {
         let re = Regex::new(&url_rule.url_regex).ok();
         let ev_web = make_event(start_utc + Duration::minutes(10), 300.0, "chrome.exe", "Video", "https://www.youtube.com/watch?v=123");
         assert_eq!(calculate_usage_for_rule(&[ev_web], &url_rule, re.as_ref(), start_utc, now_utc), 300);
+
+        // Title regex matching
+        let mut title_rule = Rule::default_template(2);
+        title_rule.monitor_selection = MonitorSelection::Titles;
+        title_rule.title_regex = "(?i)confidential".to_string();
+        let title_re = Regex::new(&title_rule.title_regex).ok();
+        let ev_title = make_event(start_utc + Duration::minutes(20), 400.0, "word.exe", "Confidential Report", "");
+        assert_eq!(calculate_usage_for_rule(&[ev_title], &title_rule, title_re.as_ref(), start_utc, now_utc), 400);
     }
 
     /// Verifies `OverlayMode::priority` prevents lower-priority overlays from clobbering active breaks, and tests strict-mode lockout.
@@ -2434,9 +2442,31 @@ mod tests {
     }
 
     #[test]
-    fn test_close_target_windows_empty_targets_returns_zero() {
-        let closed = enforcer::close_target_windows::<&str>(&[], None);
-        assert_eq!(closed, 0);
+    fn test_merge_overlapping_intervals_comprehensive() {
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 31, 10, 0, 0).unwrap();
+        let t1 = t0 + Duration::minutes(10);
+        let t2 = t0 + Duration::minutes(20);
+        let t3 = t0 + Duration::minutes(30);
+        let t4 = t0 + Duration::minutes(40);
+
+        // 1. Empty list
+        assert!(merge_overlapping_intervals(vec![]).is_empty());
+
+        // 2. Disjoint intervals preserved
+        let disjoint = merge_overlapping_intervals(vec![(t0, t1), (t2, t3)]);
+        assert_eq!(disjoint, vec![(t0, t1), (t2, t3)]);
+
+        // 3. Overlapping intervals out of order: [t1..t3], [t0..t2] -> [t0..t3]
+        let overlapping = merge_overlapping_intervals(vec![(t1, t3), (t0, t2)]);
+        assert_eq!(overlapping, vec![(t0, t3)]);
+
+        // 4. Contained interval: [t0..t4], [t1..t2] -> [t0..t4]
+        let contained = merge_overlapping_intervals(vec![(t0, t4), (t1, t2)]);
+        assert_eq!(contained, vec![(t0, t4)]);
+
+        // 5. Adjacent intervals: [t0..t1], [t1..t2] -> [t0..t2]
+        let adjacent = merge_overlapping_intervals(vec![(t0, t1), (t1, t2)]);
+        assert_eq!(adjacent, vec![(t0, t2)]);
     }
 
     #[test]
