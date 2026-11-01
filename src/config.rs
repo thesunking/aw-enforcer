@@ -430,6 +430,18 @@ impl Rule {
             schedule: RuleSchedule::default(),
         }
     }
+
+    /// Creates a duplicate copy of `self` with a new unique `id` and a ` (Copy)` name suffix.
+    pub fn duplicate(&self, new_id: String) -> Self {
+        let mut copy = self.clone();
+        copy.id = new_id.clone();
+        if !copy.name.trim().is_empty() {
+            copy.name = format!("{} (Copy)", copy.name.trim());
+        } else {
+            copy.name = format!("Rule {}", new_id.trim_start_matches("rule-"));
+        }
+        copy
+    }
 }
 
 /// Global daemon and ActivityWatch connection settings.
@@ -902,5 +914,39 @@ mod tests {
         "#;
         let parsed_software: GeneralConfig = toml::from_str(toml_software).expect("Must parse software config");
         assert_eq!(parsed_software.slint_renderer, "software");
+    }
+
+    #[test]
+    fn test_rule_duplicate() {
+        let mut original = Rule::default_template(0);
+        original.id = "rule-1".to_string();
+        original.name = "Coding Focus".to_string();
+        original.monitor_selection = MonitorSelection::Urls;
+        original.url_regex = "github\\.com".to_string();
+        original.trigger = TriggerType::Limit;
+        original.limit = DurationConfig::new(2, TimeUnit::Hr);
+        original.action = RuleAction::CloseTab;
+        original.grace_duration = DurationConfig::new(15, TimeUnit::Sec);
+        original.message = "Time to step away from GitHub!".to_string();
+
+        let dup = original.duplicate("rule-2".to_string());
+        assert_eq!(dup.id, "rule-2");
+        assert_eq!(dup.name, "Coding Focus (Copy)");
+        assert_eq!(dup.enabled, original.enabled);
+        assert_eq!(dup.monitor_selection, MonitorSelection::Urls);
+        assert_eq!(dup.url_regex, "github\\.com");
+        assert_eq!(dup.trigger, TriggerType::Limit);
+        assert_eq!(dup.limit, DurationConfig::new(2, TimeUnit::Hr));
+        assert_eq!(dup.action, RuleAction::CloseTab);
+        assert_eq!(dup.grace_duration, DurationConfig::new(15, TimeUnit::Sec));
+        assert_eq!(dup.message, original.message);
+        assert_eq!(dup.schedule.to_bool_array(), original.schedule.to_bool_array());
+
+        // Empty name duplicate falls back to Rule {n}
+        let mut empty_name = Rule::default_template(2);
+        empty_name.name = "".to_string();
+        let dup_empty = empty_name.duplicate("rule-5".to_string());
+        assert_eq!(dup_empty.id, "rule-5");
+        assert_eq!(dup_empty.name, "Rule 5");
     }
 }

@@ -837,6 +837,37 @@ fn open_settings_window(
         });
     }
 
+    // Duplicate rule
+    {
+        let rm = rules_model.clone();
+        let sw = settings_weak.clone();
+        settings_win.on_duplicate_rule(move |idx| {
+            if let Some(win) = sw.upgrade() {
+                let u = idx as usize;
+                if u < rm.row_count() {
+                    if let Some(target) = rm.row_data(u) {
+                        let mut n = rm.row_count() + 1;
+                        while (0..rm.row_count()).any(|i| {
+                            rm.row_data(i)
+                                .map(|r| r.id.as_str() == format!("rule-{n}"))
+                                .unwrap_or(false)
+                        }) {
+                            n += 1;
+                        }
+                        let target_rule = view_to_rule(&target);
+                        let duplicated = target_rule.duplicate(format!("rule-{n}"));
+                        let rv = rule_to_view(&duplicated);
+                        let new_idx = rm.row_count();
+                        rm.push(rv.clone());
+                        win.set_selected_rule_idx(new_idx as i32);
+                        load_rule_into_editor(&win, &rv, &rm);
+                        win.set_has_unsaved_changes(true);
+                    }
+                }
+            }
+        });
+    }
+
     // Toggle rule enabled (from overview list)
     {
         let rm = rules_model.clone();

@@ -341,6 +341,7 @@ Adding a rule (`on_add_rule`) scans existing rules in `rules_model` to generate 
 
 1. **Overview Pane (`selected-rule-idx == -1`):**
    - Renders summary cards for all configured rules with reactive two-way bound checkboxes (`checked: r.enabled; toggled => root.toggle-rule-enabled(i, self.checked)`). Toggling updates `rules_model` in Rust without breaking two-way property bindings.
+   - Includes **Configure**, **Duplicate**, and **Delete** actions for each rule. Clicking **Duplicate** clones the target rule (`Rule::duplicate`), assigns a unique `id`, appends `" (Copy)"` to its name, appends it to `rules_model`, and immediately switches the view to the duplicated rule's configuration editor (`selected-rule-idx`).
    - Deleting a rule via `on_delete_rule` un-conditionally re-validates all remaining rules (`refresh_rule_regex_validation`), so deleting an invalid rule from the Overview tab immediately clears regex errors and re-enables saving.
 2. **Global Sidebar Validation Error Indicator:**
    - Displays a red warning text block (`#f87171`) above the `Save & Apply Changes` button in the sidebar footer whenever `!root.time-format-valid || !root.rule-regex-valid`:

@@ -52,7 +52,7 @@
 
 - **Interactive Rule Management & Real-Time Validation:**
   - **Multi-Rule Syntax Validation:** Live regex syntax checking on `Titles` and `Urls` rules with real-time error messages in the editor and an aggregate warning banner in the left sidebar above `Save & Apply Changes`.
-  - **Overview Rule Toggle & Deletion Safety:** Toggle rule activation directly from the Overview list via two-way bindings, and automatically revalidate regexes on rule deletion to instantly clear blocking validation errors.
+  - **Overview Rule Management (Toggle, Duplicate & Delete):** Toggle rule activation directly from the Overview list via two-way bindings, duplicate rules with all properties cloned and view automatically switched to the new rule's editor, and revalidate regexes on rule deletion to instantly clear blocking validation errors.
   - **7×24 Weekly Active Hours Schedule:** Interactive click-and-drag hourly matrix per rule with one-click presets (`Work Hours`, `Evenings`, `Select All`, `Clear All`).
 
 ---
