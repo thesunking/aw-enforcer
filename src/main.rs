@@ -34,7 +34,7 @@ use config::{
     RuleSchedule, TimeUnit, TriggerType,
 };
 use engine::{DaemonCommand, Engine, OverlayAction};
-use formatter::MessageContext;
+use formatter::{MessageContext, TextHorizontalAlignment};
 use overlay::OverlayManager;
 
 slint::include_modules!();
@@ -282,15 +282,17 @@ fn refresh_message_editor_state(
                 .unwrap_or_else(|| "ActiveApp.exe".to_string()),
         };
 
+        let p_unit = TimeUnit::from_str_lossy(r.period_unit.as_str());
+        let b_unit = TimeUnit::from_str_lossy(r.break_unit.as_str());
+        let l_unit = TimeUnit::from_str_lossy(r.limit_unit.as_str());
+        let warn_unit = TimeUnit::from_str_lossy(r.warn_before_unit.as_str());
+
         let threshold_secs = if r.trigger.as_str() == "Period" {
-            let p_unit = TimeUnit::from_str_lossy(r.period_unit.as_str());
             DurationConfig::new(r.period_val.max(0) as u32, p_unit).to_seconds()
         } else {
-            let l_unit = TimeUnit::from_str_lossy(r.limit_unit.as_str());
             DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_seconds()
         };
 
-        let warn_unit = TimeUnit::from_str_lossy(r.warn_before_unit.as_str());
         let warn_secs = DurationConfig::new(r.warn_before_val.max(0) as u32, warn_unit).to_seconds();
 
         let used_secs = threshold_secs.saturating_sub(warn_secs);
@@ -303,16 +305,21 @@ fn refresh_message_editor_state(
                 r.name.to_string()
             },
             app: app_name,
-            session_duration: format!("{} {}", r.period_val, r.period_unit),
-            break_time: format!("{} {}", r.break_val, r.break_unit),
+            session_duration: DurationConfig::new(r.period_val.max(0) as u32, p_unit).to_short_string(),
+            break_time: DurationConfig::new(r.break_val.max(0) as u32, b_unit).to_short_string(),
             used,
-            limit: format!("{} {}", r.limit_val, r.limit_unit),
-            remaining: format!("{} {}", r.warn_before_val.max(5), r.warn_before_unit),
+            limit: DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_short_string(),
+            remaining: DurationConfig::new(r.warn_before_val.max(5) as u32, warn_unit).to_short_string(),
         }
     } else {
         MessageContext::sample()
     };
-    let paras = formatter::parse_formatted_text_with_context(message, &real_ctx);
+    let alignment = if rule.map_or(false, |r| r.action.as_str() == "Show Notification") {
+        TextHorizontalAlignment::Left
+    } else {
+        TextHorizontalAlignment::Center
+    };
+    let paras = formatter::parse_formatted_text_with_context_and_alignment(message, &real_ctx, alignment);
     win.set_preview_paragraphs(ModelRc::from(Rc::new(VecModel::from(paras))));
 
     if win.get_editor_message_text().as_str() != message {

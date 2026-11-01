@@ -238,6 +238,7 @@ pub fn parse_message(
 }
 
 /// Convenience parser using sample placeholder values and default theme styling for UI live previews.
+#[allow(dead_code)]
 pub fn parse_formatted_text(raw_message: &str) -> Vec<FormattedParagraph> {
     parse_formatted_text_with_context(raw_message, &MessageContext::sample())
 }
@@ -247,12 +248,21 @@ pub fn parse_formatted_text_with_context(
     raw_message: &str,
     ctx: &MessageContext,
 ) -> Vec<FormattedParagraph> {
+    parse_formatted_text_with_context_and_alignment(raw_message, ctx, TextHorizontalAlignment::Center)
+}
+
+/// Convenience parser using specific placeholder context and alignment for UI live previews.
+pub fn parse_formatted_text_with_context_and_alignment(
+    raw_message: &str,
+    ctx: &MessageContext,
+    alignment: TextHorizontalAlignment,
+) -> Vec<FormattedParagraph> {
     let default_color = Color::from_rgb_u8(248, 250, 252); // #f8fafc
     parse_message(
         raw_message,
         ctx,
         default_color,
-        TextHorizontalAlignment::Center,
+        alignment,
     )
 }
 

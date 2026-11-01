@@ -250,7 +250,15 @@ impl RuleRuntime {
     /// the current session so the snoozed rule re-triggers once `until` expires instead of wiping
     /// the pre-snooze session.
     pub fn snooze(&mut self, until: DateTime<Local>) {
+        let preserve_warned = self.active_break.is_none()
+            && self.pending_break_since.is_none()
+            && self.grace_countdown.is_none()
+            && !self.can_rollback_completion
+            && self.warned_current_cycle;
         self.reset_active_timers();
+        if preserve_warned {
+            self.warned_current_cycle = true;
+        }
         self.snoozed_until = Some(until);
         if self.can_rollback_completion {
             self.last_completed_at = self.prev_completed_at;
@@ -1849,7 +1857,7 @@ impl Engine {
         match mode {
             "break" => {
                 let text = "# Take a Break\n\n[color=#38bdf8 size=18 bold] Rest your eyes and stretch for {break_time}.";
-                let paragraphs = formatter::parse_formatted_text(text);
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Center);
                 let mode = OverlayMode::BreakEnforcer {
                     rule_id: "test_break".into(),
                     title: "Test Break Enforcer".into(),
@@ -1864,7 +1872,7 @@ impl Engine {
             }
             "hud_toast" => {
                 let text = "## App Quota Warning\n[color=#f59e0b bold] You have {remaining} remaining for {app}.";
-                let paragraphs = formatter::parse_formatted_text(text);
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
                 let mode = OverlayMode::HudToast {
                     rule_id: "test_toast".into(),
                     title: "Quota Warning".into(),
@@ -1878,7 +1886,7 @@ impl Engine {
             }
             "hud_timer" => {
                 let text = "[color=#f87171 bold] Time limit exceeded. Application closing in 30s.";
-                let paragraphs = formatter::parse_formatted_text(text);
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
                 let mode = OverlayMode::HudTimer {
                     rule_id: "test_timer".into(),
                     title: "Application Closing".into(),
@@ -1905,7 +1913,14 @@ impl Engine {
             "code.exe"
         };
         let threshold = rule.trigger_threshold_seconds();
-        let ctx = self.build_message_context(rule, app_name, threshold, threshold, 0);
+        let (elapsed_secs, rem_secs) = if rule.trigger == TriggerType::Limit || rule.message.contains("{remaining}") {
+            let rem = rule.warn_before.to_seconds().max(300);
+            let elapsed = threshold.saturating_sub(rem);
+            (elapsed, rem)
+        } else {
+            (threshold, 0)
+        };
+        let ctx = self.build_message_context(rule, app_name, elapsed_secs, threshold, rem_secs);
 
         match rule.action {
             RuleAction::ShowOverlay => {
@@ -2591,7 +2606,95 @@ mod tests {
         assert_eq!(rt.last_completed_at, Some(cycle1_time));
         assert!(rt.snoozed_until.is_some());
         assert!(!rt.can_rollback_completion);
+        assert!(rt.warned_current_cycle);
     }
+
+    #[tokio::test]
+    async fn test_snooze_stage1_warning_preserves_warned_flag_and_prevents_duplicate() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-snooze-warn".to_string();
+        rule.period = DurationConfig::new(20, TimeUnit::Min);
+        rule.warn_before = DurationConfig::new(5, TimeUnit::Min);
+        rule.target_executables = vec!["*".to_string()];
+        rule.action = RuleAction::ShowOverlay;
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(1);
+
+        // 16 minutes active: above threshold - warn_before (15m), below threshold (20m)
+        let ev = make_event(
+            now_utc - Duration::minutes(16),
+            16.0 * 60.0,
+            "editor.exe",
+            "Working",
+            "",
+        );
+
+        // First evaluation triggers Stage 1 warning
+        engine
+            .evaluate_rule(&rule, None, now, &[ev.clone()], start_of_day_utc, now_utc)
+            .await;
+
+        let rt = engine.runtimes.get("rule-snooze-warn").unwrap();
+        assert!(rt.warned_current_cycle);
+
+        // Drain the warning overlay message
+        let action = overlay_rx.try_recv().expect("Should have dispatched warning toast");
+        match action {
+            OverlayAction::Show(OverlayMode::HudToast { title, .. }) => {
+                assert!(title.contains("Upcoming"));
+            }
+            other => panic!("Expected HudToast warning, got {:?}", other),
+        }
+
+        // User snoozes the warning toast for 10 minutes
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-snooze-warn".to_string(),
+                minutes: 10,
+            })
+            .await;
+
+        // Verify warned_current_cycle remains true after snooze
+        let rt = engine.runtimes.get("rule-snooze-warn").unwrap();
+        assert!(rt.warned_current_cycle);
+        assert!(rt.snoozed_until.is_some());
+
+        // Drain any overlay action caused by snooze (e.g. Hide)
+        while overlay_rx.try_recv().is_ok() {}
+
+        // Fast-forward past the snooze expiration (11 minutes later), still within warning window (18m active < 20m)
+        let later_now = now + Duration::minutes(11);
+        let later_now_utc = now_utc + Duration::minutes(11);
+        let later_ev = make_event(
+            later_now_utc - Duration::minutes(18),
+            18.0 * 60.0,
+            "editor.exe",
+            "Working",
+            "",
+        );
+
+        engine
+            .evaluate_rule(&rule, None, later_now, &[later_ev], start_of_day_utc, later_now_utc)
+            .await;
+
+        // Verify snooze expired and no duplicate warning was dispatched
+        let rt = engine.runtimes.get("rule-snooze-warn").unwrap();
+        assert!(rt.snoozed_until.is_none());
+        assert!(rt.warned_current_cycle);
+        assert!(
+            overlay_rx.try_recv().is_err(),
+            "No duplicate warning overlay should be emitted after snooze expiration"
+        );
+    }
+
 
     #[tokio::test]
     async fn test_acknowledge_app_warning_does_not_suppress_next_cycle() {
