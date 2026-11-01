@@ -830,6 +830,7 @@ fn open_settings_window(
                     } else if cur > idx {
                         win.set_selected_rule_idx(cur - 1);
                     }
+                    refresh_rule_regex_validation(&win, &rm);
                     win.set_has_unsaved_changes(true);
                 }
             }
