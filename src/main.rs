@@ -321,33 +321,60 @@ fn refresh_message_editor_state(
     }
 }
 
-/// Validates the active rule's regular expression if Title or URL monitoring is selected,
-/// updating `rule-regex-valid` and `rule-regex-error` on `win`.
-fn refresh_rule_regex_validation(win: &SettingsWindow) {
-    let idx = win.get_selected_rule_idx();
-    if idx < 0 {
-        win.set_rule_regex_valid(true);
-        win.set_rule_regex_error("".into());
-        return;
+/// Validates regular expressions across all rules if Title or URL monitoring is selected,
+/// prioritizing the currently active rule's error message, and updating `rule-regex-valid`
+/// and `rule-regex-error` on `win`.
+fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) {
+    let cur_idx = win.get_selected_rule_idx();
+    if cur_idx >= 0 {
+        let mode = win.get_rule_monitor_selection();
+        let (valid, err) = match mode.as_str() {
+            "Titles" => {
+                let pat = win.get_rule_title_regex();
+                config::validate_regex_pattern(&pat)
+            }
+            "Urls" => {
+                let pat = win.get_rule_url_regex();
+                config::validate_regex_pattern(&pat)
+            }
+            _ => (true, String::new()),
+        };
+        if !valid {
+            win.set_rule_regex_valid(false);
+            win.set_rule_regex_error(err.into());
+            return;
+        }
     }
-    let mode = win.get_rule_monitor_selection();
-    let (valid, err) = match mode.as_str() {
-        "Titles" => {
-            let pat = win.get_rule_title_regex();
-            config::validate_regex_pattern(&pat)
+
+    for i in 0..rm.row_count() {
+        if cur_idx >= 0 && i as i32 == cur_idx {
+            continue;
         }
-        "Urls" => {
-            let pat = win.get_rule_url_regex();
-            config::validate_regex_pattern(&pat)
+        if let Some(r) = rm.row_data(i) {
+            let (valid, err) = match r.monitor_selection.as_str() {
+                "Titles" => config::validate_regex_pattern(&r.title_regex),
+                "Urls" => config::validate_regex_pattern(&r.url_regex),
+                _ => (true, String::new()),
+            };
+            if !valid {
+                let name = if !r.name.trim().is_empty() {
+                    r.name.as_str()
+                } else {
+                    "Unnamed"
+                };
+                win.set_rule_regex_valid(false);
+                win.set_rule_regex_error(format!("Rule '{name}': {err}").into());
+                return;
+            }
         }
-        _ => (true, String::new()),
-    };
-    win.set_rule_regex_valid(valid);
-    win.set_rule_regex_error(err.into());
+    }
+
+    win.set_rule_regex_valid(true);
+    win.set_rule_regex_error("".into());
 }
 
 /// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
-fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView) {
+fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<RuleView>) {
     win.set_rule_enabled(rule.enabled);
     win.set_rule_name(rule.name.clone());
     win.set_rule_monitor_selection(rule.monitor_selection.clone());
@@ -375,7 +402,7 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView) {
     win.set_rule_strict_mode(rule.strict_mode);
     win.set_editor_message_text(rule.message.clone());
     refresh_message_editor_state(win, &rule.message, 0, Some(rule));
-    refresh_rule_regex_validation(win);
+    refresh_rule_regex_validation(win, rm);
 }
 
 /// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
@@ -393,6 +420,12 @@ fn apply_config_to_ui(
     win.set_pause_all_rules(cfg.general.pause_all_rules);
     win.set_destroy_windows_on_hide(cfg.general.destroy_windows_on_hide);
     win.set_slint_renderer(cfg.general.slint_renderer.as_str().into());
+    let renderer_display = if cfg.general.slint_renderer.eq_ignore_ascii_case("software") {
+        "CPU Software (renderer-software)"
+    } else {
+        "OpenGL (renderer-femtovg)"
+    };
+    win.set_slint_renderer_display(renderer_display.into());
     win.set_overlay_opacity(cfg.overlay.opacity);
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
@@ -421,7 +454,9 @@ fn apply_config_to_ui(
 
     if let Some(r) = cfg.rules.get(safe_idx) {
         let rv = rule_to_view(r);
-        load_rule_into_editor(win, &rv);
+        load_rule_into_editor(win, &rv, rules_model);
+    } else {
+        refresh_rule_regex_validation(win, rules_model);
     }
     win.set_has_unsaved_changes(false);
 }
@@ -431,14 +466,14 @@ fn update_rule_at(
     rm: &VecModel<RuleView>,
     sw: &slint::Weak<SettingsWindow>,
     rule_idx: i32,
-    mutator: impl FnOnce(&mut RuleView, &SettingsWindow) -> bool,
+    mutator: impl FnOnce(&mut RuleView, &SettingsWindow, &VecModel<RuleView>) -> bool,
 ) {
     let idx = rule_idx as usize;
     if let (Some(win), Some(mut rule)) = (
         sw.upgrade(),
         (idx < rm.row_count()).then(|| rm.row_data(idx)).flatten(),
     ) {
-        if mutator(&mut rule, &win) {
+        if mutator(&mut rule, &win, rm) {
             rm.set_row_data(idx, rule);
             win.set_has_unsaved_changes(true);
         }
@@ -456,7 +491,7 @@ fn add_executable_to_rule(
     if trimmed.is_empty() || trimmed == "*" {
         return;
     }
-    update_rule_at(rm, sw, rule_idx, |rule_view, win| {
+    update_rule_at(rm, sw, rule_idx, |rule_view, win, rm| {
         let mut targets: Vec<slint::SharedString> = rule_view
             .target_executables
             .iter()
@@ -468,7 +503,7 @@ fn add_executable_to_rule(
         if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(trimmed)) {
             targets.push(trimmed.into());
             rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
-            load_rule_into_editor(win, rule_view);
+            load_rule_into_editor(win, rule_view, rm);
             return true;
         }
         false
@@ -482,7 +517,7 @@ fn update_rule_schedule(
     rule_idx: i32,
     f: impl FnOnce(&mut [bool]),
 ) {
-    update_rule_at(rm, sw, rule_idx, |rule, _| {
+    update_rule_at(rm, sw, rule_idx, |rule, _, _| {
         let mut slots: Vec<bool> = rule.schedule_slots.iter().collect();
         if slots.len() == 168 {
             f(&mut slots);
@@ -622,8 +657,11 @@ fn open_settings_window(
         let item_pause = item_pause.clone();
         let overlay_mgr_cell = overlay_manager.clone();
 
+        let rm = rules_model.clone();
+
         settings_win.on_save_config(move || {
             if let Some(win) = sw.upgrade() {
+                refresh_rule_regex_validation(&win, &rm);
                 if !win.get_time_format_valid() || !win.get_rule_regex_valid() {
                     return;
                 }
@@ -761,7 +799,7 @@ fn open_settings_window(
                 let idx = rm.row_count();
                 rm.push(rv.clone());
                 win.set_selected_rule_idx(idx as i32);
-                load_rule_into_editor(&win, &rv);
+                load_rule_into_editor(&win, &rv, &rm);
                 win.set_has_unsaved_changes(true);
             }
         });
@@ -782,17 +820,39 @@ fn open_settings_window(
                             let new_idx = if u < rm.row_count() { u } else { rm.row_count() - 1 };
                             win.set_selected_rule_idx(new_idx as i32);
                             if let Some(rule) = rm.row_data(new_idx) {
-                                load_rule_into_editor(&win, &rule);
+                                load_rule_into_editor(&win, &rule, &rm);
                             }
                         } else {
                             win.set_selected_rule_idx(-1);
                             win.set_editor_message_text("".into());
-                            refresh_rule_regex_validation(&win);
+                            refresh_rule_regex_validation(&win, &rm);
                         }
                     } else if cur > idx {
                         win.set_selected_rule_idx(cur - 1);
                     }
                     win.set_has_unsaved_changes(true);
+                }
+            }
+        });
+    }
+
+    // Toggle rule enabled (from overview list)
+    {
+        let rm = rules_model.clone();
+        let sw = settings_weak.clone();
+        settings_win.on_toggle_rule_enabled(move |idx, enabled| {
+            if let Some(win) = sw.upgrade() {
+                let u = idx as usize;
+                if u < rm.row_count() {
+                    if let Some(mut rule) = rm.row_data(u) {
+                        rule.enabled = enabled;
+                        rm.set_row_data(u, rule);
+                        if win.get_selected_rule_idx() == idx {
+                            win.set_rule_enabled(enabled);
+                        }
+                        refresh_rule_regex_validation(&win, &rm);
+                        win.set_has_unsaved_changes(true);
+                    }
                 }
             }
         });
@@ -805,11 +865,14 @@ fn open_settings_window(
         settings_win.on_select_rule(move |idx| {
             if let Some(win) = sw.upgrade() {
                 let u = idx as usize;
-                if u < rm.row_count() {
+                if idx >= 0 && u < rm.row_count() {
                     win.set_selected_rule_idx(idx);
                     if let Some(rule) = rm.row_data(u) {
-                        load_rule_into_editor(&win, &rule);
+                        load_rule_into_editor(&win, &rule, &rm);
                     }
+                } else if idx < 0 {
+                    win.set_selected_rule_idx(-1);
+                    refresh_rule_regex_validation(&win, &rm);
                 }
             }
         });
@@ -863,8 +926,8 @@ fn open_settings_window(
 
                         let cur_line = win.get_selected_message_line() as usize;
                         refresh_message_editor_state(&win, &rule.message, cur_line, Some(&rule));
-                        refresh_rule_regex_validation(&win);
                         rm.set_row_data(u, rule);
+                        refresh_rule_regex_validation(&win, &rm);
                         win.set_has_unsaved_changes(true);
                     }
                 }
@@ -916,7 +979,7 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_remove_executable_from_rule(move |rule_idx, exe_idx| {
             let e_idx = exe_idx as usize;
-            update_rule_at(&rm, &sw, rule_idx, |rule_view, win| {
+            update_rule_at(&rm, &sw, rule_idx, |rule_view, win, rm| {
                 let mut current_targets: Vec<slint::SharedString> =
                     rule_view.target_executables.iter().collect();
                 if e_idx < current_targets.len() {
@@ -926,7 +989,7 @@ fn open_settings_window(
                     }
                     rule_view.target_executables =
                         ModelRc::from(Rc::new(VecModel::from(current_targets)));
-                    load_rule_into_editor(win, rule_view);
+                    load_rule_into_editor(win, rule_view, rm);
                     return true;
                 }
                 false
@@ -1048,7 +1111,7 @@ fn open_settings_window(
             if let Some(win) = sw.upgrade() {
                 let rule_idx = win.get_selected_rule_idx();
                 let text_clone = text.clone();
-                update_rule_at(&rm, &sw, rule_idx, |rule, win| {
+                update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
                     rule.message = text_clone.clone();
                     let cur_line = win.get_selected_message_line() as usize;
                     refresh_message_editor_state(win, &text_clone, cur_line, Some(rule));
@@ -1065,7 +1128,7 @@ fn open_settings_window(
         settings_win.on_apply_line_style(move |line_idx, style| {
             if let Some(win) = sw.upgrade() {
                 let rule_idx = win.get_selected_rule_idx();
-                update_rule_at(&rm, &sw, rule_idx, |rule, win| {
+                update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
                     let updated = formatter::apply_line_style(&rule.message, line_idx as usize, &style);
                     rule.message = updated.as_str().into();
                     refresh_message_editor_state(win, &updated, line_idx as usize, Some(rule));
@@ -1082,7 +1145,7 @@ fn open_settings_window(
         settings_win.on_append_placeholder(move |line_idx, placeholder| {
             if let Some(win) = sw.upgrade() {
                 let rule_idx = win.get_selected_rule_idx();
-                update_rule_at(&rm, &sw, rule_idx, |rule, win| {
+                update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
                     let updated = formatter::append_placeholder(&rule.message, line_idx as usize, &placeholder);
                     rule.message = updated.as_str().into();
                     refresh_message_editor_state(win, &updated, line_idx as usize, Some(rule));

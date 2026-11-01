@@ -226,6 +226,7 @@ export component SettingsWindow inherits Window {
     in-out property <bool> pause-all-rules: false;
     in-out property <bool> destroy-windows-on-hide: true;
     in-out property <string> slint-renderer: "femtovg";
+    in-out property <string> slint-renderer-display: "OpenGL (renderer-femtovg)";
     in-out property <bool> strict-lock-active: false;
     in-out property <bool> strict-unlocked: false;
     in-out property <int> strict-unlock-countdown: 0;
@@ -287,8 +288,8 @@ export component SettingsWindow inherits Window {
     in property <bool> line-is-underline: false;
     in property <string> line-color: "";
     in property <int> line-size: 0;
-    in property <string> line-color-display: "Color: Default";
-    in property <string> line-size-display: "Size: Default";
+    in-out property <string> line-color-display: "Color: Default";
+    in-out property <string> line-size-display: "Size: Default";
 
     // Live Status metrics
     in property <bool> aw-connected: false;
@@ -307,6 +308,7 @@ export component SettingsWindow inherits Window {
 
     callback add-rule();
     callback delete-rule(int /* rule_idx */);
+    callback toggle-rule-enabled(int /* rule_idx */, bool /* enabled */);
 
     callback add-known-app-to-rule(int /* rule_idx */, string /* app */);
     callback remove-executable-from-rule(int /* rule_idx */, int /* exe_idx */);
@@ -384,6 +386,7 @@ export component SettingsWindow inherits Window {
                             clicked => {
                                 root.active-tab = 1;
                                 root.selected-rule-idx = -1;
+                                root.select-rule(-1);
                             }
                         }
 
@@ -681,7 +684,7 @@ export component SettingsWindow inherits Window {
                                 ComboBox {
                                     width: 280px;
                                     model: ["OpenGL (renderer-femtovg)", "CPU Software (renderer-software)"];
-                                    current-value: root.slint-renderer == "software" ? "CPU Software (renderer-software)" : "OpenGL (renderer-femtovg)";
+                                    current-value <=> root.slint-renderer-display;
                                     selected(val) => {
                                         if val == "CPU Software (renderer-software)" {
                                             root.slint-renderer = "software";
@@ -869,6 +872,7 @@ export component SettingsWindow inherits Window {
                                     ov_touch := TouchArea {
                                         clicked => {
                                             root.selected-rule-idx = -1;
+                                            root.select-rule(-1);
                                         }
                                     }
                                 }
@@ -1003,7 +1007,7 @@ export component SettingsWindow inherits Window {
                                         checked: r.enabled;
                                         enabled: !root.ui-locked-by-strict;
                                         toggled => {
-                                            root.rules[i].enabled = self.checked;
+                                            root.toggle-rule-enabled(i, self.checked);
                                             root.has-unsaved-changes = true;
                                         }
                                     }
@@ -1411,7 +1415,7 @@ export component SettingsWindow inherits Window {
                                     ComboBox {
                                         width: 135px;
                                         model: ["Color: Default", "Color: Sky Blue", "Color: Emerald", "Color: Amber", "Color: Rose", "Color: Purple", "Color: Indigo", "Color: White"];
-                                        current-value: root.line-color-display;
+                                        current-value <=> root.line-color-display;
                                         selected(val) => {
                                             root.apply-line-style(root.selected-message-line, val);
                                         }
@@ -1421,7 +1425,7 @@ export component SettingsWindow inherits Window {
                                     ComboBox {
                                         width: 115px;
                                         model: ["Size: Default", "Size: 12px", "Size: 14px", "Size: 16px", "Size: 18px", "Size: 20px", "Size: 24px", "Size: 28px", "Size: 32px"];
-                                        current-value: root.line-size-display;
+                                        current-value <=> root.line-size-display;
                                         selected(val) => {
                                             root.apply-line-style(root.selected-message-line, val);
                                         }
