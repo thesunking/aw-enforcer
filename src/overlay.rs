@@ -589,6 +589,7 @@ impl OverlayManager {
         self.current_mode = OverlayMode::Hidden;
         self.desired_placements.clear();
         self.applied_placements.clear();
+        *self.status_pos.borrow_mut() = None;
         for win in &self.windows {
             if let Some(hwnd) = Self::extract_hwnd(win) {
                 unsafe {
@@ -605,6 +606,7 @@ impl OverlayManager {
     /// Configures and displays the overlay windows according to the given `OverlayMode`.
     pub fn show_mode(&mut self, mode: OverlayMode) {
         let monitors = Self::enumerate_monitors();
+        let was_hud_status = matches!(self.current_mode, OverlayMode::HudStatus { .. });
         self.current_mode = mode.clone();
         self.is_updating_placements = true;
 
@@ -761,19 +763,32 @@ impl OverlayManager {
             } => {
                 self.prepare_windows(1);
 
-                let visible_pos = self.windows.first().and_then(Self::extract_hwnd).and_then(|hwnd| unsafe {
-                    let mut r: RECT = std::mem::zeroed();
-                    (IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left)
-                        .then_some((r.left, r.top))
-                });
-                let candidate_pos = visible_pos
-                    .or_else(|| *self.status_pos.borrow())
-                    .unwrap_or_else(|| Self::primary_top_right(&monitors, 540, 20));
-                let (target_x, target_y) = clamp_or_reset_status_pos(candidate_pos, 540, 270, 20, &monitors);
-                let scale = self.prepare_target_scale(0, target_x, target_y);
-                let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
+                let (card_w, card_h, _margin, x, y) = if was_hud_status {
+                    let visible_pos = self.windows.first().and_then(Self::extract_hwnd).and_then(|hwnd| unsafe {
+                        let mut r: RECT = std::mem::zeroed();
+                        (IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left)
+                            .then_some((r.left, r.top))
+                    });
+                    if let Some((target_x, target_y)) = visible_pos.or_else(|| *self.status_pos.borrow()) {
+                        let scale = self.prepare_target_scale(0, target_x, target_y);
+                        let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
+                        let (x, y) = clamp_or_reset_status_pos((target_x, target_y), card_w, card_h, margin, &monitors);
+                        (card_w, card_h, margin, x, y)
+                    } else {
+                        let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+                        let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
+                        let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
+                        let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
+                        (card_w, card_h, margin, x, y)
+                    }
+                } else {
+                    let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+                    let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
+                    let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
+                    let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
+                    (card_w, card_h, margin, x, y)
+                };
 
-                let (x, y) = clamp_or_reset_status_pos((target_x, target_y), card_w, card_h, margin, &monitors);
                 *self.status_pos.borrow_mut() = Some((x, y));
 
                 let win = &self.windows[0];
@@ -1039,6 +1054,13 @@ mod tests {
         };
         mgr.show_mode(status_mode);
         assert!(matches!(mgr.current_mode, OverlayMode::HudStatus { .. }));
+        let placement = mgr.desired_placements[0].as_ref().expect("status placement");
+        let monitors = OverlayManager::enumerate_monitors();
+        let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+        assert!(placement.x >= primary_m.work_rect.left, "HUD status x must be within work_rect left");
+        assert!(placement.x + placement.width <= primary_m.work_rect.right, "HUD status right edge must not exceed work_rect right");
+        assert!(placement.y >= primary_m.work_rect.top, "HUD status y must be within work_rect top");
+        assert!(placement.y + placement.height <= primary_m.work_rect.bottom, "HUD status bottom edge must not exceed work_rect bottom");
 
         // 5. Hide all cleans up
         mgr.hide_all();

@@ -200,10 +200,10 @@ component SidebarNavItem inherits Rectangle {
 export component SettingsWindow inherits Window {
     title: "AW-Enforcer Settings";
     icon: @image-url("../assets/app_icon_256.png");
-    min-width: 960px;
-    min-height: 680px;
-    preferred-width: 1060px;
-    preferred-height: 760px;
+    min-width: 1080px;
+    min-height: 700px;
+    preferred-width: 1240px;
+    preferred-height: 780px;
     background: #0f172a;
 
     init => {
@@ -765,10 +765,22 @@ export component SettingsWindow inherits Window {
                         FormRow {
                             label: "Test Overlays:";
                             label-width: 220px;
-                            Button { text: "Test Break Screen"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("break"); } }
-                            Button { text: "Test HUD Toast"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_toast"); } }
-                            Button { text: "Test HUD Timer"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_timer"); } }
-                            Button { text: "Test 24h Stats HUD"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_status"); } }
+                            VerticalLayout {
+                                spacing: 8px;
+                                alignment: start;
+
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Button { text: "Test Break Screen"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("break"); } }
+                                    Button { text: "Test HUD Toast"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_toast"); } }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Button { text: "Test HUD Timer"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_timer"); } }
+                                    Button { text: "Test 24h Stats HUD"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_status"); } }
+                                }
+                            }
                         }
                     }
 
@@ -1102,6 +1114,7 @@ export component SettingsWindow inherits Window {
                                                 "  •  Action: " + r.action;
                                             font-size: 12px;
                                             color: #94a3b8;
+                                            overflow: elide;
                                         }
                                     }
                                 }
@@ -1560,14 +1573,30 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 // Formatting Toolbar Row 2: Variable Quick-Insert Chips
-                                HorizontalLayout {
+                                VerticalLayout {
                                     spacing: 6px;
                                     alignment: start;
 
-                                    Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
-                                    for chip in ["{rule_name}", "{session_duration}", "{break_time}", "{app}", "{used}", "{limit}", "{remaining}"] : Button {
-                                        text: "+ " + chip;
-                                        clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+
+                                        Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
+                                        for chip in ["{rule_name}", "{session_duration}", "{break_time}", "{app}"] : Button {
+                                            text: "+ " + chip;
+                                            clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+
+                                        Rectangle { width: 88px; }
+                                        for chip in ["{used}", "{limit}", "{remaining}"] : Button {
+                                            text: "+ " + chip;
+                                            clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                                        }
                                     }
                                 }
 
