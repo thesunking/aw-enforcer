@@ -620,7 +620,7 @@ fn open_settings_window(
         for (rule_id, status_text) in &ls.rule_statuses {
             for idx in 0..rules_model.row_count() {
                 if let Some(mut r) = rules_model.row_data(idx) {
-                    if &r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                    if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
                         r.status_text = status_text.as_str().into();
                         rules_model.set_row_data(idx, r);
                     }

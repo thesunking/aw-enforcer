@@ -40,7 +40,7 @@ pub fn format_seconds_human(secs: u32) -> String {
         } else {
             format!("{}h", h)
         }
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
@@ -58,7 +58,7 @@ pub fn is_valid_attr_block(inner: &str) -> bool {
         match token {
             "bold" | "italic" | "underline" => {}
             s if s.starts_with("size=") => {
-                if !s[5..].parse::<u16>().map_or(false, |sz| (8..=72).contains(&sz)) {
+                if !s[5..].parse::<u16>().is_ok_and(|sz| (8..=72).contains(&sz)) {
                     return false;
                 }
             }
@@ -257,7 +257,7 @@ pub fn parse_formatted_text_with_context(
 }
 
 /// Represents the detected formatting attributes on a single line of the message editor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LineFormattingStatus {
     pub is_h1: bool,
     pub is_h2: bool,
@@ -266,20 +266,6 @@ pub struct LineFormattingStatus {
     pub is_underline: bool,
     pub color_code: String, // e.g. "#38bdf8" or ""
     pub size_val: u32,      // e.g. 18 or 0 (default)
-}
-
-impl Default for LineFormattingStatus {
-    fn default() -> Self {
-        Self {
-            is_h1: false,
-            is_h2: false,
-            is_bold: false,
-            is_italic: false,
-            is_underline: false,
-            color_code: String::new(),
-            size_val: 0,
-        }
-    }
 }
 
 /// Inspects the line at `line_idx` and returns its active heading or `[attr ...]` formatting state.

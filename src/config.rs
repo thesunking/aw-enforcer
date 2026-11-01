@@ -155,17 +155,12 @@ impl NotificationMethod {
 }
 
 /// Time unit for user-configured durations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TimeUnit {
     Hr,
+    #[default]
     Min,
     Sec,
-}
-
-impl Default for TimeUnit {
-    fn default() -> Self {
-        Self::Min
-    }
 }
 
 impl TimeUnit {

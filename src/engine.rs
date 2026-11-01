@@ -17,20 +17,6 @@ use crate::enforcer;
 use crate::formatter::{self, MessageContext};
 use crate::overlay::OverlayMode;
 
-/// Computes the overlap duration in seconds between an ActivityWatch event and `[start_utc, end_utc]`.
-#[allow(dead_code)]
-fn event_overlap_seconds(ev: &AwEvent, start_utc: DateTime<Utc>, end_utc: DateTime<Utc>) -> f64 {
-    let e_start = ev.timestamp;
-    let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-    let overlap_start = e_start.max(start_utc);
-    let overlap_end = e_end.min(end_utc);
-    if overlap_end > overlap_start {
-        (overlap_end - overlap_start).num_milliseconds() as f64 / 1000.0
-    } else {
-        0.0
-    }
-}
-
 /// Merges overlapping and adjacent intervals into a minimal sorted list of non-overlapping intervals.
 pub fn merge_overlapping_intervals(
     mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)>,
@@ -2249,7 +2235,7 @@ mod tests {
         assert_eq!(engine.runtimes.get(&rule_id).unwrap().daily_usage_seconds, 1200);
 
         // 3. Day rollover resets daily_usage_seconds to 0
-        engine.last_reset_date = engine.last_reset_date - chrono::Duration::days(1);
+        engine.last_reset_date -= chrono::Duration::days(1);
         let logical_now = logical_day_start(now, engine.config.general.day_start_hour);
         if logical_now.date_naive() != engine.last_reset_date {
             engine.last_reset_date = logical_now.date_naive();
