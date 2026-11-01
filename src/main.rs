@@ -293,9 +293,15 @@ fn refresh_message_editor_state(
             DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_seconds()
         };
 
-        let warn_secs = DurationConfig::new(r.warn_before_val.max(0) as u32, warn_unit).to_seconds();
+        let (eff_warn_secs, remaining) = if r.warn_before_val > 0 {
+            let cfg = DurationConfig::new(r.warn_before_val as u32, warn_unit);
+            (cfg.to_seconds(), cfg.to_short_string())
+        } else {
+            let fallback_cfg = DurationConfig::new(5, TimeUnit::Min);
+            (fallback_cfg.to_seconds().min(threshold_secs), fallback_cfg.to_short_string())
+        };
 
-        let used_secs = threshold_secs.saturating_sub(warn_secs);
+        let used_secs = threshold_secs.saturating_sub(eff_warn_secs);
         let used = formatter::format_seconds_human(used_secs);
 
         MessageContext {
@@ -309,7 +315,7 @@ fn refresh_message_editor_state(
             break_time: DurationConfig::new(r.break_val.max(0) as u32, b_unit).to_short_string(),
             used,
             limit: DurationConfig::new(r.limit_val.max(0) as u32, l_unit).to_short_string(),
-            remaining: DurationConfig::new(r.warn_before_val.max(5) as u32, warn_unit).to_short_string(),
+            remaining,
         }
     } else {
         MessageContext::sample()

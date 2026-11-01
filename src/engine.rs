@@ -462,7 +462,7 @@ impl Engine {
             let matched_app = self.get_last_matched_app_or_default(&rule.id);
             let elapsed = self.rule_elapsed_seconds(&rule);
             let threshold = rule.trigger_threshold_seconds();
-            let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+            let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, rem);
             let default_msg = format!(
                 "[color=#f87171 bold] {} in {}s.",
                 rule.action.as_str(),
@@ -1481,7 +1481,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.grace_countdown = Some((effective_grace, effective_grace));
                 }
-                let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, 0);
+                let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, effective_grace);
                 let default_msg = format!(
                     "[color=#f87171 bold] {} in {}s.",
                     rule.action.as_str(),
@@ -1911,7 +1911,8 @@ impl Engine {
         };
         let threshold = rule.trigger_threshold_seconds();
         let (elapsed_secs, rem_secs) = if rule.trigger == TriggerType::Limit || rule.message.contains("{remaining}") {
-            let rem = rule.warn_before.to_seconds().max(300);
+            let warn_secs = rule.warn_before.to_seconds();
+            let rem = if warn_secs > 0 { warn_secs } else { 300.min(threshold) };
             let elapsed = threshold.saturating_sub(rem);
             (elapsed, rem)
         } else {
@@ -3381,6 +3382,35 @@ mod tests {
                 assert_eq!(rule_id, "test_preview");
                 assert_eq!(remaining_seconds, 10);
                 assert!(!paragraphs.is_empty());
+            }
+            other => panic!("Expected HudToast overlay, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_rule_alert_preserves_short_warn_before_remaining() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-short-warn".to_string();
+        rule.action = RuleAction::ShowNotification;
+        rule.notification_method = NotificationMethod::Hud;
+        rule.trigger = TriggerType::Limit;
+        rule.limit = DurationConfig::new(1, TimeUnit::Hr);
+        rule.warn_before = DurationConfig::new(2, TimeUnit::Min);
+        rule.message = "{remaining} remaining out of {limit}".to_string();
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        engine.handle_command(DaemonCommand::PreviewRule(Box::new(rule))).await;
+
+        let action = overlay_rx.recv().await.expect("Expected overlay action");
+        match action {
+            OverlayAction::Show(OverlayMode::HudToast { paragraphs, .. }) => {
+                assert!(!paragraphs.is_empty());
+                assert_eq!(paragraphs[0].text.as_str(), "2m remaining out of 1h");
             }
             other => panic!("Expected HudToast overlay, got: {other:?}"),
         }
