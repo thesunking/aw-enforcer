@@ -606,6 +606,7 @@ impl Engine {
                 if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
                 }
+                self.poll_tick().await;
             }
             DaemonCommand::DismissBreakOverlay => {
                 if self.is_strict_lock_active(Local::now()) {
@@ -619,6 +620,7 @@ impl Engine {
                     }
                 }
                 self.hide_overlay();
+                self.poll_tick().await;
             }
             DaemonCommand::SnoozeAll { minutes } => {
                 if self.is_strict_lock_active(Local::now()) {
@@ -636,6 +638,7 @@ impl Engine {
                     rt.snooze(until);
                 }
                 self.hide_overlay();
+                self.poll_tick().await;
             }
             DaemonCommand::SetPauseAll { paused } => {
                 if paused && self.is_strict_lock_active(Local::now()) {
@@ -649,6 +652,7 @@ impl Engine {
                     }
                     self.hide_overlay();
                 }
+                self.poll_tick().await;
             }
             DaemonCommand::ShowStatsOverlay => {
                 self.display_stats_overlay(false).await;
@@ -4774,5 +4778,97 @@ mod tests {
         let rt = engine.runtimes.get("rule-hud-toast-eval").unwrap();
         assert!(rt.can_rollback_completion);
         assert_eq!(rt.last_completed_at, Some(completed_time));
+    }
+
+    #[tokio::test]
+    async fn test_commands_emit_immediate_live_status_update() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-live-update-test".to_string();
+        rule.action = RuleAction::ShowOverlay;
+        rule.break_duration = DurationConfig::new(10, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let recv_last_live_status = |rx: &mut mpsc::UnboundedReceiver<OverlayAction>| {
+            let mut last = None;
+            while let Ok(action) = rx.try_recv() {
+                if let OverlayAction::UpdateLiveStatus {
+                    rule_statuses,
+                    tray_tooltip,
+                    any_snoozed,
+                    ..
+                } = action
+                {
+                    last = Some((tray_tooltip, any_snoozed, rule_statuses));
+                }
+            }
+            last
+        };
+
+        // 1. SnoozeAll: Immediately emits UpdateLiveStatus with any_snoozed == true and Snoozed tooltip
+        engine
+            .handle_command(DaemonCommand::SnoozeAll { minutes: 15 })
+            .await;
+        let (tooltip, any_snoozed, statuses) = recv_last_live_status(&mut overlay_rx)
+            .expect("SnoozeAll must emit UpdateLiveStatus");
+        assert!(any_snoozed);
+        assert!(tooltip.contains("Snoozed 15m"));
+        assert!(!statuses.is_empty());
+        assert!(statuses.iter().any(|(id, badge)| id == "rule-live-update-test" && badge.contains("Snoozed")));
+
+        // 2. SetPauseAll(true): Immediately emits UpdateLiveStatus with Paused tooltip
+        engine
+            .handle_command(DaemonCommand::SetPauseAll { paused: true })
+            .await;
+        let (tooltip, _any_snoozed, _statuses) = recv_last_live_status(&mut overlay_rx)
+            .expect("SetPauseAll(true) must emit UpdateLiveStatus");
+        assert!(tooltip.contains("Paused"));
+
+        // Unpause to test break commands
+        engine
+            .handle_command(DaemonCommand::SetPauseAll { paused: false })
+            .await;
+        let _ = recv_last_live_status(&mut overlay_rx);
+
+        // Clear snooze
+        engine.handle_command(DaemonCommand::ClearSnoozeAll).await;
+        let _ = recv_last_live_status(&mut overlay_rx);
+
+        // 3. SkipBreak: Set active break, skip it, ensure UpdateLiveStatus emitted immediately
+        {
+            let rt = engine.runtimes.get_mut("rule-live-update-test").unwrap();
+            rt.active_break = Some((600, 600));
+        }
+        engine
+            .handle_command(DaemonCommand::SkipBreak {
+                rule_id: "rule-live-update-test".to_string(),
+            })
+            .await;
+        let (_tooltip, any_snoozed, statuses) = recv_last_live_status(&mut overlay_rx)
+            .expect("SkipBreak must emit UpdateLiveStatus");
+        assert!(!any_snoozed);
+        let rt = engine.runtimes.get("rule-live-update-test").unwrap();
+        assert!(rt.active_break.is_none());
+        assert!(statuses.iter().any(|(id, _)| id == "rule-live-update-test"));
+
+        // 4. DismissBreakOverlay: Set active break, dismiss, ensure UpdateLiveStatus emitted immediately
+        {
+            let rt = engine.runtimes.get_mut("rule-live-update-test").unwrap();
+            rt.active_break = Some((600, 600));
+        }
+        engine
+            .handle_command(DaemonCommand::DismissBreakOverlay)
+            .await;
+        let (_tooltip, any_snoozed, statuses) = recv_last_live_status(&mut overlay_rx)
+            .expect("DismissBreakOverlay must emit UpdateLiveStatus");
+        assert!(!any_snoozed);
+        let rt = engine.runtimes.get("rule-live-update-test").unwrap();
+        assert!(rt.active_break.is_none());
+        assert!(statuses.iter().any(|(id, _)| id == "rule-live-update-test"));
     }
 }
