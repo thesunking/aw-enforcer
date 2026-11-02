@@ -1,91 +1,118 @@
-# Technical Specification: "AW-Enforcer" (Unified Rule Engine & Slint UI)
+# Technical Specification: AW-Enforcer
 
-## 1. Project Overview & Orthogonal Trigger/Action Architecture
-
-Build a local, lightweight Windows desktop application in **Rust** (`aw-enforcer`) that runs persistently in the system tray, polls the local ActivityWatch REST API (`http://localhost:5600/api/0/`), and enforces user-configured usage and ergonomic rules.
-
-### Key Architectural Highlights in v1.0.0
-
-1. **Orthogonal `Trigger` and `Action` Rule Model (`Rule`):**
-   - Decouples **how a rule is triggered** (`TriggerType`: `Period` vs. `Limit`) from **what happens when it triggers** (`RuleAction`: `Show Overlay`, `Show Notification`, `Show Statistics`, `Lock Workstation`, `Close Tab`, `Close Window`, `Kill Process`).
-   - Any trigger (`Period` or `Limit`) can be paired with any of the 7 actions, with universal pre-action warnings (`Warn Before Action`) and pre-execution countdowns (`Grace Countdown`).
-2. **Unified Three-Stage Evaluation Pipeline (`src/engine.rs`):**
-   - Replaces separate frequency/limit evaluation paths with a single `evaluate_rule()` pipeline:
-     - **Stage 1 (Warn Before Action):** Fires when `warn_before > 0` and `remaining <= warn_before`. Supports custom formatted message templates across all rule actions (preserving unambiguous upcoming-break countdowns for `ShowOverlay`).
-     - **Stage 2 (Grace Countdown):** Displays a top-right `HudTimer` countdown when `grace_duration > 0` before executing the configured action, rendering the rule's custom message template.
-     - **Stage 3 (Action Execution):** Executes `Show Overlay`, `Show Notification` (`HUD` or `Windows`), `Show Statistics`, `Lock Workstation`, `Close Tab`, `Close Window`, or `Kill Process`.
-   - Centralizes cycle state transitions on `RuleRuntime` (`reset_active_timers()`, `complete_cycle(now)`, and `snooze(until)` with `prev_completed_at` tracking) so snoozing on any cycle pauses enforcement for `minutes` and then re-evaluates without losing pre-snooze session progress.
-3. **Five-Section Rule Editor & Preview Alerts (`ui/settings.slint`):**
-   - Each rule's configuration page is organized into five clean sections with headers placed outside their cards: **1. General Settings**, **2. Monitor Target**, **3. Trigger**, **4. Action**, and **5. Active Hours Schedule** (each enclosed in a dedicated `SectionCard`).
-   - The Message Template & Formatting Toolbar section is hosted in a dedicated sub-card within the **4. Action** card (visible when `action == ShowOverlay || action == ShowNotification || warn_before > 0 || grace_duration > 0`) and live-updates its preview whenever rule names, targets, monitor modes, triggers, or durations change.
-   - Includes a dedicated **"Preview This Rule's Alert"** button that dispatches a preview alert matching the rule's exact custom template, formatting, click-through, and notification parameters (previewing `BreakEnforcer` for `ShowOverlay`, `HudToast` for `ShowNotification` or zero-grace warnings, `HudTimer` for actions with `grace_duration > 0`, and `HudStatus` for `ShowStatistics` when both grace countdown and pre-action warning are disabled).
-4. **Configuration Import & Export (`src/config.rs`, `ui/settings.slint`, `src/main.rs`):**
-   - Users can export their complete configuration to a `.toml` file (`aw-enforcer-config.toml`) or import an existing configuration file via native `rfd::FileDialog` pickers in General Settings.
-   - Import automatically executes full validation (`validate_strftime_format`, opacity clamping, excessive threshold clamping, and `sanitize_rules()`), loads the rules and settings into the UI, synchronizes live badges, and sets `has-unsaved-changes = true` for user review before committing. Both controls are disabled during active strict mode (`ui-locked-by-strict`).
-5. **Single-Instance IPC, Window Activation & System Tray UX:**
-   - Enforces single-instance execution via a named Win32 mutex (`Local\AW_Enforcer_SingleInstance_Mutex`).
-   - Pairs with a named Win32 auto-reset activation event (`Local\AW_Enforcer_Activate_Event`): when a second instance is launched without `--autostart` or `--minimized`, it signals the activation event and exits immediately.
-   - The primary instance's 250ms UI timer detects the event, calls `ShowWindow(hwnd, SW_RESTORE)`, and `SetForegroundWindow(hwnd)` to focus the existing `SettingsWindow`.
-   - Double-clicking the system tray icon (`TrayIconEvent::DoubleClick`) opens or restores the `SettingsWindow`.
-   - The system tray tooltip dynamically displays active snooze countdowns (e.g. `AW-Enforcer (Snoozed 15m) — Today: 2h 15m`), and rule status badges in the overview display `"Snoozed ({rem}m)"` during active global or per-rule snooze intervals. The tray menu contextually toggles between `"Snooze All (15m)"` and `"Resume Snoozed Rules"` based on active snoozes (`OverlayAction::UpdateLiveStatus.any_snoozed`), allowing early resumption of both global and individual rule snoozes via `DaemonCommand::ClearSnoozeAll`. All tray and UI state-mutating commands (`SnoozeAll`, `SetPauseAll`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeBreak`, `ResetRuleSession`, `ClearSnoozeAll`, and `ReloadConfig`) trigger an immediate telemetry and badge refresh (`self.poll_tick().await`), ensuring system tray tooltips, menu toggles (`any_snoozed`), and Settings rule status badges update instantly without waiting for the next periodic poll interval.
-6. **Ergonomic, Shell & Anti-Bypass Safeguards:**
-   - **Double-Counting Prevention via Interval Coalescing (`merge_overlapping_intervals`):** Eliminates double-counted screen time from concurrent browser windows, nested activity events, and overlapping ActivityWatch records across continuous session tracking, daily quota usage calculations, and 24-hour histogram binning.
-   - **Multi-Browser Web Watcher Integration & Resilient Bucket Selection:** Dynamically discovers all local browser buckets (Chrome, Edge, Firefox, Brave) while strictly excluding non-local synchronized buckets (`-synced` and `_synced`) across window, AFK, and web watchers, querying unioned and `not-afk` intersected web activity. Periodically refreshes web bucket discovery every 60 seconds so newly opened browsers are detected at runtime. When multiple local window or AFK buckets exist (e.g., across hostname migrations), deterministically selects the bucket matching the local machine's hostname or with the latest `last_updated`/`created` timestamp.
-   - **URL Tab-Level Target Verification, Full URL Tracking & Wildcard Protection:** In Stage 2/3 and break countdowns, matches open browser windows against the specific tab title regex (`rt.last_matched_title_regex`, falling back to regex-escaped `rt.last_matched_title`), ensuring that closing or navigating away from the target tab during a grace period safely skips destructive closing. `RuleRuntime::last_matched_url` preserves the full URL string (`ev.data.url`) alongside `last_matched_app` (hostname), enabling path-based URL regexes (e.g. `youtube\.com/shorts`) to be matched accurately via `matched_url_or_app_matches_rule`. Navigating between pages matching `rule.url_regex` while a grace period is actively ticking continuously updates `rt.last_matched_app`, `rt.last_matched_url`, `rt.last_matched_title`, and `rt.last_matched_title_regex`. Destructive actions (`CloseTab` and `CloseWindow`) for `MonitorSelection::Urls` strictly require a verified tab title regex (`last_matched_title_regex`); if the tab title is empty or whitespace-only, destructive actions are skipped and the cycle completes safely, preventing unguarded closures from closing all open browser windows. Event selection orders by end-time and start-time (`(event_end_utc(ev), ev.timestamp)`) across active window discovery, rule evaluation, and active app polling so long-running active sessions are never shadowed by shorter finished intervals. The `{app}` message placeholder accurately extracts and retains the URL hostname (e.g. `youtube.com`).
-   - **Stage 1 Warning Snooze State Preservation:** Snoozing an alert while a pre-action warning is active preserves `rt.warned_current_cycle = true` so snooze expiration does not fire duplicate pre-action warnings within the same threshold cycle.
-   - **Long Process Paths & Keystroke Synthesis Guards:** Win32 executable path resolution employs a 1024-wchar stack buffer to prevent `ERROR_INSUFFICIENT_BUFFER` on deep paths. Tab-closing input synthesis (`enforcer::close_active_browser_tab`) explicitly releases physical `VK_SHIFT` and `VK_MENU` keys prior to sending `Ctrl+W` to prevent unintended `Ctrl+Shift+W` (closing whole browser window).
-   - **Dynamic Lifecycle and Off-Schedule Timer Cleanup:** Deleting, disabling, or transitioning off-schedule on any rule immediately resets its active countdown timers and clears or transitions any active overlay if that rule was being displayed.
-   - **Logical Day-Start Hour Offset (`day_start_hour`, default `4` = `04:00 AM`):** Prevents midnight rollover from resetting daily quotas during late-night sessions.
-   - **1.5s Natural Break Delay & Visual Idle Feedback:** Waits for a 1.5s pause in user input before launching a full-screen `Show Overlay` break (when `grace_duration == 0`), and displays `"⏸ Input detected — timer paused until you step away"` when mouse/keyboard activity occurs during a break.
-   - **Fullscreen / Presentation DND (`SHQueryUserNotificationState`):** Automatically downgrades `Show Overlay` breaks to passive Windows notifications during fullscreen D3D games, presentations, or Focus Assist.
-   - **Strict Mode Lockout & Overlay Priority Hierarchy:** `OverlayMode::priority()` enforces `BreakEnforcer (4) > HudTimer (3) > HudToast (2) > HudStatus (1) > Hidden (0)`. When `Strict Mode` is enabled on a `Show Overlay` rule, it hides Skip/Snooze buttons on the overlay, disables tray bypass items, blocks `SnoozeBreak`/`SkipBreak`/`CloseOverlay`/`TriggerTestOverlay` commands in the engine, and locks rule/settings edits (including `Pause All Rules` and `Test Overlays` buttons) behind a 15-second confirmation timer while actively enforcing or during the pending break natural pause (`rt.pending_break_since`). Active strict `BreakEnforcer` overlays cannot be clobbered by non-strict, click-through, or shorter breaks from other rules, and countdown transitions prioritize active breaks maximizing `(strict_mode, !click_through, remaining_seconds)`. Test and preview alerts can replace preceding test overlays without priority lockouts.
-   - **Protected Window & Shell Guards (`enforcer::is_protected_window`):** Excludes the `aw-enforcer` process (`GetCurrentProcessId()`) and Windows shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`, `NotifyIconOverflowWindow`, `TopLevelWindowForOverflowXamlIsland`, `MultitaskingViewFrame`) from window enumeration, wildcard `WM_CLOSE`, `Ctrl+W` synthesis, and process termination.
-   - **Sub-Second Session Interval Accumulation & Clamping:** Continuous session calculation accumulates millisecond intervals before integer second conversion and clamps event boundaries to `now_utc`, preventing up to 999ms per-interval truncation.
-   - **Dismissing Pending Breaks Completes Cycle:** Dismissing a break during its natural 1.5s pause marks the cycle completed (`rt.complete_cycle(now)`), preventing it from immediately re-triggering on the next poll tick.
-   - **Strict Unlock Reset on Window Close:** When `destroy_windows_on_hide = false`, closing the Settings window immediately resets `strict_unlocked = false` so strict mode lockouts cannot be bypassed across window re-openings.
-   - **Action Center Plain-Text Sanitization:** `formatter::format_plain_message` cleanly strips Markdown heading prefixes (`# `, `## `) and valid attribute blocks (`[color=... size=... bold]`) before sending native WinRT toasts to the Windows Action Center.
-   - **Off-Screen HUD Clamping & Clean Initial Placement:** `clamp_or_reset_status_pos` detects if the 24h Stats HUD window has drifted off-screen (e.g. after monitor disconnection) and resets it to the primary display's top-right corner. Opening/starting `OverlayMode::HudStatus` computes DPI-scaled bounds on the primary display (`primary_top_right`) without inheriting stale positions from other overlay modes or unscaled dimensions, ensuring the HUD starts fully on-screen within work area boundaries, and resetting stored coordinates on `hide_all()`.
-   - **Settings Window Sizing & Multi-Row Toolbar Layouts:** `SettingsWindow` defines `preferred-width: 1240px` (`min-width: 1080px`, `preferred-height: 780px`) so the window opens comfortably displaying all actions and buttons. Test overlay buttons in General Settings and message variable quick-insert chips in Section 4 are organized into dual-row layouts, and rule card overview descriptions elide overflowing text, ensuring all action buttons remain fully visible on screen.
-7. **Performance, Renderer & GPU Memory Management:**
-   - **Worker Thread Optimization:** Tokio runtime is configured with `.worker_threads(2)` to minimize idle background thread overhead on high-core CPUs.
-   - **Direct JSON Event Stream Deserialization:** `AwClient` executes queries and deserializes directly into `Vec<Vec<AwEvent>>`, eliminating intermediate `serde_json::Value` allocations and cloning.
-   - **Multi-Hour 24h Histogram Bin Rollover:** Stats histogram aligns hour boundaries to multiples of `(bin_size_mins / 60)` and computes coalesced overlap for intermediate bins during multi-bin transitions.
-   - **Rendering Backend Toggle (`slint_renderer`, default `"femtovg"`):** Allows switching between OpenGL hardware acceleration (`renderer-femtovg`) and CPU software rendering (`renderer-software`) directly from the General Settings **Performance** card.
-   - **DPI-Aware Positioning & DWM Frame Reset:** Top-right HUD cards scale logical pixel geometry and screen margins by monitor DPI scale factor (`scale_factor().max(1.0)`). Reused overlay windows cleanly reset DWM client area margins (`DwmExtendFrameIntoClientArea`) with zeroed margins when transitioning from fullscreen mode.
-   - **Same-Tick Countdown Decrement Prevention:** Real-time 1s countdown reorders active HUD overlay ticking to the start of `realtime_tick()`, ensuring newly spawned cards from completed grace periods or launched breaks retain their full duration without being decremented in the same tick.
-   - **Authoritative Win32 Overlay Placement, Multi-Monitor Hotplug & Slint Rendering:** Overlay styling, window styles, and monitor geometry updates are applied authoritatively in a single pass (`apply_pending_win32_styles()`, returning early if `OverlayMode::Hidden`). `OverlayManager::show_mode` updates placement configurations across all monitors with re-entrancy protection (`is_updating_placements`) before invoking `apply_pending_win32_styles()`, preventing recursive hotplug checks and stack overflows on multi-monitor systems. Active overlay windows explicitly activate Slint rendering via `win.show()` alongside Win32 `SW_SHOW`, ensuring both full-screen break screens and floating HUD cards (`HudToast`, `HudTimer`, `HudStatus`) reliably render on screen. During active break enforcement, changes in connected display count or monitor work areas (e.g., monitor plug/unplug, resolution or dock changes) are automatically detected and trigger overlay respawning to maintain full multi-monitor coverage. Countdown state (`remaining_seconds` and `duration_seconds`) is continuously synchronized in `current_mode` during `update_countdown()`, ensuring display hotplug respawns preserve the active countdown exactly without resetting to full duration. Break overlays accurately track `duration_seconds` and compute real-time progress ratios on launch and reuse, while initializing user idle status via `get_idle_time_millis() >= 3000`.
-   - **Cached Window UI State Synchronization (`sync_live_state_to_ui`):** When `destroy_windows_on_hide` is disabled and the existing `SettingsWindow` is re-opened or changes are discarded, active session duration, daily screen time, active app, strict lock states, and live rule status badges are preserved and refreshed immediately.
-   - **Full-Screen Overlay Surface Cleanup (`destroy_windows_on_hide`, default `true`):** Calling `OverlayManager::hide_all` clears active `OverlayWindow` instances from `self.windows`, immediately releasing multi-monitor swapchains, framebuffers, and driver memory once breaks or toasts dismiss.
-   - **Lazy-Instantiation & Teardown of Settings UI:** `SettingsWindow` is not allocated at startup when launched silently (`--autostart` / `--minimized`). It is instantiated on demand when clicking "Open Settings" in the tray, and dropped on close (`'X'`) via a zero-delay UI timer when `destroy_windows_on_hide` is enabled.
-   - **Event-Driven UI Dispatch & Idle-Quiet Connection Polling:** `OverlayAction` updates from the Tokio engine are dispatched directly onto the Slint UI thread via `slint::invoke_from_event_loop` (`OVERLAY_ACTION_HANDLER`), while tray/countdown maintenance runs on a lightweight `250ms` timer that only updates the UI model and polls `/api/0/info` connection health when `SettingsWindow` is visible.
-   - **Per-Tick Usage Caching (`RuleRuntime::daily_usage_seconds`):** Caches daily quota calculations during `evaluate_rule` so `poll_tick` reuses the cached value when formatting Live Status badges instead of scanning events twice.
-   - **Zero-Allocation Win32 Process Resolution & Shared Snapshot Iterator:** Uses `QueryFullProcessImageNameW` on stack buffers and zero-allocation `.exe` stem matching (`enforcer::exe_name_matches_targets`). Process termination (`kill_target_processes`) and known-app discovery (`scan_and_update_known_apps`) share `enforcer::for_each_process` over Win32 ToolHelp snapshots.
-   - **Typed Event Schema (`AwEventData`) & Optimized Release Profile:** Deserializes ActivityWatch event payloads into strongly-typed Rust structs and compiles release binaries with `lto = true`, `codegen-units = 1`, `strip = true`, and `opt-level = "s"`.
-   - **Bucket Discovery Deduplication & Query Escaping:** `AwClient::refresh_buckets` immediately timestamps `last_web_bucket_check` upon start of discovery, preventing redundant back-to-back `/api/0/buckets/` calls during poll ticks. Bucket identifiers escape backslashes and double quotes (`escape_bucket_id`) before query string interpolation.
-   - **AwClient Reuse Across Config Reloads:** `AwClient` stores `port` and `api_key` (`AwClient::matches_config`). `Engine::handle_command(DaemonCommand::ReloadConfig)` and `on_save_config` reuse the existing `AwClient` instance when port and API key are unchanged, preserving the HTTP connection pool, verified bucket state (`buckets_verified`), and discovered bucket IDs (`window_bucket_id`, `afk_bucket_id`, `web_bucket_ids`) without redundant `/api/0/buckets/` network roundtrips.
-   - **Deduplicated Tab Title Regex Compilation:** `RuleRuntime::set_last_matched_title` normalizes whitespace/empty titles to `None` and short-circuits immediately when the matched window/tab title has not changed, avoiding recompiling identical title regular expressions on every poll tick.
-   - **Zero-Allocation Protected Window Class Check:** Window class inspection compares UTF-16 buffers directly against static UTF-16 constants for shell surfaces (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`, `NotifyIconOverflowWindow`, `TopLevelWindowForOverflowXamlIsland`, `MultitaskingViewFrame`), eliminating heap `String` allocations during `EnumWindows`.
-   - **Immediate Telemetry & Badge Refresh on Reload:** Applying settings or reloading configuration triggers an immediate `self.poll_tick().await`, refreshing live badges and tray tooltip instantly without waiting for the next polling interval.
+| Metadata | Details |
+| :--- | :--- |
+| **Document Title** | Technical Specification: AW-Enforcer (Unified Rule Engine & Slint UI) |
+| **Document Status** | Approved / Living Specification |
+| **Target Platform** | Windows 10 / Windows 11 (x86_64) |
+| **Implementation Language** | Rust (Edition 2021), Slint UI Toolkit (v1.9+) |
+| **Primary Dependency** | Local ActivityWatch Server (`http://localhost:5600/api/0/`) |
+| **Last Updated** | November 2026 |
 
 ---
 
-## 2. Configuration Schema (`src/config.rs`)
+## 1. Executive Summary & Problem Statement
 
-Store configuration at `%LOCALAPPDATA%\aw-enforcer\config.toml`. Note that saving an empty `rules = []` list is preserved across restarts; default rules are only generated when creating a new `config.toml` or falling back from a corrupted file. Configuration writes in `Config::save_to_path` serialize to a sibling temporary file (`path.with_extension("toml.tmp")`) and atomically replace the destination via `fs::rename` (falling back to direct file write and temporary file cleanup if atomic rename fails across filesystem boundaries or locks). If loading an existing `config.toml` fails due to syntax corruption or deserialization errors (`Config::try_load`), the corrupted file is automatically backed up to `path.with_extension("toml.bak")` (`config.toml.bak`) with a logged warning before falling back to defaults, ensuring user data is never lost.
+### 1.1 Executive Summary
+**AW-Enforcer** is a high-performance, lightweight Windows desktop application written in Rust that operates continuously in the system tray. It interfaces with a local [ActivityWatch](https://activitywatch.net/) instance to enforce ergonomic breaks, application time limits, and digital wellbeing policies. Designed with an orthogonal trigger/action architecture, AW-Enforcer supports versatile rule formulations ranging from posture and stretch reminders to strict, un-bypassable process termination and multi-monitor screen lockouts.
 
-### A. Time Units & Duration Struct
+### 1.2 Problem Statement
+Modern computer professionals face persistent physical and mental fatigue due to prolonged, uninterrupted screen time. While passive tracking tools (such as standard ActivityWatch dashboards) record user behavior, they fail to enforce healthy habits actively. Existing intervention tools suffer from major drawbacks:
+1. **Rigid Triggers and Actions:** Time-limit and periodic reminder tools are often hardcoded to specific alerts, lacking support for custom actions (e.g., locking the workstation or terminating distracting processes after a grace period).
+2. **Double-Counting and Multi-Monitor Inaccuracies:** Browser extensions continue reporting active tabs even when browser windows are unfocused or idling on a secondary display, skewing time tracking.
+3. **Trivial Bypassability:** Users easily close or ignore standard notification prompts during deep distraction or hyperfocus, undermining ergonomic goals.
+4. **Heavy Resource Footprint:** Many commercial productivity enforcers rely on bloated Electron runtimes, consuming hundreds of megabytes of RAM and keeping discrete GPUs awake.
+
+AW-Enforcer addresses these challenges through a zero-bloat native architecture, strict Win32 anti-bypass protections, sub-second input-idle detection, and authoritative multi-monitor overlay management.
+
+---
+
+## 2. System Goals and Non-Goals
+
+### 2.1 Functional Goals
+- **Orthogonal Rule Configuration:** Any trigger mechanism (`Period` or `Limit`) can be combined with any supported action (`Show Overlay`, `Show Notification`, `Show Statistics`, `Lock Workstation`, `Close Tab`, `Close Window`, `Kill Process`).
+- **Three-Stage Enforcement Pipeline:** Every rule supports configurable pre-action warnings (Stage 1), interactive grace countdowns (Stage 2), and authoritative action execution (Stage 3).
+- **Accurate Telemetry Aggregation:** Filter and coalesce web events (`aw-watcher-web`) against active foreground browser intervals (`aw-watcher-window`) and idle intervals (`aw-watcher-afk`) without double-counting.
+- **Strict Anti-Bypass Enforcements:** Optional strict modes that hide skip/snooze options, lock application settings, and disable tray bypasses across break and grace intervals.
+- **Low-Latency Native UI:** A responsive Slint-based GUI that opens instantly, supports hardware-accelerated OpenGL or software rendering, and releases GPU swapchains when dismissed.
+
+### 2.2 Non-Functional Goals
+- **Minimal Resource Footprint:** Idle RAM usage below 35 MB, resting CPU usage near 0%, and Tokio runtime constrained to two worker threads.
+- **Robust Persistence & Safety:** Atomic configuration saves using temporary sibling files, automatic corrupted file backups (`.toml.bak`), and strict validation clamping.
+- **Display Server Resilience:** Graceful handling of display resolution changes, multi-monitor docking/undocking, and fullscreen DirectX/presentation mode detection.
+
+### 2.3 Explicit Non-Goals
+- **Cross-Platform Host Support:** AW-Enforcer is purpose-built for the Win32 API ecosystem (Windows 10/11); cross-platform desktop abstractions for macOS/Linux are out of scope.
+- **Remote Cloud Sync:** Configuration and telemetry remain strictly local; no external network traffic is generated beyond `localhost` HTTP polling.
+- **Kernel-Level Anti-Tamper:** AW-Enforcer operates in user space and does not employ kernel drivers to prevent administrative task termination via Task Manager.
+
+---
+
+## 3. High-Level Architecture & Concurrency Model
+
+### 3.1 Architectural Decomposition
+
+The application is structured into decoupled subsystems operating across distinct threads:
+
+```mermaid
+flowchart TD
+    subgraph UI_Thread ["Slint GUI & System Tray Thread"]
+        Tray["System Tray Icon & Menu\n(tray-icon)"]
+        SettingsWin["Settings Window\n(ui/settings.slint)"]
+        OverlayWin["Overlay & HUD Windows\n(ui/overlay.slint)"]
+        SingleInst["Single-Instance Mutex & Event\n(Local\\AW_Enforcer_*)"]
+    end
+
+    subgraph Async_Runtime ["Tokio Async Runtime (2 Worker Threads)"]
+        Engine["Rule Engine & State Machine\n(src/engine.rs)"]
+        AwClient["ActivityWatch HTTP Client\n(src/aw_client.rs)"]
+        Enforcer["Win32 Enforcer Subsystem\n(src/enforcer.rs)"]
+    end
+
+    subgraph Storage ["Local Storage"]
+        ConfigDisk["%LOCALAPPDATA%\\aw-enforcer\\config.toml"]
+        ConfigBackup["config.toml.bak"]
+    end
+
+    subgraph AW_Server ["Local ActivityWatch Server"]
+        AWRest["REST API (localhost:5600)\n/api/0/buckets\n/api/0/query"]
+    end
+
+    Tray -->|DaemonCommand MPSC| Engine
+    SettingsWin -->|DaemonCommand MPSC| Engine
+    Engine -->|OverlayAction Dispatch\nslint::invoke_from_event_loop| OverlayWin
+    Engine -->|UpdateLiveStatus| SettingsWin
+    Engine -->|UpdateLiveStatus| Tray
+
+    Engine -->|HTTP GET/POST| AwClient
+    AwClient --> AWRest
+
+    Engine -->|Execute Actions| Enforcer
+    SettingsWin -->|Atomic Save / Load| ConfigDisk
+    ConfigDisk -.->|Automatic Backup on Corruption| ConfigBackup
+```
+
+### 3.2 Threading & Communication
+1. **Slint Event Loop (Main Thread):** Owns window handles, OpenGL/FemtoVG render contexts, and the Win32 message pump for the system tray. It periodically polls for activation events via a 250ms timer.
+2. **Tokio Async Engine Runtime (Background):** A 2-worker multithreaded Tokio runtime driving periodic polling ticks (`poll_interval_seconds`) and a 1-second high-resolution `realtime_tick()` timer.
+3. **MPSC Command Channel:** User interactions in the GUI or tray dispatch `DaemonCommand` messages to the engine through a non-blocking Tokio MPSC channel (`tokio::sync::mpsc::Sender<DaemonCommand>`).
+4. **UI Dispatch Pipeline:** The engine communicates state changes back to the UI via `slint::invoke_from_event_loop` using typed `OverlayAction` variants, preventing UI freezes during network I/O or Win32 process scans.
+
+---
+
+## 4. Configuration Schema & Data Model (`src/config.rs`)
+
+Configuration resides at `%LOCALAPPDATA%\aw-enforcer\config.toml`. All changes are serialized atomically to prevent corruption.
+
+### 4.1 Type Definitions
+
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TimeUnit {
     Hr,
+    #[default]
     Min,
     Sec,
-}
-
-impl Default for TimeUnit {
-    fn default() -> Self {
-        Self::Min
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,11 +121,6 @@ pub struct DurationConfig {
     pub unit: TimeUnit,
 }
 
-```
-
-### B. Strongly-Typed `Rule` Enums, Struct & Sanitization
-
-```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MonitorSelection {
     #[default]
@@ -140,7 +162,11 @@ pub enum NotificationMethod {
     Hud,
     Windows,
 }
+```
 
+### 4.2 Complete Rule Structure
+
+```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     // 1. General
@@ -148,60 +174,65 @@ pub struct Rule {
     pub enabled: bool,
     pub name: String,
 
-    // 2. Monitor
+    // 2. Monitor Target
     #[serde(default)]
-    pub monitor_selection: MonitorSelection, // "Executables" | "Titles" | "Urls"
+    pub monitor_selection: MonitorSelection,
     #[serde(default = "default_wildcard_targets")]
-    pub target_executables: Vec<String>,     // Active when monitor_selection == Executables ("*" = all)
+    pub target_executables: Vec<String>,     // Wildcard ["*"] or list of .exe names
     #[serde(default)]
-    pub title_regex: String,                 // Active when monitor_selection == Titles
+    pub title_regex: String,                 // Evaluated when monitor_selection == Titles
     #[serde(default)]
-    pub url_regex: String,                   // Active when monitor_selection == Urls
+    pub url_regex: String,                   // Evaluated when monitor_selection == Urls
 
     // 3. Trigger
     #[serde(default)]
-    pub trigger: TriggerType,                // "Period" | "Limit"
+    pub trigger: TriggerType,                // Period vs. Limit
     #[serde(default = "default_period")]
-    pub period: DurationConfig,              // Continuous active session threshold (when trigger == Period)
+    pub period: DurationConfig,              // Continuous active session duration
     #[serde(default = "default_reset_after_afk")]
-    pub reset_after_afk: DurationConfig,     // Idle AFK gap that resets session (when trigger == Period)
+    pub reset_after_afk: DurationConfig,     // Inactivity duration resetting continuous session
     #[serde(default = "default_limit")]
-    pub limit: DurationConfig,               // Daily cumulative active usage limit (when trigger == Limit; 0 = immediate)
+    pub limit: DurationConfig,               // Cumulative daily screen-time limit
 
-    // 4. Action
+    // 4. Action & Alerts
     #[serde(default)]
-    pub action: RuleAction,                  // "Show Overlay" | "Show Notification" | "Show Statistics" | "Lock Workstation" | "Close Tab" | "Close Window" | "Kill Process"
+    pub action: RuleAction,
     #[serde(default = "default_warn_before")]
-    pub warn_before: DurationConfig,         // Pre-action warning lead time (0 = disabled)
+    pub warn_before: DurationConfig,         // Stage 1 warning lead time (0 = disabled)
     #[serde(default = "default_grace")]
-    pub grace_duration: DurationConfig,      // Grace countdown before action executes (0 = disabled)
+    pub grace_duration: DurationConfig,      // Stage 2 grace countdown (0 = disabled)
     #[serde(default = "default_break_duration")]
-    pub break_duration: DurationConfig,      // Required idle break duration (when action == ShowOverlay)
+    pub break_duration: DurationConfig,      // Required idle break time for ShowOverlay
     #[serde(default)]
-    pub click_through: bool,                 // Passes input through overlay (when action == ShowOverlay)
+    pub click_through: bool,                 // Passes input through overlay (WS_EX_TRANSPARENT)
     #[serde(default)]
-    pub strict_mode: bool,                   // Hides Skip/Snooze & locks settings (when action == ShowOverlay)
+    pub strict_mode: bool,                   // Locks settings and UI during enforcement
     #[serde(default)]
-    pub notification_method: NotificationMethod, // "HUD" | "Windows" (when action == ShowNotification)
+    pub notification_method: NotificationMethod, // HUD Toast vs. Windows System Toast
     #[serde(default = "default_notification_duration")]
-    pub notification_duration: DurationConfig, // Duration HUD notification is visible (when action == ShowNotification && notification_method == HUD)
+    pub notification_duration: DurationConfig,
     #[serde(default)]
-    pub show_remaining_time: bool,           // Live countdown timer on HUD notification
+    pub show_remaining_time: bool,           // Real-time HUD countdown display
     #[serde(default)]
-    pub message: String,                     // Rich formatted message template (used when action == ShowOverlay || ShowNotification, or as custom warning/grace alert across all actions)
+    pub message: String,                     // Formatted markdown/color template
 
     // 5. Schedule
     #[serde(default)]
     pub schedule: RuleSchedule,              // 7x24 bitmask matrix
 }
-
 ```
 
-`Rule::sanitize(&mut self)` enforces safety and timing invariants on both config load and UI save (`view_to_rule`), automatically downgrading `RuleAction::KillProcess` to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard `.exe` target is configured, while clamping `period.value`, `reset_after_afk.value`, `break_duration.value`, and `notification_duration.value` to at least `1`. `Rule::trigger_threshold_seconds()` returns `period.to_seconds().max(1)` for `TriggerType::Period`.
+### 4.3 Sanitization Invariants & Clamping
+Both `Config::load_from_path` and `Config::save_to_path` execute `Config::sanitize(&mut self)` to enforce system stability:
+- **Port Clamping:** `aw_port` clamped to valid TCP ports (`1..=65535`).
+- **Polling Rate:** `poll_interval_seconds` clamped to `≥ 2` seconds (upper bound `120s`).
+- **Logical Day-Start:** `day_start_hour` clamped to `0..=23` (default `4` = 04:00 AM).
+- **Destructive Action Safety:** `RuleAction::KillProcess` is downgraded to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard target is present.
+- **Duration Clamping:** `period.value`, `reset_after_afk.value`, `break_duration.value`, and `notification_duration.value` are clamped to `≥ 1`.
+- **Color Validation:** `overlay.accent_color`, `overlay.background_color`, and `overlay.text_color` are parsed using `formatter::parse_hex_color`. Invalid hex entries reset to default values (`#3b82f6`, `#0f172a`, `#f8fafc`).
+- **Stats Consistency:** `daily_screentime_target_minutes ≥ 1`, and `threshold_excessive_minutes ≥ daily_screentime_target_minutes`.
 
-`Config::sanitize(&mut self)` unifies all application configuration invariants, validating `histogram_time_format` (falling back to `"%H:%M"`), clamping `aw_port` to valid TCP ports (`1..=65535`, `.max(1)`), `poll_interval_seconds` (\ge 2), `day_start_hour` (\le 23), normalizing `slint_renderer` (`"software"` vs `"femtovg"`), clamping `overlay.opacity` to `[0.1, 1.0]`, clamping stats thresholds (`daily_screentime_target_minutes` \ge 1, `threshold_excessive_minutes` \ge target, histogram bin size \ge 1, bin count \ge 1), and invoking `sanitize_rules()`. Both `Config::load_from_path` and `Config::save_to_path` invoke `Config::sanitize()`, ensuring identical invariants across disk persistence and configuration export/import. Saving configuration in the UI immediately applies sanitized and clamped values back to `SettingsWindow` controls (`apply_config_to_ui`) while preserving live rule status badges (`sync_live_state_to_ui`). Similarly, closing a resident `SettingsWindow` (`destroy_windows_on_hide = false`) synchronizes live status badges after applying the saved configuration.
-
-### C. Example `config.toml` (v1.0.0)
+### 4.4 Reference `config.toml`
 
 ```toml
 [general]
@@ -229,11 +260,10 @@ histogram_bin_size_minutes = 60
 histogram_bin_count = 24
 histogram_time_format = "%H:%M"
 
-# Rule 1: Ergonomic Break Reminder (Period + Show Overlay)
 [[rules]]
-id = "rule-ergo-break"
+id = "rule-1"
 enabled = true
-name = "Workday Ergonomic Break"
+name = "Ergonomic Break"
 monitor_selection = "Executables"
 target_executables = ["*"]
 title_regex = ""
@@ -247,11 +277,11 @@ warn_before = { value = 5, unit = "Min" }
 grace_duration = { value = 0, unit = "Sec" }
 break_duration = { value = 10, unit = "Min" }
 click_through = false
-strict_mode = false
+strict_mode = true
 notification_method = "HUD"
 notification_duration = { value = 10, unit = "Sec" }
 show_remaining_time = false
-message = "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
+message = "# Time for a Break\n[color=#38bdf8 size=18 bold] Active for {session_duration}.\nPlease step away for {break_time}."
 
 [rules.schedule]
 mon = "000000001111111111000000"
@@ -261,170 +291,127 @@ thu = "000000001111111111000000"
 fri = "000000001111111111000000"
 sat = "000000000000000000000000"
 sun = "000000000000000000000000"
-
-# Rule 2: Application Quota Blocker (Limit + Close Window)
-[[rules]]
-id = "rule-gaming-limit"
-enabled = true
-name = "Weeknight Gaming Limit"
-monitor_selection = "Executables"
-target_executables = ["steam.exe", "discord.exe"]
-title_regex = ""
-url_regex = ""
-trigger = "Limit"
-period = { value = 50, unit = "Min" }
-reset_after_afk = { value = 5, unit = "Min" }
-limit = { value = 1, unit = "Hr" }
-action = "Close Window"
-warn_before = { value = 5, unit = "Min" }
-grace_duration = { value = 30, unit = "Sec" }
-break_duration = { value = 10, unit = "Min" }
-click_through = false
-strict_mode = false
-notification_method = "HUD"
-notification_duration = { value = 10, unit = "Sec" }
-show_remaining_time = false
-message = "## Quota Warning: {app}\n[color=#f59e0b bold] {remaining} remaining out of your {limit} daily limit.\nPlease wrap up and save your work."
-
-[rules.schedule]
-mon = "000000000111111111111100"
-tue = "000000000111111111111100"
-wed = "000000000111111111111100"
-thu = "000000000111111111111100"
-fri = "000000000111111111111100"
-sat = "000000000000000000000000"
-sun = "000000000000000000000000"
-
 ```
 
 ---
 
-## 3. UI Navigation & Settings Screens (`ui/settings.slint`)
+## 5. Unified Rule Evaluation & Enforcement Subsystem
 
-### A. Tab 0: General Settings (`active-tab == 0`)
+### 5.1 Telemetry Aggregation & Web Intersection
+ActivityWatch event streams are processed on each `poll_tick()`:
+1. **Pre-Poll Verification:** `AwClient::prepare_poll_buckets` checks bucket readiness and re-discovers web buckets every 60 seconds. Offline servers produce empty event vectors immediately, reducing network roundtrips from 3 to 1.
+2. **Interval Coalescing (`merge_overlapping_intervals`):** Activity intervals across overlapping windows are merged into contiguous non-overlapping spans.
+3. **Web Event Filtering (`filter_web_events_by_active_browser_windows`):** Raw `aw-watcher-web` events are clipped to overlapping active foreground browser intervals (`enforcer::BROWSER_EXES`). Unfocused background browser tabs are excluded from accumulating screen time.
 
-The General Settings tab organizes application-wide preferences into five structured `SectionCard` panels:
+### 5.2 Rule Lifecycle State Machine
 
-1. **General Settings:** ActivityWatch Port (`aw_port`, minimum `1`, clamped to `1..=65535`), Polling Interval in seconds (`poll_interval_seconds`, minimum `2`, clamped to `2..=120`), Start on Windows Login (`autostart`), API Key (`api_key`), Logical Day Start Hour (`day_start_hour`), Fullscreen/Presentation DND (`suppress_fullscreen_d3d`), and Pause All Rules (`pause_all_rules`, disabled when `ui-locked-by-strict` is active).
-2. **Performance:**
-* **Slint Renderer (`slint-renderer`):** ComboBox selecting between OpenGL (`OpenGL (renderer-femtovg)`) and CPU Software (`CPU Software (renderer-software)`). Includes an interactive `InfoBadge` tooltip on hover/click (requires application restart).
-* **Destroy Windows when Hidden (`destroy-windows-on-hide`):** Checkbox controlling whether `OverlayWindow` and `SettingsWindow` instances and their OpenGL/GPU contexts are destroyed when hidden or closed (`true`), or kept resident in memory for instantaneous zero-latency display (`false`).
-3. **Overlay Theme & Appearance:** Overlay Opacity slider (`overlay_opacity`), Accent Color hex input (`accent_color_hex`), and test overlay trigger buttons (`Test Break Screen`, `Test HUD Toast`, `Test HUD Timer`, `Test 24h Stats HUD` — all disabled when `ui-locked-by-strict` is active). `Config::sanitize()` validates all `OverlayConfig` hex colors (`accent_color`, `background_color`, `text_color`) using `formatter::parse_hex_color`, restoring defaults if malformed while preserving valid 6- and 8-digit hex strings.
-4. **Activity Statistics & 24h HUD Configuration:** Daily Target Screen Time (`daily_screentime_target_minutes`, minimum `1`), Excessive Threshold (`threshold_excessive_minutes`, minimum dynamically bound to `daily_screentime_target_minutes`, automatically updating `threshold_excessive_minutes = val` when `threshold_excessive_minutes < val`), and Histogram Strftime Code (`histogram_time_format`) with live preview validation.
-5. **Configuration Backup & Transfer:** Dedicated card with **Export Config...** and **Import Config...** buttons (disabled during active strict mode via `ui-locked-by-strict`). Exports the active configuration via `rfd::FileDialog` to `.toml` format; imports external `.toml` files, runs full validation (`load_from_path`), synchronizes the UI and live telemetry, and marks `has-unsaved-changes = true` for user review before committing.
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: Rule Enabled & In-Schedule
+    Idle --> Evaluating: poll_tick()
+    Evaluating --> Warned: Stage 1 (remaining <= warn_before)
+    Warned --> Grace: Stage 2 (elapsed >= threshold && grace > 0)
+    Evaluating --> Grace: Stage 2 (elapsed >= threshold && grace > 0 && warn_before == 0)
+    Evaluating --> Action_Exec: Stage 3 (elapsed >= threshold && grace == 0)
+    Grace --> Action_Exec: Grace Countdown Expired (0s)
+    
+    Grace --> Snoozed: User clicks Snooze (5m)
+    Action_Exec --> Snoozed: User clicks Snooze
+    Action_Exec --> Completed: Action Executed / Acknowledged
+    
+    Snoozed --> Evaluating: Snooze Timer Expired
+    Completed --> Idle: AFK Reset (Period) / Day Rollover (Limit)
+```
 
-### B. Tab 1: Rule Child Tab Sections & Conditional Visibility Matrix (`active-tab == 1 && selected-rule-idx >= 0`)
+### 5.3 Three-Stage Evaluation Pipeline
 
-Adding a rule (`on_add_rule`) scans existing rules in `rules_model` to generate the lowest unused `rule-{n}` ID so deleting and adding rules never produces ID collisions. When `active-tab == 1 && selected-rule-idx >= 0`, `child_rule_view` binds reactive properties for the selected rule (`cur-monitor`, `cur-trigger`, `cur-action`, `has-target-executables`) and renders five structured `SectionCard` groups:
+#### Stage 1: Pre-Action Warning (`warn_before > 0`)
+- **Trigger Condition:** `threshold > 0 && warn_secs > 0 && warn_secs < threshold && elapsed >= threshold - warn_secs && elapsed < threshold`.
+- **Behavior:** Dispatches a HUD toast or notification once per cycle (`rt.warned_current_cycle = true`). For `ShowOverlay`, dispatches a specific upcoming-break warning to distinguish it from the break screen itself.
 
-### Section 1: General
+#### Stage 2: Grace Countdown (`grace_duration > 0`)
+- **Trigger Condition:** `elapsed >= threshold`.
+- **Behavior:** Initiates `rt.grace_countdown = Some((grace_secs, grace_secs))` and displays `OverlayMode::HudTimer`.
+- **Destructive Action Clamping:** When a daily `Limit` rule with destructive actions (`CloseTab`, `CloseWindow`, `KillProcess`, `LockWorkstation`) has already executed once today, subsequent triggers clamp `effective_grace = grace_secs.min(5)` to prevent endless bypasses.
+- **Tab Navigation Safety:** URL rules continuously verify that the matching tab title and hostname remain open. If the offending tab was closed or switched away from during grace, the action safely aborts and completes the cycle.
 
-All interactive controls across Sections 1 through 5 (as well as `+ Add Rule`, `+ Create Your First Rule`, `DurationInput`, `ExecutableSelector`, `ScheduleGrid`, and the message editor toolbar buttons) bind `enabled: !root.ui-locked-by-strict`. In `src/main.rs`, all sixteen corresponding rule mutation callbacks (`on_add_rule`, `on_delete_rule`, `on_duplicate_rule`, `on_move_rule`, `on_toggle_rule_enabled`, `on_active_rule_edited`, `on_browse_executable`, `on_add_known_app_to_rule`, `on_remove_executable_from_rule`, `on_toggle_schedule_slot`, `on_toggle_schedule_day`, `on_toggle_schedule_hour`, `on_apply_schedule_preset`, `on_message_text_edited`, `on_apply_line_style`, `on_append_placeholder`) verify `is_ui_locked_by_strict(&win)` and return immediately if locked, preventing changes while a strict break is active.
-
-| Control | Type | Visibility Condition | Description |
-| --- | --- | --- | --- |
-| **Rule Enabled** | `CheckBox` | **Always Visible** | Enables or disables evaluation of this rule during active schedule hours. |
-| **Rule Name** | `LineEdit` | **Always Visible** | Human-readable name displayed in tabs, notifications, and `{rule_name}`. |
-
-### Section 2: Monitor
-
-| Control | Type | Visibility Condition | Description |
-| --- | --- | --- | --- |
-| **Selection Mode** | `ComboBox` (`["Executables", "Titles", "Urls"]`) | **Always Visible** | Determines whether the rule matches process executables, window titles, or browser URLs. Switching modes sanitizes `Kill Process` to `Close Window` if no specific `.exe` target applies and refreshes the live message preview. |
-| **Monitored Executables** | `ExecutableSelector` | **`cur-monitor == "Executables"`** | Chip list of `.exe` names, manual `.exe` input field with Add button/Enter key support, `"Browse .exe..."` file dialog, and running apps dropdown (which resets to placeholder after each selection). Empty UI list serializes as `["*"]` and displays wildcard guidance text ("All applications monitored (* wildcard) — add specific .exe names below to restrict."). Input names are automatically normalized with `.exe` extensions and deduplicated case-insensitively. |
-| **Window Title Regex** | `LineEdit` | **`cur-monitor == "Titles"`** | Regular expression matched against `event.data.title` and visible window titles (with real-time regex syntax validation). |
-| **Browser URL Regex** | `LineEdit` | **`cur-monitor == "Urls"`** | Regular expression matched against `event.data.url` from `aw-watcher-web` (with real-time regex syntax validation). |
-
-### Section 3: Trigger
-
-| Control | Type | Visibility Condition | Description |
-| --- | --- | --- | --- |
-| **Trigger:** | `ComboBox` (`["Period", "Limit"]`) | **Always Visible** | Selects continuous active session duration (`Period`) vs. cumulative daily usage quota (`Limit`). |
-| **Period:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Period"`** | Continuous active session time before triggering the configured action. |
-| **Reset Session after AFK:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Period"`** | AFK gap required to reset the continuous session counter to `0`. |
-| **Daily Limit (0 = immediate):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-trigger == "Limit"`** | Maximum cumulative daily active duration allowed (`0` = immediate enforcement during scheduled hours). |
-
-### Section 4: Action
-
-| Control | Type | Visibility Condition | Description |
-| --- | --- | --- | --- |
-| **Action:** | `ComboBox` | **Always Visible** | When `cur-monitor == "Executables"` and `has-target-executables` is true, all 7 actions (`["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]`) are selectable; otherwise `Kill Process` is omitted. |
-| **Notification Method:** | Segmented Toggle (`["HUD", "Windows"]`) | **`cur-action == "Show Notification"`** | Selects interactive top-right `HudToast` card (`HUD`) vs. native Windows Action Center toast (`Windows`). |
-| **Duration:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-action == "Show Notification" && notification-method == "HUD"`** | Controls the duration the HUD notification remains visible on screen before auto-dismissing. |
-| **Show Time Remaining:** | `CheckBox` | **`cur-action == "Show Notification" && notification-method == "HUD"`** | Displays a real-time countdown timer in the top-right HUD notification header showing remaining display time. |
-| **Warn Before Action (0 = disabled):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **Always Visible** | Lead time before threshold to display a pre-action warning (`0` = disabled). When `warn_before.to_seconds() > 0 && warn_before.to_seconds() >= rule.trigger_threshold_seconds()`, triggers `warn-before-exceeds-threshold` and displays an inline amber warning text (`"⚠ Warn Before Action must be shorter than the trigger Period/Limit to fire before enforcement."`). |
-| **Grace Countdown (0 = disabled):** | `DurationInput` (`Hr`/`Min`/`Sec`) | **Always Visible** | Displays a top-right `HudTimer` final countdown before executing the action (`0` = immediate execution). |
-| **Break Duration:** | `DurationInput` (`Hr`/`Min`/`Sec`) | **`cur-action == "Show Overlay"`** | Required physical idle duration to complete the full-screen break overlay. |
-| **Click-through Overlay:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Applies `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` so mouse/keyboard pass through the overlay. |
-| **Strict Mode:** | `CheckBox` | **`cur-action == "Show Overlay"`** | Hides Skip/Snooze buttons on the overlay and locks tray bypasses & settings edits behind a 15s confirmation delay while enforcing. |
-| **Message Template & Formatting Toolbar** | `TextEdit` + Gutter + Toolbar + `FormattedText` Preview | **`cur-action == "Show Overlay" || cur-action == "Show Notification" || root.rule-warn-before-val > 0 || root.rule-grace-val > 0`** | Hosted in a dedicated sub-card inside Section 4 with rich formatted message editor, toolbar, line gutter, and live formatted preview. Allows configuring custom alert templates for quota enforcement actions (`Close Window`, `Close Tab`, `Kill Process`, `Lock Workstation`) in addition to Break and Notification actions. Dynamically formats preview placeholders (`{rule_name}`, `{app}` / `{app_name}`, `{session_duration}`, `{break_time}`, `{limit}`, `{remaining}`, `{used}`) with concise units matching runtime overlay formatting via `formatter::build_preview_context()`, ensuring identical calculation across live Settings editor previews and dispatched preview alerts (clamping `remaining` to `warn_before.min(threshold)` or fallback `300.min(threshold)`, and computing `used` as `threshold.saturating_sub(remaining)`). Single-pass scanning in `MessageContext::interpolate` uses preallocated capacity (`template.len() + 32`) and replaces placeholders without re-scanning substituted text, eliminating cross-placeholder injection (preventing literal `{limit}` or other placeholder names within window titles from recursive expansion), supporting `{app_name}` as an alias for `{app}`, and preserving unknown `{...}` tags or unclosed `{` braces intact. |
-
-### Section 5: Active Hours Schedule
-
-| Control | Type | Visibility Condition | Description |
-| --- | --- | --- | --- |
-| **Active Hours Schedule** | `ScheduleGrid` (7×24 Matrix) | **Always Visible** | Enclosed in a dedicated `SectionCard` with click-and-drag hourly grid with `Work Hours`, `Evenings`, `Select All`, and `Clear All` presets. |
-
-### C. Overview Tab & Real-Time Validation Safeguards (`ui/settings.slint`, `src/main.rs`)
-
-1. **Overview Pane (`selected-rule-idx == -1`):**
-   - Renders summary cards for all configured rules with reactive two-way bound checkboxes (`checked: r.enabled; toggled => root.toggle-rule-enabled(i, self.checked)`). Toggling updates `rules_model` in Rust without breaking two-way property bindings.
-   - Includes **↑** / **↓** (reordering), **Snooze 15m**, **Reset Timer**, **Configure**, **Duplicate**, and **Delete** actions for each rule (with Snooze, Reset, Duplicate, Delete, and Reordering disabled during active strict mode via `ui-locked-by-strict`). Clicking **↑** or **↓** invokes `move-rule(from_idx, to_idx)` to swap rules in `rules_model`, adjusts `selected_rule_idx` if the active rule was moved, and sets `has_unsaved_changes = true`. The Rule Editor header in the Child Rule tab provides matching **Snooze 15m** and **Reset Timer** buttons alongside the rule title and status badge.
-   - Clicking **Snooze 15m** dispatches `DaemonCommand::SnoozeBreak { rule_id, minutes: 15 }` followed by an immediate telemetry refresh. Clicking **Reset Timer** dispatches `DaemonCommand::ResetRuleSession { rule_id }`, which calls `rt.reset_session(now)` to reset active timers, clear `snoozed_until`, set `daily_reset_at = Some(now)`, reset `daily_usage_seconds = 0`, clear `action_executed_today = false`, restart `Period` continuous session accumulation from 0s (`last_completed_at = Some(now)`), and isolate rollback flags (`can_rollback_completion = false`) so subsequent snoozes cannot leak and undo resets or finished/skipped breaks. Limit rule usage queries evaluate against `effective_start_utc = daily_reset_at.unwrap_or(start_of_day_utc)`, ignoring earlier events from the logical day.
-   - Clicking **Duplicate** clones the target rule (`Rule::duplicate`), assigns a unique `id`, appends `" (Copy)"` to its name, appends it to `rules_model`, and immediately switches the view to the duplicated rule's configuration editor (`selected-rule-idx`).
-   - Deleting a rule via `on_delete_rule` un-conditionally re-validates all remaining rules (`refresh_rule_regex_validation`), so deleting an invalid rule from the Overview tab immediately clears regex errors and re-enables saving.
-2. **Global Sidebar Validation Error Indicator:**
-   - Displays a red warning text block (`#f87171`) above the `Save & Apply Changes` button in the sidebar footer whenever `!root.time-format-valid || !root.rule-regex-valid`:
-     - Highlights invalid strftime syntax in General Settings (`"⚠ Invalid time format in General Settings"`).
-     - Highlights specific rule regex errors across any enabled rule (`"⚠ Rule '{name}': {error}"`), ensuring users understand why saving is disabled even while navigating other tabs. When editing a rule, regex errors are only evaluated if the rule is enabled (`win.get_rule_enabled() == true`), matching the Overview tab's enabled check so disabling an invalid rule in the editor immediately clears validation errors and unblocks saving.
-3. **Two-Way Binding Synchronization:**
-   - ComboBox components for Slint renderer display (`slint-renderer-display`), line color selection (`line-color-display`), and line size selection (`line-size-display`) are bound using two-way syntax (`current-value <=> property;`), preventing user selections from severing UI synchronization.
+#### Stage 3: Action Execution
+- **`Show Overlay`:** Launches fullscreen multi-monitor `OverlayMode::BreakEnforcer`. Waits for a 1.5s natural pause in physical user input before display. If input is detected during enforcement, progress pauses and displays an idle warning banner.
+- **`Show Notification`:** Emits `OverlayMode::HudToast` or native WinRT toast notification, marking the cycle complete.
+- **`Show Statistics`:** Opens the interactive 24-hour activity HUD (`OverlayMode::HudStatus`).
+- **`Lock Workstation`:** Calls `enforcer::lock_workstation()`. Suppresses redundant calls if the user is already AFK.
+- **`Close Tab`:** Sends synthesized `Ctrl+W` (`enforcer::close_active_browser_tab`), releasing modifier keys (`VK_SHIFT`, `VK_MENU`) beforehand. Strictly requires an active foreground browser window.
+- **`Close Window`:** Posts `WM_CLOSE` to matching non-protected windows.
+- **`Kill Process`:** Terminates target processes via Win32 process handles (`enforcer::kill_target_processes`), strictly excluding the `aw-enforcer` PID.
 
 ---
 
-## 4. Unified Rule Evaluation Pipeline (`src/engine.rs` & `src/enforcer.rs`)
+## 6. Overlay & User Interface Subsystems
 
-### A. Event Stream Separation & Multi-Browser Web Discovery (`poll_tick`, `src/aw_client.rs`)
+### 6.1 Overlay Window Hierarchy & Priority (`src/overlay.rs`)
+Overlays are managed authoritatively across all connected monitors:
 
-* `poll_tick()` queries window events (`aw-watcher-window_`) into `all_events` and browser tab events (`aw-watcher-web*`) into a separate `web_events` vector.
-* **Pre-Poll Bucket Preparation (`prepare_poll_buckets`):** Before query dispatch, `poll_tick()` executes `AwClient::prepare_poll_buckets(has_url_rules).await`. This checks if required buckets are verified and whether web buckets require a periodic 60-second refresh. If required buckets are unverified or web buckets need refreshing, it executes `refresh_buckets().await` once before launching queries; otherwise, it returns `true` immediately without network overhead. If buckets are not ready (e.g. ActivityWatch server is offline or required window/afk buckets are missing), `poll_tick()` skips both `query_intersected_events` and `query_web_events` (yielding empty event collections), deduplicating `/api/0/buckets/` calls on offline ticks (reducing offline network requests from 3 to at most 1) and eliminating `RwLock` write-lock contention or query races during `tokio::join!`. Mutex locking on `last_web_bucket_check` uses `.unwrap_or_else(|e| e.into_inner())` across all access sites to safely recover from poisoned mutexes without panicking the daemon. When `has_url_rules` is active and buckets are verified, `Engine::poll_tick` executes `query_intersected_events` and `query_web_events` concurrently via `tokio::join!`, halving ActivityWatch polling latency.
-* `AwClient` discovers all local bucket keys starting with `aw-watcher-web` (supporting simultaneous use of Chrome, Edge, Firefox, and Brave) while strictly ignoring synchronized remote buckets (`-synced` and `_synced`) across window, AFK, and web watchers. `AwClient` strictly requires verified local bucket IDs without `find_bucket` fallbacks, eliminating the risk of querying unverified or synced remote buckets. Bucket discovery automatically re-checks every 60 seconds to detect newly launched browsers, and local window/AFK bucket selection deterministically prefers matching hostnames and latest update timestamps.
-* Construct queries that flood each discovered local web bucket individually (`flood(query_bucket(...))`), fold multiple web buckets via nested binary `concat` expressions (respecting ActivityWatch's 2-argument `concat(events1, events2)` constraint), wrap in `sort_by_timestamp(...)`, and intersect with `not-afk`. Direct deserialization into `Vec<Vec<AwEvent>>` avoids intermediate JSON tree allocations.
-* **Active Browser Window Interval Intersection:** In `poll_tick()`, when `has_url_rules` is true and `!all_events.is_empty()`, `web_events` is filtered through `filter_web_events_by_active_browser_windows(&web_events, &all_events)`. Active intervals of open browser processes (`enforcer::BROWSER_EXES`) from `all_events` are coalesced via `merge_overlapping_intervals()`, and each web event is clipped to overlapping active browser window intervals. If non-browser applications (such as VS Code or Discord) are active in the foreground while a browser window remains open in the background or on a secondary monitor, background URL events are excluded, preventing unfocused browser windows from accumulating continuous session time or daily quota for `MonitorSelection::Urls` rules.
-* Rules with `MonitorSelection::Urls` evaluate exclusively against `web_events`, preventing double-counting of browser screen time in `total_today_secs` or wildcard `"*"` executable rules.
+$$\text{BreakEnforcer (4)} > \text{HudTimer (3)} > \text{HudToast (2)} > \text{HudStatus (1)} > \text{Hidden (0)}$$
 
-### B. Three-Stage Evaluation (`evaluate_rule`)
+- **Multi-Monitor Hotplug Detection:** Work areas and monitor counts are tracked dynamically. Connecting or disconnecting displays triggers an automatic placement refresh preserving active countdowns.
+- **DirectX D3D / Presentation Suppression:** When `suppress_fullscreen_d3d` is enabled, `SHQueryUserNotificationState` detects games and presentations, downgrading fullscreen overlays to unobtrusive toasts.
+- **Resource Cleanup:** When `destroy_windows_on_hide = true`, dismissing overlays immediately drops Slint window instances, releasing GPU swapchains and framebuffer memory.
 
-For each enabled rule active in the current `(day_index, hour_index)` schedule slot:
+### 6.2 Settings Window Architecture (`ui/settings.slint`, `src/main.rs`)
 
-1. **Progress Calculation & Interval Coalescing:**
-* **`TriggerType::Period`:** Computes continuous active session duration (`session_duration`) via `calculate_continuous_session_for_rule` by clipping matching events against `last_completed_at`, coalescing overlapping or nested intervals via `merge_overlapping_intervals`, and walking backward until an AFK gap $\ge$ `reset_after_afk` is encountered. Threshold is `rule.period.to_seconds()`.
-* **`TriggerType::Limit`:** Computes cumulative active duration since `logical_day_start` (`day_start_hour`) via `calculate_usage_for_rule`, coalescing matching intervals via `merge_overlapping_intervals`, and caches the result in `rt.daily_usage_seconds` for reuse in Live Status badges. Threshold is `rule.limit.to_seconds()`.
-* **Active Window / URL Verification (`find_matching_window_for_rule`):** Confirms a matching visible, non-minimized, non-protected window is currently open. For `MonitorSelection::Urls`, requires a visible browser window (`enforcer::BROWSER_EXES`, covering Chrome, Edge, Firefox, Brave, Opera, Vivaldi, Chromium, Arc, Zen, LibreWolf, Waterfox, Floorp, and Thorium; for `CloseTab`, strictly requires the foreground window to be an active browser via `enforcer::is_foreground_browser()`) and selects the most recent matching `aw-watcher-web` event ordered by `(event_end_utc(ev), ev.timestamp)` within the active recency window (`2 * poll_interval + 5s`), returning the extracted URL hostname. For `MonitorSelection::Executables` with empty or wildcard `"*"` targets, dynamically resolves the foreground process via `enforcer::get_foreground_app_name()` (returning `None` for destructive `CloseWindow` / `CloseTab` actions if no non-protected foreground window is active, preventing infinite closure loops on empty desktops). Enumeration in `enum_windows_callback` and `close_active_browser_tab` short-circuits Win32 process handle lookups before querying process names whenever `compiled_regex.is_some() && !title_matches`. In addition, `scan_windows` maintains a per-enumeration process name cache (`EnumMatchContext.pid_cache: HashMap<u32, Option<String>>`), ensuring `get_process_name_by_pid(pid)` is called only once per unique process ID during a window enumeration pass and eliminating redundant `OpenProcess` and executable query calls across multiple windows owned by the same application.
+```mermaid
+graph LR
+    subgraph Sidebar [Sidebar Navigation]
+        NavGen["General Preferences\n(active-tab == 0)"]
+        NavRules["Rule Overview & Editor\n(active-tab == 1)"]
+        NavLive["Live Telemetry\n(active-tab == 2)"]
+    end
 
+    subgraph TabPanels [Content Views]
+        GenView["General Settings Cards\n• Connection & Autostart\n• Performance & Renderer\n• Overlay Theme\n• Stats Configuration\n• Backup & Transfer"]
+        RuleView["Rule Configuration Sections\n1. General\n2. Monitor Target\n3. Trigger\n4. Action & Message Toolbar\n5. Schedule Grid"]
+        LiveView["Live Telemetry Rows\n• Server Status\n• Session Duration\n• Today Screen Time\n• Active Window"]
+    end
 
-2. **Stage 1 — Pre-Action Warning (`warn_before > 0`):**
-* When `threshold > 0 && warn_secs > 0 && warn_secs < threshold && elapsed >= threshold - warn_secs && elapsed < threshold`:
-* Fires a pre-action warning once per cycle/day (`warned_current_cycle = true`). For `ShowNotification`, `CloseWindow`, `CloseTab`, `KillProcess`, and `LockWorkstation`, uses `&rule.message` whenever configured (falling back to default warning text if empty). For `ShowOverlay`, dispatches a clear upcoming-break countdown toast to keep pre-break warnings and fullscreen break screens distinct.
+    NavGen --> GenView
+    NavRules --> RuleView
+    NavLive --> LiveView
+```
 
+- **Strict Mode Lock:** While a strict break or grace period is active, all rule modification callbacks (`on_add_rule`, `on_delete_rule`, `on_active_rule_edited`, etc.) return early, and the UI displays a 15-second unlock countdown card.
+- **Real-Time Regex & Strftime Validation:** Syntax errors in title/URL regexes or strftime formats are displayed in an inline warning banner, disabling the `Save & Apply Changes` button.
 
-3. **Stage 2 — Grace Countdown (`grace_duration > 0`):**
-* When `elapsed >= threshold`:
-* If `effective_grace > 0`, starts `rt.grace_countdown = Some((effective_grace, effective_grace))` and displays `OverlayMode::HudTimer` counting down every second in `realtime_tick()`. When non-strict and interactive (`!strict_mode && allow_snooze && !click_through`), `HudTimer` renders interactive **Snooze (5m)** and **Dismiss** buttons: clicking **Snooze (5m)** pauses enforcement for 5 minutes (`rt.snooze(until)`), while clicking **Dismiss** (`DaemonCommand::AcknowledgeAppWarning`) immediately cancels the grace countdown and completes the cycle (`rt.complete_cycle(Local::now())`, setting `can_rollback_completion = false`). When multiple rules have active grace countdowns, `transition_to_active_countdown_or_hide` selects the active grace rule prioritizing strict breaks first, destructive actions (`LockWorkstation`, `CloseTab`, `CloseWindow`, `KillProcess`) second, and earliest expiring countdown (`std::cmp::Reverse(rem)`) third.
-* When the countdown reaches `0`:
-  * For `MonitorSelection::Urls`, builds `title_re` from `rt.last_matched_title_regex` and verifies against open browser windows. In-site tab navigation during an active grace countdown continuously refreshes `rt.last_matched_title`, `rt.last_matched_url`, and `rt.last_matched_title_regex`, and cleans up stale tab titles (`rt.set_last_matched_title(None)`) whenever the latest matching URL event contains an empty or whitespace-only title (during both normal evaluation and active grace countdowns). If the offending tab was closed, switched away from, or no matching web event was recorded within the recency window during the grace period (clearing `rt.last_matched_app`, `rt.last_matched_url`, and `rt.last_matched_title`), or if `last_matched_title_regex` is `None` (empty tab title), destructive actions (`CloseTab`, `CloseWindow`, `KillProcess`, `LockWorkstation`) are safely skipped, logging the closure and completing the cycle.
+---
 
+## 7. Security, Anti-Bypass & Reliability Architecture
 
-4. **Stage 3 — Action Execution (`execute_rule_action`):**
-* Executes when `grace_countdown` reaches `0` (or immediately when `grace_duration == 0`):
-* Overlay updates are reordered in `realtime_tick` so active test/HUD countdowns tick at the start of each second, ensuring newly spawned alerts retain their full duration without same-tick decrement.
-* **Empty Message Template Fallbacks (`rule_message_fallback`, `get_effective_rule_message`):** When `rule.message.trim().is_empty()`, `Engine::get_effective_rule_message` automatically provides canonical formatted fallback templates across Stage 3 alert dispatch, pending natural break launches in `realtime_tick`, overlay countdown restorations in `transition_to_active_countdown_or_hide`, and live alert previews (`preview_rule_alert`):
-  - For `RuleAction::ShowOverlay`: `"# Time for a Break\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."`
-  - For `RuleAction::ShowNotification`: `"[color=#38bdf8 bold] {rule_name}: Active for {session_duration} on {app}."` (when `trigger == TriggerType::Period`) or `"[color=#f59e0b bold] {rule_name}: Daily limit ({limit}) reached for {app}."` (when `trigger == TriggerType::Limit`).
-* **`Show Overlay`:** Launches full-screen `OverlayMode::BreakEnforcer` across all monitors for `break_duration` (with 1.5s natural idle pause if `grace_duration == 0`, fullscreen D3D downgrade to Windows toast if `suppress_fullscreen_d3d` is enabled, and amber pause banner when physical input is detected). Records `prev_completed_at = last_completed_at` so snoozing restores the pre-break completion timestamp. While a `BreakEnforcer` overlay is displayed, incoming break overlays for different rules cannot replace it if the active break is strict and incoming is non-strict, if active is non-click-through and incoming is click-through, or if equal in strictness/click-through and active remaining duration $\ge$ incoming remaining duration. During countdown transitions (`transition_to_active_countdown_or_hide`), the engine prioritizes the active break rule that maximizes `(strict_mode, !click_through, remaining_seconds)`. Strict mode locks settings, tray actions, and command bypasses during both `active_break` and the 1.5s–15s `pending_break_since` window.
-* **`Show Notification`:** Marks the cycle complete (`rt.complete_cycle(now)`) and dispatches either `OverlayMode::HudToast` (`NotificationMethod::Hud`) or a WinRT system toast (`NotificationMethod::Windows`) using the rule's formatted `message` (or canonical fallback). If the user clicks **Snooze** on the HUD toast, `rt.snooze(until)` restores `last_completed_at = prev_completed_at` so the notification re-triggers after the snooze expires. Acknowledging the HUD toast (`AcknowledgeAppWarning`) or letting its countdown expire to `0` immediately clears `rt.can_rollback_completion = false`, locking in cycle completion so subsequent snoozes cannot leak and revert `last_completed_at`.
-* **`Show Statistics`:** Marks the cycle complete and opens the 24-Hour Screen Time Summary (`OverlayMode::HudStatus`), which caches historical hourly bins in `StatsHudCache` and live-updates on subsequent `poll_tick`s without extra ActivityWatch HTTP queries.
-* **`Lock Workstation`:** Marks the cycle complete and calls `enforcer::lock_workstation()` (suppressing repeated lock calls on `Limit` rules when user idle time exceeds the poll interval).
-* **`Close Tab`:** Marks the cycle complete and sends `Ctrl+W` (`enforcer::close_active_browser_tab`, synthesizing `VK_SHIFT` and `VK_MENU` key-ups beforehand to avoid `Ctrl+Shift+W`) to the matching foreground window (requiring browser executable and verified tab title match for `Urls`, strictly requiring `last_matched_title_regex` and never falling back to closing entire windows or all browser tabs).
-* **`Close Window`:** Marks the cycle complete and posts `WM_CLOSE` (`enforcer::close_target_windows`) to matching visible non-minimized windows (requiring browser executable and verified tab title match for `Urls`, strictly requiring `last_matched_title_regex` and excluding protected shell windows and the `aw-enforcer` process).
-* **`Kill Process`:** Marks the cycle complete and terminates matching processes via `enforcer::kill_target_processes` (excluding the `aw-enforcer` process).
+| Subsystem | Mechanism | Technical Implementation |
+| :--- | :--- | :--- |
+| **Single-Instance Enforcement** | Win32 Named Mutex & Event | `CreateMutexW(..., "Local\\AW_Enforcer_SingleInstance_Mutex")` + `CreateEventW(..., "Local\\AW_Enforcer_Activate_Event")`. Second launches restore existing window and exit. |
+| **Shell & Self Protection** | Protected Window & Process Guards | `enforcer::is_protected_window` excludes current PID and shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `MultitaskingViewFrame`) from window closing and process termination. |
+| **Strict Mode Lockout** | Command & UI Interception | Blocks `SnoozeBreak`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeAll`, `SetPauseAll`, `ResetRuleSession`, and tray bypasses when `rt.active_break`, `rt.grace_countdown`, or `rt.pending_break_since` is active. |
+| **Atomic Configuration Writes** | Two-Phase Disk Commit | Writes to `config.toml.tmp` and renames to `config.toml`. Corrupted files are preserved to `config.toml.bak` on load failure. |
+| **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis | Clears `VK_SHIFT` and `VK_MENU` state prior to dispatching `Ctrl+W` to avoid accidental `Ctrl+Shift+W` (entire window closure). |
+| **Poisoned Mutex Recovery** | Safe Lock Unwrapping | All synchronization locks use `.unwrap_or_else(|e| e.into_inner())` to prevent daemon panics if an internal thread panics. |
+
+---
+
+## 8. Performance & Resource Budgets
+
+| Metric | Target Budget | Observed / Measured Implementation |
+| :--- | :--- | :--- |
+| **Resident Working Set (Idle)** | $< 45\text{ MB}$ | $\sim 28\text{ MB} - 35\text{ MB}$ (with FemtoVG OpenGL backend) |
+| **Idle CPU Utilization** | $< 0.2\%$ | $0.0\% - 0.1\%$ between 10-second polling ticks |
+| **Thread Count** | $\le 6\text{ OS Threads}$ | Main Slint GUI Thread + 2 Tokio Workers + 1 Helper Pool Thread |
+| **Offline Network Overhead** | 1 HTTP Request / tick | Pre-poll bucket verification eliminates query flooding when server is down |
+| **Window Scanning Overhead** | $< 1.5\text{ ms} / \text{scan}$ | Zero-allocation UTF-16 shell checks + per-pass `pid_cache: HashMap<u32, Option<String>>` |
+
+---
+
+## 9. Verification & Test Plan
+
+The application maintains comprehensive test coverage across all domain components:
+- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion.
+- **Rule Lifecycle & State Machine Tests (`src/engine.rs`):** Invariant testing for Stage 1/2/3 triggers, grace countdown rollbacks, snooze timestamps, and strict mode command rejections.
+- **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.
+- **Format & String Interpolation Tests (`src/formatter.rs`):** Verifies single-pass template parsing, placeholder injection immunity, and Markdown tag stripping for Windows Action Center toasts.
