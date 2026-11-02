@@ -72,6 +72,67 @@ pub fn compute_coalesced_overlap_seconds(
         .sum()
 }
 
+/// Intersects web events from `aw-watcher-web` with active browser window intervals from `window_events` (`aw-watcher-window`).
+///
+/// Prevents background/unfocused browser windows from accumulating URL usage while the user is actively working in non-browser applications.
+pub fn filter_web_events_by_active_browser_windows(
+    web_events: &[AwEvent],
+    window_events: &[AwEvent],
+) -> Vec<AwEvent> {
+    if window_events.is_empty() || web_events.is_empty() {
+        return web_events.to_vec();
+    }
+
+    let raw_browser_intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = window_events
+        .iter()
+        .filter_map(|ev| {
+            let app = ev.data.app.as_deref()?;
+            if enforcer::exe_name_matches_targets(app, enforcer::BROWSER_EXES) {
+                let start = ev.timestamp;
+                let end = event_end_utc(ev);
+                if end > start {
+                    Some((start, end))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if raw_browser_intervals.is_empty() {
+        return Vec::new();
+    }
+
+    let browser_intervals = merge_overlapping_intervals(raw_browser_intervals);
+
+    let mut filtered = Vec::new();
+    for web_ev in web_events {
+        let w_start = web_ev.timestamp;
+        let w_end = event_end_utc(web_ev);
+        if w_end <= w_start {
+            continue;
+        }
+
+        for &(b_start, b_end) in &browser_intervals {
+            let overlap_start = w_start.max(b_start);
+            let overlap_end = w_end.min(b_end);
+            if overlap_end > overlap_start {
+                let duration = (overlap_end - overlap_start).num_milliseconds() as f64 / 1000.0;
+                if duration > 0.0 {
+                    let mut clipped_ev = web_ev.clone();
+                    clipped_ev.timestamp = overlap_start;
+                    clipped_ev.duration = duration;
+                    filtered.push(clipped_ev);
+                }
+            }
+        }
+    }
+
+    filtered
+}
+
 /// Returns physical user idle duration in milliseconds using GetLastInputInfo.
 /// Uses `wrapping_sub` to properly handle 32-bit `GetTickCount()` rollover after 49.7 days.
 pub fn get_idle_time_millis() -> u32 {
@@ -1094,7 +1155,7 @@ impl Engine {
             }
         }
 
-        let (all_events, web_events) = if has_url_rules {
+        let (all_events, mut web_events) = if has_url_rules {
             let _ = self.aw_client.has_required_buckets().await;
             let (all_res, web_res) = tokio::join!(
                 self.aw_client.query_intersected_events(min_start_utc, now_utc),
@@ -1110,6 +1171,10 @@ impl Engine {
                 Vec::new(),
             )
         };
+
+        if has_url_rules && !all_events.is_empty() {
+            web_events = filter_web_events_by_active_browser_windows(&web_events, &all_events);
+        }
 
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
         let mut evaluated_in_step_4 = std::collections::HashSet::new();
@@ -4908,5 +4973,92 @@ mod tests {
         rt.set_last_matched_title(Some("".to_string()));
         assert!(rt.last_matched_title.is_none());
         assert!(rt.last_matched_title_regex.is_none());
+    }
+
+    #[test]
+    fn test_filter_web_events_clips_to_active_browser_windows() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        // Window events: Chrome active from 10:00 to 10:10 (600s), Firefox active from 10:15 to 10:20 (300s)
+        let win_chrome = make_event(base_time, 600.0, "chrome.exe", "Google Chrome", "");
+        let win_firefox = make_event(base_time + Duration::seconds(900), 300.0, "firefox.exe", "Mozilla Firefox", "");
+
+        // Web event 1: 10:05 to 10:15 (600s) - YouTube (should clip to 10:05 - 10:10, 300s)
+        let web1 = make_event(
+            base_time + Duration::seconds(300),
+            600.0,
+            "",
+            "YouTube - Video",
+            "https://youtube.com/watch?v=123",
+        );
+        // Web event 2: 10:12 to 10:25 (780s) - Docs (should clip to 10:15 - 10:20, 300s)
+        let web2 = make_event(
+            base_time + Duration::seconds(720),
+            780.0,
+            "",
+            "Google Docs",
+            "https://docs.google.com/document/d/xyz",
+        );
+
+        let filtered = filter_web_events_by_active_browser_windows(
+            &[web1, web2],
+            &[win_chrome, win_firefox],
+        );
+
+        assert_eq!(filtered.len(), 2);
+
+        // First event clipped to Chrome active interval (10:05 to 10:10)
+        assert_eq!(filtered[0].timestamp, base_time + Duration::seconds(300));
+        assert_eq!(filtered[0].duration, 300.0);
+        assert_eq!(filtered[0].data.url.as_deref(), Some("https://youtube.com/watch?v=123"));
+
+        // Second event clipped to Firefox active interval (10:15 to 10:20)
+        assert_eq!(filtered[1].timestamp, base_time + Duration::seconds(900));
+        assert_eq!(filtered[1].duration, 300.0);
+        assert_eq!(filtered[1].data.url.as_deref(), Some("https://docs.google.com/document/d/xyz"));
+    }
+
+    #[test]
+    fn test_filter_web_events_excludes_non_browser_window_activity() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        // Window event: VS Code active from 10:00 to 10:10 (600s)
+        let win_code = make_event(base_time, 600.0, "code.exe", "VS Code - main.rs", "");
+
+        // Web event: YouTube reported by background browser watcher from 10:00 to 10:10
+        let web_ev = make_event(
+            base_time,
+            600.0,
+            "",
+            "YouTube - Music",
+            "https://youtube.com/watch?v=music",
+        );
+
+        let filtered = filter_web_events_by_active_browser_windows(&[web_ev], &[win_code]);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_web_events_preserves_when_window_events_empty() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        let web_ev = make_event(
+            base_time,
+            300.0,
+            "",
+            "Reddit",
+            "https://reddit.com/r/rust",
+        );
+
+        let filtered = filter_web_events_by_active_browser_windows(&[web_ev.clone()], &[]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].timestamp, web_ev.timestamp);
+        assert_eq!(filtered[0].duration, 300.0);
+        assert_eq!(filtered[0].data.url.as_deref(), Some("https://reddit.com/r/rust"));
+    }
+
+    #[test]
+    fn test_filter_web_events_handles_empty_web_events() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        let win_ev = make_event(base_time, 600.0, "chrome.exe", "Google Chrome", "");
+        let filtered = filter_web_events_by_active_browser_windows(&[], &[win_ev]);
+        assert!(filtered.is_empty());
     }
 }
