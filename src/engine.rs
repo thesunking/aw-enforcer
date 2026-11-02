@@ -180,6 +180,7 @@ pub struct RuleRuntime {
     pub compiled_regex: Option<Regex>,
     pub current_session_seconds: u32,
     pub daily_usage_seconds: u32,
+    pub daily_reset_at: Option<DateTime<Local>>,
     pub last_completed_at: Option<DateTime<Local>>,
     pub prev_completed_at: Option<DateTime<Local>>,
     pub can_rollback_completion: bool,
@@ -203,6 +204,7 @@ impl RuleRuntime {
             compiled_regex: Self::compile_regex(rule),
             current_session_seconds: 0,
             daily_usage_seconds: 0,
+            daily_reset_at: None,
             last_completed_at: None,
             prev_completed_at: None,
             can_rollback_completion: false,
@@ -244,12 +246,27 @@ impl RuleRuntime {
         self.snoozed_until = None;
         self.prev_completed_at = self.last_completed_at;
         self.last_completed_at = Some(now);
-        self.can_rollback_completion = true;
+        self.can_rollback_completion = false;
         self.action_executed_today = true;
         self.last_matched_app = None;
         self.last_matched_url = None;
         self.last_matched_title = None;
         self.last_matched_title_regex = None;
+    }
+
+    /// Resets the rule's active session or daily quota, clearing timers, snooze, and daily limit locks.
+    pub fn reset_session(&mut self, now: DateTime<Local>) {
+        self.reset_active_timers();
+        self.snoozed_until = None;
+        self.prev_completed_at = Some(now);
+        self.last_completed_at = Some(now);
+        self.daily_reset_at = Some(now);
+        self.can_rollback_completion = false;
+        self.action_executed_today = false;
+        self.daily_usage_seconds = 0;
+        self.last_matched_app = None;
+        self.last_matched_url = None;
+        self.set_last_matched_title(None);
     }
 
     /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
@@ -706,7 +723,7 @@ impl Engine {
                 }
                 let now = Local::now();
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.complete_cycle(now);
+                    rt.reset_session(now);
                 }
                 if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
@@ -1017,6 +1034,7 @@ impl Engine {
                 rt.snoozed_until = None;
                 rt.pending_break_since = None;
                 rt.daily_usage_seconds = 0;
+                rt.daily_reset_at = None;
                 rt.can_rollback_completion = false;
                 rt.last_matched_app = None;
                 rt.last_matched_url = None;
@@ -1200,11 +1218,15 @@ impl Engine {
                     } else {
                         &all_events
                     };
+                    let effective_start_utc = rt
+                        .daily_reset_at
+                        .map(|dt| dt.with_timezone(&Utc).max(start_of_day_utc))
+                        .unwrap_or(start_of_day_utc);
                     let used = calculate_usage_for_rule(
                         events_for_rule,
                         rule,
                         rt.compiled_regex.as_ref(),
-                        start_of_day_utc,
+                        effective_start_utc,
                         now_utc,
                     );
                     rt.daily_usage_seconds = used;
@@ -1467,7 +1489,13 @@ impl Engine {
                 (session_duration, period_secs)
             }
             TriggerType::Limit => {
-                let used = calculate_usage_for_rule(events, rule, compiled_re, start_of_day_utc, now_utc);
+                let effective_start_utc = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|rt| rt.daily_reset_at)
+                    .map(|dt| dt.with_timezone(&Utc).max(start_of_day_utc))
+                    .unwrap_or(start_of_day_utc);
+                let used = calculate_usage_for_rule(events, rule, compiled_re, effective_start_utc, now_utc);
                 let limit_secs = rule.limit.to_seconds();
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.current_session_seconds = 0;
@@ -1695,6 +1723,9 @@ impl Engine {
                         enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(&rule.message, &ctx));
                     }
                     NotificationMethod::Hud => {
+                        if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                            rt.can_rollback_completion = true;
+                        }
                         let paragraphs = self.parse_rule_message(
                             &rule.message,
                             &ctx,
@@ -2793,6 +2824,7 @@ mod tests {
                 rt.snoozed_until = None;
                 rt.pending_break_since = None;
                 rt.daily_usage_seconds = 0;
+                rt.daily_reset_at = None;
             }
         }
         assert_eq!(engine.runtimes.get(&rule_id).unwrap().daily_usage_seconds, 0);
@@ -2812,7 +2844,7 @@ mod tests {
         let rt = engine.runtimes.get_mut(&rule_id).unwrap();
         rt.complete_cycle(cycle1_time);
         assert_eq!(rt.last_completed_at, Some(cycle1_time));
-        assert!(rt.can_rollback_completion);
+        assert!(!rt.can_rollback_completion);
 
         // Simulate cycle 2 Stage 1 warning dispatch
         rt.warned_current_cycle = true;
@@ -3269,7 +3301,8 @@ mod tests {
         let rt = engine.runtimes.get_mut("rule-1").unwrap();
         rt.complete_cycle(completed_time);
         assert_eq!(rt.last_completed_at, Some(completed_time));
-        assert!(rt.can_rollback_completion);
+        assert!(!rt.can_rollback_completion);
+        rt.can_rollback_completion = true;
 
         // Ensure rule is not currently displayed (active_overlay_mode is Hidden)
         assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
@@ -4348,6 +4381,11 @@ mod tests {
         assert!(rt.snoozed_until.is_none());
         assert!(rt.last_completed_at.is_some());
         assert!(!rt.warned_current_cycle);
+        assert_eq!(rt.current_session_seconds, 0);
+        assert_eq!(rt.daily_usage_seconds, 0);
+        assert!(!rt.can_rollback_completion);
+        assert!(!rt.action_executed_today);
+        assert!(rt.daily_reset_at.is_some());
     }
 
     #[tokio::test]
@@ -4374,5 +4412,158 @@ mod tests {
         assert!(engine.global_snoozed_until.is_none());
         assert!(engine.runtimes.get("rule-1").unwrap().snoozed_until.is_none());
         assert!(engine.runtimes.get("rule-2").unwrap().snoozed_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_snooze_after_reset_skip_or_dismiss_does_not_rollback_completed_at() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-rollback-test".to_string();
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(20, TimeUnit::Min);
+
+        cfg.rules = vec![rule];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let t0 = Local::now() - Duration::hours(2);
+        let t1 = Local::now() - Duration::hours(1);
+
+        // 1. ResetRuleSession: Snoozing after reset must not rollback last_completed_at
+        {
+            let rt = engine.runtimes.get_mut("rule-rollback-test").unwrap();
+            rt.prev_completed_at = Some(t0);
+            rt.last_completed_at = Some(t1);
+        }
+        engine
+            .handle_command(DaemonCommand::ResetRuleSession {
+                rule_id: "rule-rollback-test".to_string(),
+            })
+            .await;
+        let reset_time = engine.runtimes.get("rule-rollback-test").unwrap().last_completed_at.unwrap();
+        assert!(!engine.runtimes.get("rule-rollback-test").unwrap().can_rollback_completion);
+
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-rollback-test".to_string(),
+                minutes: 15,
+            })
+            .await;
+        let rt = engine.runtimes.get("rule-rollback-test").unwrap();
+        assert_eq!(rt.last_completed_at, Some(reset_time));
+
+        // 2. SkipBreak: Snoozing after SkipBreak must not rollback last_completed_at
+        {
+            let rt = engine.runtimes.get_mut("rule-rollback-test").unwrap();
+            rt.prev_completed_at = Some(t0);
+            rt.last_completed_at = Some(t1);
+            rt.active_break = Some((300, 300));
+            rt.can_rollback_completion = true;
+        }
+        engine
+            .handle_command(DaemonCommand::SkipBreak {
+                rule_id: "rule-rollback-test".to_string(),
+            })
+            .await;
+        let skip_time = engine.runtimes.get("rule-rollback-test").unwrap().last_completed_at.unwrap();
+        assert!(!engine.runtimes.get("rule-rollback-test").unwrap().can_rollback_completion);
+
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-rollback-test".to_string(),
+                minutes: 15,
+            })
+            .await;
+        let rt = engine.runtimes.get("rule-rollback-test").unwrap();
+        assert_eq!(rt.last_completed_at, Some(skip_time));
+
+        // 3. DismissBreakOverlay: Snoozing after DismissBreakOverlay must not rollback last_completed_at
+        {
+            let rt = engine.runtimes.get_mut("rule-rollback-test").unwrap();
+            rt.prev_completed_at = Some(t0);
+            rt.last_completed_at = Some(t1);
+            rt.active_break = Some((300, 300));
+            rt.can_rollback_completion = true;
+        }
+        engine
+            .handle_command(DaemonCommand::DismissBreakOverlay)
+            .await;
+        let dismiss_time = engine.runtimes.get("rule-rollback-test").unwrap().last_completed_at.unwrap();
+        assert!(!engine.runtimes.get("rule-rollback-test").unwrap().can_rollback_completion);
+
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-rollback-test".to_string(),
+                minutes: 15,
+            })
+            .await;
+        let rt = engine.runtimes.get("rule-rollback-test").unwrap();
+        assert_eq!(rt.last_completed_at, Some(dismiss_time));
+    }
+
+    #[tokio::test]
+    async fn test_reset_rule_session_limit_rule_resets_usage_and_clears_action_executed() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-limit-reset".to_string();
+        rule.trigger = TriggerType::Limit;
+        rule.limit = DurationConfig::new(30, TimeUnit::Min); // 1800s
+        rule.action = RuleAction::ShowNotification;
+        rule.notification_method = NotificationMethod::Hud;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = logical_day_start(now, engine.config.general.day_start_hour).with_timezone(&Utc);
+
+        // Pre-reset event 1 hour ago for 2000s (exceeding 1800s limit)
+        let ev = make_event(
+            now_utc - Duration::minutes(70),
+            2000.0,
+            "code.exe",
+            "main.rs",
+            "",
+        );
+
+        // Simulate pre-reset state where quota had triggered
+        {
+            let rt = engine.runtimes.get_mut("rule-limit-reset").unwrap();
+            rt.daily_usage_seconds = 2000;
+            rt.action_executed_today = true;
+        }
+
+        // User clicks Reset Timer
+        engine
+            .handle_command(DaemonCommand::ResetRuleSession {
+                rule_id: "rule-limit-reset".to_string(),
+            })
+            .await;
+
+        let rt = engine.runtimes.get("rule-limit-reset").unwrap();
+        assert_eq!(rt.daily_usage_seconds, 0);
+        assert!(!rt.action_executed_today);
+        assert!(rt.daily_reset_at.is_some());
+        assert!(!rt.can_rollback_completion);
+
+        // Now evaluate rule against the event stream from earlier in the day
+        let re = Regex::new("(?i)code\\.exe").ok();
+        engine
+            .evaluate_rule(&rule, re.as_ref(), now, &[ev], start_of_day_utc, now_utc)
+            .await;
+
+        // Effective start timestamp should ignore the 1-hour-old event, keeping usage at 0
+        let rt = engine.runtimes.get("rule-limit-reset").unwrap();
+        assert_eq!(rt.daily_usage_seconds, 0);
+        assert!(!rt.action_executed_today);
+        assert!(rt.grace_countdown.is_none());
+        assert!(rt.active_break.is_none());
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
     }
 }
