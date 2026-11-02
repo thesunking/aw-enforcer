@@ -557,6 +557,11 @@ fn add_executable_to_rule(
     });
 }
 
+/// Returns true if UI controls should be locked due to active strict break enforcement without an unlock countdown.
+fn is_ui_locked_by_strict(win: &SettingsWindow) -> bool {
+    win.get_strict_lock_active() && !win.get_strict_unlocked()
+}
+
 /// Applies a mutation closure `f` to the 168-slot weekly schedule array of the rule at `rule_idx`.
 fn update_rule_schedule(
     rm: &VecModel<RuleView>,
@@ -904,6 +909,9 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_add_rule(move || {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let mut n = rm.row_count() + 1;
                 while (0..rm.row_count()).any(|i| {
                     rm.row_data(i)
@@ -929,6 +937,9 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_delete_rule(move |idx| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let u = idx as usize;
                 if u < rm.row_count() {
                     rm.remove(u);
@@ -961,6 +972,9 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_duplicate_rule(move |idx| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let u = idx as usize;
                 if u < rm.row_count() {
                     if let Some(target) = rm.row_data(u) {
@@ -992,6 +1006,9 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_toggle_rule_enabled(move |idx, enabled| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let u = idx as usize;
                 if u < rm.row_count() {
                     if let Some(mut rule) = rm.row_data(u) {
@@ -1072,6 +1089,9 @@ fn open_settings_window(
         let sw = settings_weak.clone();
         settings_win.on_active_rule_edited(move || {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let idx = win.get_selected_rule_idx();
                 let u = idx as usize;
                 if idx >= 0 && u < rm.row_count() {
@@ -1126,12 +1146,15 @@ fn open_settings_window(
         let rm = rules_model.clone();
 
         settings_win.on_browse_executable(move || {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Executables", &["exe"])
-                .pick_file()
-            {
-                if let Some(filename) = path.file_name().map(|f| f.to_string_lossy().to_string()) {
-                    if let Some(win) = sw.upgrade() {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Executables", &["exe"])
+                    .pick_file()
+                {
+                    if let Some(filename) = path.file_name().map(|f| f.to_string_lossy().to_string()) {
                         add_executable_to_rule(&rm, &sw, win.get_selected_rule_idx(), &filename);
                     }
                 }
@@ -1154,7 +1177,12 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_add_known_app_to_rule(move |rule_idx, app| {
-            add_executable_to_rule(&rm, &sw, rule_idx, app.as_str());
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+                add_executable_to_rule(&rm, &sw, rule_idx, app.as_str());
+            }
         });
     }
 
@@ -1163,6 +1191,11 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_remove_executable_from_rule(move |rule_idx, exe_idx| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+            }
             let e_idx = exe_idx as usize;
             update_rule_at(&rm, &sw, rule_idx, |rule_view, win, rm| {
                 let mut current_targets: Vec<slint::SharedString> =
@@ -1187,6 +1220,11 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_toggle_schedule_slot(move |rule_idx, day, hour, state| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+            }
             let slot_idx = (day as usize) * 24 + (hour as usize);
             if slot_idx < 168 {
                 update_rule_schedule(&rm, &sw, rule_idx, |slots| {
@@ -1201,6 +1239,11 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_toggle_schedule_day(move |rule_idx, day| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+            }
             let d = day as usize;
             if d < 7 {
                 let start = d * 24;
@@ -1220,6 +1263,11 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_toggle_schedule_hour(move |rule_idx, hour| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+            }
             let h = hour as usize;
             if h < 24 {
                 update_rule_schedule(&rm, &sw, rule_idx, |slots| {
@@ -1237,6 +1285,11 @@ fn open_settings_window(
         let rm = rules_model.clone();
         let sw = settings_weak.clone();
         settings_win.on_apply_schedule_preset(move |rule_idx, preset| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+            }
             update_rule_schedule(&rm, &sw, rule_idx, |slots| {
                 match preset.as_str() {
                     "select_all" => {
@@ -1294,6 +1347,9 @@ fn open_settings_window(
         let rm = rules_model.clone();
         settings_win.on_message_text_edited(move |text| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let rule_idx = win.get_selected_rule_idx();
                 let text_clone = text.clone();
                 update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
@@ -1312,6 +1368,9 @@ fn open_settings_window(
         let rm = rules_model.clone();
         settings_win.on_apply_line_style(move |line_idx, style| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let rule_idx = win.get_selected_rule_idx();
                 update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
                     let updated = formatter::apply_line_style(&rule.message, line_idx as usize, &style);
@@ -1329,6 +1388,9 @@ fn open_settings_window(
         let rm = rules_model.clone();
         settings_win.on_append_placeholder(move |line_idx, placeholder| {
             if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
                 let rule_idx = win.get_selected_rule_idx();
                 update_rule_at(&rm, &sw, rule_idx, |rule, win, _| {
                     let updated = formatter::append_placeholder(&rule.message, line_idx as usize, &placeholder);

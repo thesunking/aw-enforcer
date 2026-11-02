@@ -1,6 +1,7 @@
 import { Button, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 
 export component ExecutableSelector inherits VerticalLayout {
+    in property <bool> enabled: true;
     in property <[string]> executables;
     in property <[string]> known-apps;
     in property <string> empty-text: "All applications monitored (* wildcard) — add specific .exe names below to restrict.";
@@ -14,6 +15,9 @@ export component ExecutableSelector inherits VerticalLayout {
     callback remove-executable(int /* index */);
 
     function submit-manual-app() {
+        if (!root.enabled) {
+            return;
+        }
         let raw = manual-input.text;
         if (raw != "") {
             root.add-known-app(raw);
@@ -30,20 +34,23 @@ export component ExecutableSelector inherits VerticalLayout {
 
         Button {
             text: "Browse .exe...";
+            enabled: root.enabled;
             clicked => { root.browse-executable(); }
         }
 
         Button {
             text: "Refresh Running Apps";
+            enabled: root.enabled;
             clicked => { root.refresh-known-apps(); }
         }
 
         app-combo := ComboBox {
             width: 240px;
+            enabled: root.enabled;
             model: root.known-apps;
             current-value: "Pick running/recent app...";
             selected(val) => {
-                if (val != "" && val != "Pick running/recent app...") {
+                if (root.enabled && val != "" && val != "Pick running/recent app...") {
                     root.add-known-app(val);
                     self.current-value = "Pick running/recent app...";
                     self.current-index = -1;
@@ -53,12 +60,14 @@ export component ExecutableSelector inherits VerticalLayout {
 
         manual-input := LineEdit {
             placeholder-text: "Type app name (e.g. game.exe)...";
+            enabled: root.enabled;
             width: 190px;
             accepted => { root.submit-manual-app(); }
         }
 
         Button {
             text: "Add";
+            enabled: root.enabled;
             clicked => { root.submit-manual-app(); }
         }
     }
@@ -104,7 +113,7 @@ export component ExecutableSelector inherits VerticalLayout {
                         width: 16px;
                         height: 16px;
                         border-radius: 8px;
-                        background: remove-touch.has-hover ? #ef4444 : #475569;
+                        background: (remove-touch.has-hover && root.enabled) ? #ef4444 : #475569;
 
                         Text {
                             text: "X";
@@ -116,6 +125,8 @@ export component ExecutableSelector inherits VerticalLayout {
                         }
 
                         remove-touch := TouchArea {
+                            enabled: root.enabled;
+                            mouse-cursor: root.enabled ? pointer : default;
                             clicked => {
                                 root.remove-executable(i);
                             }

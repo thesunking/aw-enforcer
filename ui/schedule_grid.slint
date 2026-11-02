@@ -2,6 +2,7 @@ import { Button } from "std-widgets.slint";
 
 export component ScheduleGrid inherits VerticalLayout {
     in-out property <[bool]> slots; // length 168: day * 24 + hour
+    in property <bool> enabled: true;
     in property <color> active-color: #3b82f6;
     in property <color> inactive-color: #1e293b;
     in property <color> border-color: #334155;
@@ -32,21 +33,25 @@ export component ScheduleGrid inherits VerticalLayout {
 
         Button {
             text: "Work Hours (M-F 9-5)";
+            enabled: root.enabled;
             clicked => { root.apply-preset("work_hours"); }
         }
 
         Button {
             text: "Evenings";
+            enabled: root.enabled;
             clicked => { root.apply-preset("evenings"); }
         }
 
         Button {
             text: "Select All";
+            enabled: root.enabled;
             clicked => { root.apply-preset("select_all"); }
         }
 
         Button {
             text: "Clear All";
+            enabled: root.enabled;
             clicked => { root.apply-preset("clear"); }
         }
     }
@@ -67,7 +72,7 @@ export component ScheduleGrid inherits VerticalLayout {
 
             // Day headers
             for day-name[d] in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]: Rectangle {
-                background: day-touch.has-hover ? #334155 : #0f172a;
+                background: (day-touch.has-hover && root.enabled) ? #334155 : #0f172a;
                 border-radius: 3px;
                 border-width: 1px;
                 border-color: root.border-color;
@@ -82,6 +87,8 @@ export component ScheduleGrid inherits VerticalLayout {
                 }
 
                 day-touch := TouchArea {
+                    enabled: root.enabled;
+                    mouse-cursor: root.enabled ? pointer : default;
                     clicked => {
                         root.toggle-day(d);
                     }
@@ -105,7 +112,7 @@ export component ScheduleGrid inherits VerticalLayout {
                     "18:00", "19:00", "20:00", "21:00", "22:00", "23:00"
                 ]: Rectangle {
                     height: 16px;
-                    background: hour-touch.has-hover ? #334155 : transparent;
+                    background: (hour-touch.has-hover && root.enabled) ? #334155 : transparent;
                     border-radius: 2px;
 
                     Text {
@@ -117,6 +124,8 @@ export component ScheduleGrid inherits VerticalLayout {
                     }
 
                     hour-touch := TouchArea {
+                        enabled: root.enabled;
+                        mouse-cursor: root.enabled ? pointer : default;
                         clicked => {
                             root.toggle-hour(h);
                         }
@@ -154,12 +163,14 @@ export component ScheduleGrid inherits VerticalLayout {
                 // Single unified TouchArea over entire 7x24 grid area
                 // Uses reactive element properties instead of invalid C-style `int col = ...` statements
                 TouchArea {
+                    enabled: root.enabled;
+                    mouse-cursor: root.enabled ? pointer : default;
                     property <int> current-col: self.width > 0px ? Math.min(Math.max(Math.floor(self.mouse-x / (self.width / 7)), 0), 6) : 0;
                     property <int> current-row: self.height > 0px ? Math.min(Math.max(Math.floor(self.mouse-y / (self.height / 24)), 0), 23) : 0;
                     property <int> current-idx: self.current-col * 24 + self.current-row;
 
                     pointer-event(event) => {
-                        if (self.width <= 0px || self.height <= 0px) {
+                        if (!root.enabled || self.width <= 0px || self.height <= 0px) {
                             return;
                         }
 
@@ -176,7 +187,7 @@ export component ScheduleGrid inherits VerticalLayout {
                     }
 
                     moved => {
-                        if (root.is-dragging && self.width > 0px && self.height > 0px) {
+                        if (root.enabled && root.is-dragging && self.width > 0px && self.height > 0px) {
                             if (self.current-idx != root.last-touched-index) {
                                 root.last-touched-index = self.current-idx;
                                 root.toggle-slot(self.current-col, self.current-row, root.drag-target-state);

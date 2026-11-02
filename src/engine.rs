@@ -133,6 +133,24 @@ pub fn filter_web_events_by_active_browser_windows(
     filtered
 }
 
+/// Returns the fallback template message when `rule.message.trim().is_empty()` for Stage 3 actions and preview alerts.
+pub fn rule_message_fallback(rule: &Rule) -> &'static str {
+    match rule.action {
+        RuleAction::ShowOverlay => {
+            "# Time for a Break\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
+        }
+        RuleAction::ShowNotification => match rule.trigger {
+            TriggerType::Period => {
+                "[color=#38bdf8 bold] {rule_name}: Active for {session_duration} on {app}."
+            }
+            TriggerType::Limit => {
+                "[color=#f59e0b bold] {rule_name}: Daily limit ({limit}) reached for {app}."
+            }
+        },
+        _ => "",
+    }
+}
+
 /// Returns physical user idle duration in milliseconds using GetLastInputInfo.
 /// Uses `wrapping_sub` to properly handle 32-bit `GetTickCount()` rollover after 49.7 days.
 pub fn get_idle_time_millis() -> u32 {
@@ -550,8 +568,9 @@ impl Engine {
             let elapsed = self.rule_elapsed_seconds(&rule);
             let threshold = rule.trigger_threshold_seconds();
             let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+            let raw_msg = self.get_effective_rule_message(&rule);
             let paragraphs = self.parse_rule_message(
-                &rule.message,
+                raw_msg,
                 &ctx,
                 TextHorizontalAlignment::Center,
             );
@@ -906,8 +925,9 @@ impl Engine {
                     rt.action_executed_today = true;
                 }
                 let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+                let raw_msg = self.get_effective_rule_message(&rule);
                 let paragraphs = self.parse_rule_message(
-                    &rule.message,
+                    raw_msg,
                     &ctx,
                     TextHorizontalAlignment::Center,
                 );
@@ -1371,6 +1391,15 @@ impl Engine {
         self.refresh_stats_overlay_from_events(now, &all_events);
     }
 
+    /// Returns the effective template message for a rule, falling back to canonical defaults if empty.
+    pub fn get_effective_rule_message<'a>(&self, rule: &'a Rule) -> &'a str {
+        if !rule.message.trim().is_empty() {
+            &rule.message
+        } else {
+            rule_message_fallback(rule)
+        }
+    }
+
     /// Parses a raw rule message with context using the engine's default text color and requested alignment.
     fn parse_rule_message(
         &self,
@@ -1771,7 +1800,8 @@ impl Engine {
                     if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                         rt.complete_cycle(now);
                     }
-                    enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(&rule.message, &ctx));
+                    let raw_msg = self.get_effective_rule_message(rule);
+                    enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(raw_msg, &ctx));
                     return;
                 }
 
@@ -1789,8 +1819,9 @@ impl Engine {
                     rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
+                let raw_msg = self.get_effective_rule_message(rule);
                 let paragraphs = self.parse_rule_message(
-                    &rule.message,
+                    raw_msg,
                     &ctx,
                     TextHorizontalAlignment::Center,
                 );
@@ -1811,14 +1842,16 @@ impl Engine {
                 }
                 match rule.notification_method {
                     NotificationMethod::Windows => {
-                        enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(&rule.message, &ctx));
+                        let raw_msg = self.get_effective_rule_message(rule);
+                        enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(raw_msg, &ctx));
                     }
                     NotificationMethod::Hud => {
                         if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                             rt.can_rollback_completion = true;
                         }
+                        let raw_msg = self.get_effective_rule_message(rule);
                         let paragraphs = self.parse_rule_message(
-                            &rule.message,
+                            raw_msg,
                             &ctx,
                             TextHorizontalAlignment::Left,
                         );
@@ -2122,8 +2155,9 @@ impl Engine {
 
         match rule.action {
             RuleAction::ShowOverlay => {
+                let raw_msg = self.get_effective_rule_message(rule);
                 let paragraphs =
-                    self.parse_rule_message(&rule.message, &ctx, TextHorizontalAlignment::Center);
+                    self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Center);
                 let mode = OverlayMode::BreakEnforcer {
                     rule_id: "test_preview".to_string(),
                     title: rule.name.clone(),
@@ -2138,24 +2172,12 @@ impl Engine {
             }
             RuleAction::ShowNotification => match rule.notification_method {
                 NotificationMethod::Windows => {
-                    let text = if !rule.message.trim().is_empty() {
-                        formatter::format_plain_message(&rule.message, &ctx)
-                    } else {
-                        format!("{} in {}.", rule.action.as_str(), &ctx.remaining)
-                    };
+                    let raw_msg = self.get_effective_rule_message(rule);
+                    let text = formatter::format_plain_message(raw_msg, &ctx);
                     enforcer::send_system_notification(&rule.name, &text);
                 }
                 NotificationMethod::Hud => {
-                    let default_msg = format!(
-                        "[color=#f59e0b bold] {} in {}.",
-                        rule.action.as_str(),
-                        &ctx.remaining
-                    );
-                    let raw_msg = if !rule.message.trim().is_empty() {
-                        &rule.message
-                    } else {
-                        &default_msg
-                    };
+                    let raw_msg = self.get_effective_rule_message(rule);
                     let paragraphs =
                         self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
                     let dur = rule.notification_duration.to_seconds().max(1);
@@ -3110,8 +3132,12 @@ mod tests {
         let mut cfg = AppConfig::default();
         let mut rule1 = Rule::default_template(0);
         rule1.id = "rule-1".to_string();
+        rule1.trigger = TriggerType::Limit;
+        rule1.limit = DurationConfig::new(60, TimeUnit::Min);
+        rule1.target_executables = vec!["nonexistent_unit_test_app.exe".to_string()];
         let mut rule2 = Rule::default_template(1);
         rule2.id = "rule-2".to_string();
+        rule2.target_executables = vec!["nonexistent_unit_test_app.exe".to_string()];
         cfg.rules = vec![rule1, rule2];
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
@@ -5252,5 +5278,100 @@ mod tests {
         let rt_done = engine.runtimes.get("rule-urls-stale-grace").unwrap();
         assert_eq!(rt_done.grace_countdown, None);
         assert!(rt_done.action_executed_today);
+    }
+
+    #[tokio::test]
+    async fn test_empty_message_fallbacks_in_preview_and_execution() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        let mut rule_break = Rule::default_template(0);
+        rule_break.id = "rule-empty-break".to_string();
+        rule_break.action = RuleAction::ShowOverlay;
+        rule_break.message = "".to_string();
+        rule_break.break_duration = DurationConfig::new(5, TimeUnit::Min);
+        rule_break.period = DurationConfig::new(20, TimeUnit::Min);
+        rule_break.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+
+        let mut rule_notify_period = Rule::default_template(1);
+        rule_notify_period.id = "rule-empty-notify-p".to_string();
+        rule_notify_period.action = RuleAction::ShowNotification;
+        rule_notify_period.notification_method = NotificationMethod::Hud;
+        rule_notify_period.trigger = TriggerType::Period;
+        rule_notify_period.period = DurationConfig::new(25, TimeUnit::Min);
+        rule_notify_period.message = "   ".to_string();
+
+        let mut rule_notify_limit = Rule::default_template(2);
+        rule_notify_limit.id = "rule-empty-notify-l".to_string();
+        rule_notify_limit.action = RuleAction::ShowNotification;
+        rule_notify_limit.notification_method = NotificationMethod::Hud;
+        rule_notify_limit.trigger = TriggerType::Limit;
+        rule_notify_limit.limit = DurationConfig::new(60, TimeUnit::Min);
+        rule_notify_limit.message = "".to_string();
+
+        cfg.rules = vec![
+            rule_break.clone(),
+            rule_notify_period.clone(),
+            rule_notify_limit.clone(),
+        ];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Preview rule alert for ShowOverlay with empty message
+        engine.preview_rule_alert(&rule_break).await;
+        if let OverlayMode::BreakEnforcer { paragraphs, .. } = &engine.active_overlay_mode {
+            assert!(!paragraphs.is_empty());
+            assert!(paragraphs.iter().any(|p| p.text.contains("Time for a Break")));
+        } else {
+            panic!("Expected BreakEnforcer mode");
+        }
+
+        // 2. Preview rule alert for ShowNotification (Period) with whitespace message
+        engine.preview_rule_alert(&rule_notify_period).await;
+        if let OverlayMode::HudToast { paragraphs, .. } = &engine.active_overlay_mode {
+            assert!(!paragraphs.is_empty());
+            assert!(paragraphs.iter().any(|p| p.text.contains("Active for")));
+        } else {
+            panic!("Expected HudToast mode");
+        }
+
+        // 3. Preview rule alert for ShowNotification (Limit) with empty message
+        engine.preview_rule_alert(&rule_notify_limit).await;
+        if let OverlayMode::HudToast { paragraphs, .. } = &engine.active_overlay_mode {
+            assert!(!paragraphs.is_empty());
+            assert!(paragraphs.iter().any(|p| p.text.contains("Daily limit")));
+        } else {
+            panic!("Expected HudToast mode");
+        }
+
+        // 4. execute_rule_action for ShowOverlay with empty message
+        let now = Local::now();
+        engine.execute_rule_action(&rule_break, None, now, "chrome.exe", 1200, 1200).await;
+        if let OverlayMode::BreakEnforcer { paragraphs, .. } = &engine.active_overlay_mode {
+            assert!(!paragraphs.is_empty());
+            assert!(paragraphs.iter().any(|p| p.text.contains("Time for a Break")));
+        } else {
+            panic!("Expected BreakEnforcer mode on execute_rule_action");
+        }
+
+        // 5. execute_rule_action for ShowNotification (HUD) with empty message
+        engine.hide_overlay();
+        engine.execute_rule_action(&rule_notify_limit, None, now, "chrome.exe", 3600, 3600).await;
+        if let OverlayMode::HudToast { paragraphs, .. } = &engine.active_overlay_mode {
+            assert!(!paragraphs.is_empty());
+            assert!(paragraphs.iter().any(|p| p.text.contains("Daily limit")));
+        } else {
+            panic!("Expected HudToast mode on execute_rule_action");
+        }
+
+        // 6. Windows notification plain-text fallback formatting
+        let mut rule_notify_win = rule_notify_period.clone();
+        rule_notify_win.notification_method = NotificationMethod::Windows;
+        let effective_msg = engine.get_effective_rule_message(&rule_notify_win);
+        let ctx = formatter::build_preview_context(&rule_notify_win);
+        let plain = formatter::format_plain_message(effective_msg, &ctx);
+        assert!(!plain.is_empty());
+        assert!(plain.contains("Active for"));
     }
 }

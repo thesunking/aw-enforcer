@@ -42,26 +42,29 @@ component FormatToggleBtn inherits Rectangle {
     in property <bool> is-active;
     in property <bool> is-italic: false;
     in property <length> btn-width: 48px;
+    in property <bool> enabled: true;
     callback clicked();
 
     width: root.btn-width;
     height: 28px;
     border-radius: 4px;
-    background: root.is-active ? #2563eb : (touch.has-hover ? #334155 : #0f172a);
+    background: !root.enabled ? #1e293b.with-alpha(0.5) : (root.is-active ? #2563eb : (touch.has-hover ? #334155 : #0f172a));
     border-width: 1px;
-    border-color: root.is-active ? #60a5fa : #475569;
+    border-color: !root.enabled ? #334155 : (root.is-active ? #60a5fa : #475569);
 
     Text {
         text: root.text;
         font-weight: 700;
         font-italic: root.is-italic;
         font-size: 12px;
-        color: root.is-active ? #ffffff : #cbd5e1;
+        color: !root.enabled ? #64748b : (root.is-active ? #ffffff : #cbd5e1);
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
     touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { root.clicked(); }
     }
 }
@@ -982,6 +985,7 @@ export component SettingsWindow inherits Window {
                                 // Add Rule Button
                                 Button {
                                     text: "+ Add Rule";
+                                    enabled: !root.ui-locked-by-strict;
                                     clicked => {
                                         root.add-rule();
                                     }
@@ -1014,6 +1018,7 @@ export component SettingsWindow inherits Window {
                             Button {
                                 text: "+ Add Rule";
                                 primary: true;
+                                enabled: !root.ui-locked-by-strict;
                                 clicked => { root.add-rule(); }
                             }
                         }
@@ -1038,6 +1043,7 @@ export component SettingsWindow inherits Window {
                                     alignment: center;
                                     Button {
                                         text: "+ Create Your First Rule";
+                                        enabled: !root.ui-locked-by-strict;
                                         clicked => { root.add-rule(); }
                                     }
                                 }
@@ -1243,6 +1249,7 @@ export component SettingsWindow inherits Window {
                                 label: "Rule Enabled:";
                                 CheckBox {
                                     checked <=> root.rule-enabled;
+                                    enabled: !root.ui-locked-by-strict;
                                     text: "Active during scheduled hours";
                                     toggled => {
                                         root.active-rule-edited();
@@ -1254,6 +1261,7 @@ export component SettingsWindow inherits Window {
                                 label: "Rule Name:";
                                 LineEdit {
                                     text <=> root.rule-name;
+                                    enabled: !root.ui-locked-by-strict;
                                     edited(val) => {
                                         root.active-rule-edited();
                                     }
@@ -1270,6 +1278,7 @@ export component SettingsWindow inherits Window {
                                 label: "Selection Mode:";
                                 ComboBox {
                                     width: 200px;
+                                    enabled: !root.ui-locked-by-strict;
                                     model: ["Executables", "Titles", "Urls"];
                                     current-value <=> root.rule-monitor-selection;
                                     selected(val) => {
@@ -1282,6 +1291,7 @@ export component SettingsWindow inherits Window {
                                 spacing: 8px;
                                 Text { text: "Monitored Executables ('*' = all active screen time):"; font-size: 14px; font-weight: 600; color: #f8fafc; }
                                 ExecutableSelector {
+                                    enabled: !root.ui-locked-by-strict;
                                     executables: root.rules[root.selected-rule-idx].target-executables;
                                     known-apps: root.known-apps;
                                     empty-text: "All applications monitored (* wildcard) — add specific .exe names below to restrict.";
@@ -1298,6 +1308,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 4px;
                                     LineEdit {
                                         text <=> root.rule-title-regex;
+                                        enabled: !root.ui-locked-by-strict;
                                         placeholder-text: "(?i)(youtube|twitch|reddit)";
                                         edited(val) => {
                                             root.active-rule-edited();
@@ -1319,6 +1330,7 @@ export component SettingsWindow inherits Window {
                                     spacing: 4px;
                                     LineEdit {
                                         text <=> root.rule-url-regex;
+                                        enabled: !root.ui-locked-by-strict;
                                         placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
                                         edited(val) => {
                                             root.active-rule-edited();
@@ -1345,6 +1357,7 @@ export component SettingsWindow inherits Window {
                                 label: "Trigger:";
                                 ComboBox {
                                     width: 220px;
+                                    enabled: !root.ui-locked-by-strict;
                                     model: ["Period", "Limit"];
                                     current-value <=> root.rule-trigger;
                                     selected(val) => {
@@ -1355,6 +1368,7 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-trigger == "Period" : DurationInput {
                                 label: "Period:";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 1;
                                 maximum-value: 3600;
                                 value <=> root.rule-period-val;
@@ -1366,6 +1380,7 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-trigger == "Period" : DurationInput {
                                 label: "Reset Session after AFK:";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 1;
                                 maximum-value: 3600;
                                 value <=> root.rule-reset-afk-val;
@@ -1377,6 +1392,7 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-trigger == "Limit" : DurationInput {
                                 label: "Daily Limit (0 = immediate):";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 0;
                                 maximum-value: 3600;
                                 value <=> root.rule-limit-val;
@@ -1397,6 +1413,7 @@ export component SettingsWindow inherits Window {
                                 label: "Action:";
                                 ComboBox {
                                     width: 220px;
+                                    enabled: !root.ui-locked-by-strict;
                                     model: (child_rule_view.cur-monitor == "Executables" && child_rule_view.has-target-executables)
                                         ? ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]
                                         : ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window"];
@@ -1417,7 +1434,7 @@ export component SettingsWindow inherits Window {
                                         border-radius: 6px;
                                         background: root.rule-notification-method == method
                                             ? #2563eb
-                                            : (method_touch.has-hover ? #334155 : #0f172a);
+                                            : ((method_touch.has-hover && !root.ui-locked-by-strict) ? #334155 : #0f172a);
                                         border-width: 1px;
                                         border-color: root.rule-notification-method == method
                                             ? #60a5fa
@@ -1425,9 +1442,9 @@ export component SettingsWindow inherits Window {
 
                                         Text {
                                             text: method;
-                                            color: root.rule-notification-method == method
+                                            color: root.ui-locked-by-strict ? #64748b : (root.rule-notification-method == method
                                                 ? #ffffff
-                                                : #cbd5e1;
+                                                : #cbd5e1);
                                             font-size: 13px;
                                             font-weight: root.rule-notification-method == method ? 700 : 500;
                                             horizontal-alignment: center;
@@ -1435,7 +1452,8 @@ export component SettingsWindow inherits Window {
                                         }
 
                                         method_touch := TouchArea {
-                                            mouse-cursor: pointer;
+                                            enabled: !root.ui-locked-by-strict;
+                                            mouse-cursor: !root.ui-locked-by-strict ? pointer : default;
                                             clicked => {
                                                 root.rule-notification-method = method;
                                                 root.active-rule-edited();
@@ -1447,6 +1465,7 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-action == "Show Notification" && root.rule-notification-method == "HUD" : DurationInput {
                                 label: "Duration:";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 1;
                                 maximum-value: 3600;
                                 value <=> root.rule-notification-duration-val;
@@ -1460,6 +1479,7 @@ export component SettingsWindow inherits Window {
                                 label: "Show Time Remaining:";
                                 CheckBox {
                                     text: "Show countdown timer on notification";
+                                    enabled: !root.ui-locked-by-strict;
                                     checked <=> root.rule-show-remaining-time;
                                     toggled => {
                                         root.active-rule-edited();
@@ -1469,6 +1489,7 @@ export component SettingsWindow inherits Window {
 
                             DurationInput {
                                 label: "Warn Before Action (0 = disabled):";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 0;
                                 maximum-value: 3600;
                                 value <=> root.rule-warn-before-val;
@@ -1480,6 +1501,7 @@ export component SettingsWindow inherits Window {
 
                             DurationInput {
                                 label: "Grace Countdown (0 = disabled):";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 0;
                                 maximum-value: 3600;
                                 value <=> root.rule-grace-val;
@@ -1491,6 +1513,7 @@ export component SettingsWindow inherits Window {
 
                             if child_rule_view.cur-action == "Show Overlay" : DurationInput {
                                 label: "Break Duration:";
+                                enabled: !root.ui-locked-by-strict;
                                 minimum-value: 1;
                                 maximum-value: 3600;
                                 value <=> root.rule-break-val;
@@ -1504,6 +1527,7 @@ export component SettingsWindow inherits Window {
                                 label: "Click-through Overlay:";
                                 CheckBox {
                                     text: "Pass mouse clicks and keystrokes through overlay";
+                                    enabled: !root.ui-locked-by-strict;
                                     checked <=> root.rule-click-through;
                                     toggled => {
                                         root.active-rule-edited();
@@ -1515,6 +1539,7 @@ export component SettingsWindow inherits Window {
                                 label: "Strict Mode:";
                                 CheckBox {
                                     text: "Hide Skip/Snooze buttons and lock settings during enforcement";
+                                    enabled: !root.ui-locked-by-strict;
                                     checked <=> root.rule-strict-mode;
                                     toggled => {
                                         root.active-rule-edited();
@@ -1545,15 +1570,16 @@ export component SettingsWindow inherits Window {
                                     spacing: 8px;
                                     alignment: start;
 
-                                    FormatToggleBtn { text: "H1"; btn-width: 36px; is-active: root.line-is-h1; clicked => { root.apply-line-style(root.selected-message-line, "h1"); } }
-                                    FormatToggleBtn { text: "H2"; btn-width: 36px; is-active: root.line-is-h2; clicked => { root.apply-line-style(root.selected-message-line, "h2"); } }
-                                    FormatToggleBtn { text: "Bold"; btn-width: 48px; is-active: root.line-is-bold; clicked => { root.apply-line-style(root.selected-message-line, "bold"); } }
-                                    FormatToggleBtn { text: "Italic"; btn-width: 48px; is-active: root.line-is-italic; is-italic: true; clicked => { root.apply-line-style(root.selected-message-line, "italic"); } }
-                                    FormatToggleBtn { text: "Underline"; btn-width: 68px; is-active: root.line-is-underline; clicked => { root.apply-line-style(root.selected-message-line, "underline"); } }
+                                    FormatToggleBtn { text: "H1"; btn-width: 36px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-h1; clicked => { root.apply-line-style(root.selected-message-line, "h1"); } }
+                                    FormatToggleBtn { text: "H2"; btn-width: 36px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-h2; clicked => { root.apply-line-style(root.selected-message-line, "h2"); } }
+                                    FormatToggleBtn { text: "Bold"; btn-width: 48px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-bold; clicked => { root.apply-line-style(root.selected-message-line, "bold"); } }
+                                    FormatToggleBtn { text: "Italic"; btn-width: 48px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-italic; is-italic: true; clicked => { root.apply-line-style(root.selected-message-line, "italic"); } }
+                                    FormatToggleBtn { text: "Underline"; btn-width: 68px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-underline; clicked => { root.apply-line-style(root.selected-message-line, "underline"); } }
 
                                     // Color selector tool
                                     ComboBox {
                                         width: 135px;
+                                        enabled: !root.ui-locked-by-strict;
                                         model: ["Color: Default", "Color: Sky Blue", "Color: Emerald", "Color: Amber", "Color: Rose", "Color: Purple", "Color: Indigo", "Color: White"];
                                         current-value <=> root.line-color-display;
                                         selected(val) => {
@@ -1564,6 +1590,7 @@ export component SettingsWindow inherits Window {
                                     // Size selector tool
                                     ComboBox {
                                         width: 115px;
+                                        enabled: !root.ui-locked-by-strict;
                                         model: ["Size: Default", "Size: 12px", "Size: 14px", "Size: 16px", "Size: 18px", "Size: 20px", "Size: 24px", "Size: 28px", "Size: 32px"];
                                         current-value <=> root.line-size-display;
                                         selected(val) => {
@@ -1584,6 +1611,7 @@ export component SettingsWindow inherits Window {
                                         Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
                                         for chip in ["{rule_name}", "{session_duration}", "{break_time}", "{app}"] : Button {
                                             text: "+ " + chip;
+                                            enabled: !root.ui-locked-by-strict;
                                             clicked => { root.append-placeholder(root.selected-message-line, chip); }
                                         }
                                     }
@@ -1595,6 +1623,7 @@ export component SettingsWindow inherits Window {
                                         Rectangle { width: 88px; }
                                         for chip in ["{used}", "{limit}", "{remaining}"] : Button {
                                             text: "+ " + chip;
+                                            enabled: !root.ui-locked-by-strict;
                                             clicked => { root.append-placeholder(root.selected-message-line, chip); }
                                         }
                                     }
@@ -1652,6 +1681,8 @@ export component SettingsWindow inherits Window {
                                                 }
 
                                                 gutter_touch := TouchArea {
+                                                    enabled: !root.ui-locked-by-strict;
+                                                    mouse-cursor: !root.ui-locked-by-strict ? pointer : default;
                                                     clicked => {
                                                         root.selected-message-line = i;
                                                         root.select-message-line(i);
@@ -1665,6 +1696,7 @@ export component SettingsWindow inherits Window {
                                     TextEdit {
                                         height: 120px;
                                         font-size: 15px;
+                                        enabled: !root.ui-locked-by-strict;
                                         text <=> root.editor-message-text;
                                         edited(val) => {
                                             root.message-text-edited(val);
@@ -1706,6 +1738,7 @@ export component SettingsWindow inherits Window {
                         Text { text: "5. Active Hours Schedule"; font-size: 17px; font-weight: 700; color: #f8fafc; }
                         SectionCard {
                             ScheduleGrid {
+                                enabled: !root.ui-locked-by-strict;
                                 slots: root.rules[root.selected-rule-idx].schedule-slots;
                                 toggle-slot(d, h, s) => { root.toggle-schedule-slot(root.selected-rule-idx, d, h, s); }
                                 toggle-day(d) => { root.toggle-schedule-day(root.selected-rule-idx, d); }
