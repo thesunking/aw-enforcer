@@ -147,16 +147,47 @@ impl MessageContext {
         }
     }
 
-    /// Replaces all supported `{...}` placeholders in `template` with their corresponding context values.
+    /// Replaces all supported `{...}` placeholders in `template` with their corresponding context values
+    /// in a single pass without re-scanning substituted values, leaving unknown `{...}` or unclosed `{` intact.
     pub fn interpolate(&self, template: &str) -> String {
-        template
-            .replace("{rule_name}", &self.rule_name)
-            .replace("{session_duration}", &self.session_duration)
-            .replace("{break_time}", &self.break_time)
-            .replace("{app}", &self.app)
-            .replace("{used}", &self.used)
-            .replace("{limit}", &self.limit)
-            .replace("{remaining}", &self.remaining)
+        let mut result = String::with_capacity(template.len() + 32);
+        let mut rest = template;
+
+        while let Some(open_idx) = rest.find('{') {
+            result.push_str(&rest[..open_idx]);
+            let after_open = &rest[open_idx + 1..];
+            if let Some(close_idx) = after_open.find('}') {
+                if let Some(next_open) = after_open[..close_idx].find('{') {
+                    result.push('{');
+                    result.push_str(&after_open[..next_open]);
+                    rest = &after_open[next_open..];
+                    continue;
+                }
+                let tag = &after_open[..close_idx];
+                match tag {
+                    "rule_name" => result.push_str(&self.rule_name),
+                    "session_duration" => result.push_str(&self.session_duration),
+                    "break_time" => result.push_str(&self.break_time),
+                    "app" | "app_name" => result.push_str(&self.app),
+                    "used" => result.push_str(&self.used),
+                    "limit" => result.push_str(&self.limit),
+                    "remaining" => result.push_str(&self.remaining),
+                    _ => {
+                        result.push('{');
+                        result.push_str(tag);
+                        result.push('}');
+                    }
+                }
+                rest = &after_open[close_idx + 1..];
+            } else {
+                result.push('{');
+                result.push_str(after_open);
+                rest = "";
+                break;
+            }
+        }
+        result.push_str(rest);
+        result
     }
 
     /// Interpolates placeholders and strips formatting markup into clean plain text for native notifications.
@@ -745,5 +776,25 @@ mod tests {
         let ctx2 = build_preview_context(&rule);
         assert_eq!(ctx2.remaining, "5m"); // fallback 300s
         assert_eq!(ctx2.used, "15m"); // 20m - 5m = 15m
+    }
+
+    #[test]
+    fn test_single_pass_interpolation_no_recursive_expansion_and_alias() {
+        let mut ctx = MessageContext::default();
+        ctx.app = "Important Document {limit} - Notes".to_string();
+        ctx.limit = "2h".to_string();
+        ctx.rule_name = "Break Rule".to_string();
+
+        // 1. {app} contains literal "{limit}" which must NOT be recursively expanded
+        let result = ctx.interpolate("{app} - {limit}");
+        assert_eq!(result, "Important Document {limit} - Notes - 2h");
+
+        // 2. {app_name} alias for {app}
+        let alias_result = ctx.interpolate("Active in {app_name} under {rule_name}");
+        assert_eq!(alias_result, "Active in Important Document {limit} - Notes under Break Rule");
+
+        // 3. Unknown placeholders and unclosed braces remain intact
+        let unknown = ctx.interpolate("{app} [{unknown_tag}] {unclosed_tag");
+        assert_eq!(unknown, "Important Document {limit} - Notes [{unknown_tag}] {unclosed_tag");
     }
 }

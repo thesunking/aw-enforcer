@@ -292,6 +292,7 @@ struct EnumMatchContext<'a, S: AsRef<str>> {
     close_matched: bool,
     matched_count: usize,
     matched_name: Option<String>,
+    pid_cache: std::collections::HashMap<u32, Option<String>>,
 }
 
 /// Win32 `EnumWindows` callback that inspects visible, non-minimized windows against title regex or process targets.
@@ -323,7 +324,12 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     let exe_matches = if ctx.has_exe_targets {
         let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        if let Some(exe_name) = get_process_name_by_pid(pid) {
+        let cached_exe = ctx
+            .pid_cache
+            .entry(pid)
+            .or_insert_with(|| get_process_name_by_pid(pid))
+            .clone();
+        if let Some(exe_name) = cached_exe {
             let matched = exe_name_matches_targets(&exe_name, ctx.target_executables);
             exe_name_opt = Some(exe_name);
             matched
@@ -393,6 +399,7 @@ fn scan_windows<S: AsRef<str>>(
         close_matched,
         matched_count: 0,
         matched_name: None,
+        pid_cache: std::collections::HashMap::new(),
     };
 
     unsafe {

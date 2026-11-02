@@ -1178,8 +1178,10 @@ impl Engine {
             }
         }
 
-        let (all_events, mut web_events) = if has_url_rules {
-            let _ = self.aw_client.has_required_buckets().await;
+        let buckets_ready = self.aw_client.prepare_poll_buckets(has_url_rules).await;
+        let (all_events, mut web_events) = if !buckets_ready {
+            (Vec::new(), Vec::new())
+        } else if has_url_rules {
             let (all_res, web_res) = tokio::join!(
                 self.aw_client.query_intersected_events(min_start_utc, now_utc),
                 self.aw_client.query_web_events(min_start_utc, now_utc)

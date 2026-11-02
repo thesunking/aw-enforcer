@@ -197,10 +197,28 @@ impl AwClient {
         self.refresh_buckets().await
     }
 
+    /// Prepares buckets before polling, refreshing `/api/0/buckets/` if unverified or if web buckets need a 60s refresh.
+    /// Returns `true` if required buckets are ready, avoiding duplicate calls and racing queries during `tokio::join!`.
+    pub async fn prepare_poll_buckets(&self, need_web: bool) -> bool {
+        let is_verified = self.buckets_verified.load(Ordering::Relaxed);
+        let need_web_refresh = need_web
+            && self
+                .last_web_bucket_check
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+
+        if !is_verified || need_web_refresh {
+            self.refresh_buckets().await
+        } else {
+            true
+        }
+    }
+
     /// Fetches all buckets from `/api/0/buckets/`, updates cached window, afk, and web bucket IDs,
     /// and sets `buckets_verified` if both window and afk buckets exist.
     pub async fn refresh_buckets(&self) -> bool {
-        *self.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
+        *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         let url = format!("{}/api/0/buckets/", self.base_url);
         let resp = match self.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
@@ -291,12 +309,12 @@ impl AwClient {
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
         let is_verified = self.buckets_verified.load(Ordering::Relaxed);
         let elapsed_60s = {
-            let last_check = *self.last_web_bucket_check.lock().unwrap();
+            let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
             last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
         };
 
         if !is_verified || elapsed_60s {
-            *self.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
+            *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             self.refresh_buckets().await;
         }
 
@@ -658,7 +676,7 @@ mod tests {
 
         // For query_web_events:
         // Set last check to now so elapsed_60s is false
-        *client.last_web_bucket_check.lock().unwrap() = Some(Instant::now());
+        *client.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         client.has_web_bucket.store(true, Ordering::Relaxed);
         *client.web_bucket_ids.write().await = vec!["aw-watcher-web-chrome_LOCAL".to_string()];
         *client.afk_bucket_id.write().await = None;
