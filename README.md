@@ -21,12 +21,12 @@
     - **`Show Statistics`:** Opens a 24-Hour Screen Time Summary HUD with an hourly activity histogram.
     - **`Lock Workstation`:** Immediately locks the Windows session.
     - **`Close Tab`:** Closes the active tab of the matching foreground window.
-    - **`Close Window`:** Closes matching visible, non-minimized windows.
-    - **`Kill Process`:** Terminates matching processes.
+    - **`Close Window`:** Closes matching visible top-level windows (including minimized taskbar windows).
+    - **`Kill Process`:** Terminates matching processes via ToolHelp snapshots, verifying running processes even when minimized or resident in the system tray.
 
 - **Three-Stage Enforcement Pipeline:**
   1. **Stage 1 — Pre-Action Warning:** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Supports custom formatted message templates across all rules.
-  2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work.
+  2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. Window minimization does not bypass enforcement: `Close Window` closes minimized taskbar windows, `Kill Process` terminates background/tray targets, and `Lock Workstation` executes reliably regardless of active desktop state.
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
 
 ---

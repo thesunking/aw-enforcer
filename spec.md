@@ -334,15 +334,16 @@ stateDiagram-v2
 - **Behavior:** Initiates `rt.grace_countdown = Some((grace_secs, grace_secs))` and displays `OverlayMode::HudTimer`.
 - **Destructive Action Clamping:** When a daily `Limit` rule with destructive actions (`CloseTab`, `CloseWindow`, `KillProcess`, `LockWorkstation`) has already executed once today, subsequent triggers clamp `effective_grace = grace_secs.min(5)` to prevent endless bypasses.
 - **Tab Navigation Safety:** URL rules continuously verify that the matching tab title and hostname remain open. If the offending tab was closed or switched away from during grace, the action safely aborts and completes the cycle.
+- **Minimization & Background Process Resilience:** Minimizing windows during grace does not bypass enforcement. `Close Window` rules scan visible top-level windows (including minimized taskbar windows). `Kill Process` rules verify running targets via ToolHelp snapshots (`find_matching_process`), terminating minimized or tray-resident processes when grace expires. `Lock Workstation` is never skipped when windows are minimized or desktop is active.
 
 #### Stage 3: Action Execution
 - **`Show Overlay`:** Launches fullscreen multi-monitor `OverlayMode::BreakEnforcer`. Waits for a 1.5s natural pause in physical user input before display. If input is detected during enforcement, progress pauses and displays an idle warning banner.
 - **`Show Notification`:** Emits `OverlayMode::HudToast` or native WinRT toast notification, marking the cycle complete.
 - **`Show Statistics`:** Opens the interactive 24-hour activity HUD (`OverlayMode::HudStatus`).
-- **`Lock Workstation`:** Calls `enforcer::lock_workstation()`. Suppresses redundant calls if the user is already AFK.
+- **`Lock Workstation`:** Calls `enforcer::lock_workstation()`. Suppresses redundant calls if the user is already AFK, and is never skipped by window minimization during grace countdowns.
 - **`Close Tab`:** Sends synthesized `Ctrl+W` (`enforcer::close_active_browser_tab`), releasing modifier keys (`VK_SHIFT`, `VK_MENU`) beforehand. Strictly requires an active foreground browser window.
-- **`Close Window`:** Posts `WM_CLOSE` to matching non-protected windows.
-- **`Kill Process`:** Terminates target processes via Win32 process handles (`enforcer::kill_target_processes`), strictly excluding the `aw-enforcer` PID.
+- **`Close Window`:** Posts `WM_CLOSE` to matching visible top-level windows (including minimized taskbar windows).
+- **`Kill Process`:** Terminates target processes via Win32 process handles (`enforcer::kill_target_processes`), verifying running instances via ToolHelp snapshots (`find_matching_process`) even if minimized or tray-resident, and strictly excluding the `aw-enforcer` PID.
 
 ---
 
@@ -388,7 +389,7 @@ graph LR
 | Subsystem | Mechanism | Technical Implementation |
 | :--- | :--- | :--- |
 | **Single-Instance Enforcement** | Win32 Named Mutex & Event | `CreateMutexW(..., "Local\\AW_Enforcer_SingleInstance_Mutex")` + `CreateEventW(..., "Local\\AW_Enforcer_Activate_Event")`. Second launches restore existing window and exit. |
-| **Shell & Self Protection** | Protected Window & Process Guards | `enforcer::is_protected_window` excludes current PID and shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `MultitaskingViewFrame`) from window closing and process termination. |
+| **Shell & Self Protection** | Protected Window & Process Guards | `enforcer::is_protected_window_base` and `is_protected_foreground_window` exclude current PID and shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `MultitaskingViewFrame`) from window closing and process termination, while allowing `Close Window` to match visible top-level windows minimized to the taskbar. |
 | **Strict Mode Lockout** | Command & UI Interception | Blocks `SnoozeBreak`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeAll`, `SetPauseAll`, `ResetRuleSession`, and tray bypasses when `rt.active_break`, `rt.grace_countdown`, or `rt.pending_break_since` is active. |
 | **Atomic Configuration Writes** | Two-Phase Disk Commit | Writes to `config.toml.tmp` and renames to `config.toml`. Corrupted files are preserved to `config.toml.bak` on load failure. |
 | **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis | Clears `VK_SHIFT` and `VK_MENU` state prior to dispatching `Ctrl+W` to avoid accidental `Ctrl+Shift+W` (entire window closure). |

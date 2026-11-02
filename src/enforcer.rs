@@ -6,9 +6,11 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
+#[cfg(not(test))]
+use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
     VK_SHIFT,
@@ -44,7 +46,7 @@ pub const BROWSER_EXES: &[&str] = &[
 pub fn get_foreground_app_name() -> Option<String> {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if is_protected_window(hwnd) {
+        if is_protected_foreground_window(hwnd) {
             return None;
         }
 
@@ -74,7 +76,7 @@ pub fn get_foreground_app_name() -> Option<String> {
 pub fn is_foreground_browser() -> bool {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if is_protected_window(hwnd) {
+        if is_protected_foreground_window(hwnd) {
             return false;
         }
 
@@ -212,6 +214,11 @@ pub fn send_system_notification(title: &str, message: &str) {
 /// Locks the Windows workstation immediately.
 pub fn lock_workstation() -> bool {
     tracing::info!("Locking workstation via LockWorkStation()");
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
     unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
 }
 
@@ -263,9 +270,10 @@ pub fn is_protected_window_class(class_name: &[u16]) -> bool {
         || class_name == MULTITASKING_VIEW_FRAME
 }
 
-/// Returns true if the window is invalid, invisible, minimized, owned by current process, or a Windows shell surface.
-unsafe fn is_protected_window(hwnd: HWND) -> bool {
-    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+/// Returns true if the window is invalid, invisible, owned by current process, or a Windows shell surface.
+/// Does not reject minimized (iconic) windows.
+unsafe fn is_protected_window_base(hwnd: HWND) -> bool {
+    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
         return true;
     }
 
@@ -284,6 +292,11 @@ unsafe fn is_protected_window(hwnd: HWND) -> bool {
     false
 }
 
+/// Returns true if the window is protected, invisible, owned by current process, a shell surface, or minimized.
+unsafe fn is_protected_foreground_window(hwnd: HWND) -> bool {
+    is_protected_window_base(hwnd) || IsIconic(hwnd) != 0
+}
+
 /// Context passed into the Win32 `EnumWindows` callback to match and optionally close top-level windows.
 struct EnumMatchContext<'a, S: AsRef<str>> {
     target_executables: &'a [S],
@@ -295,9 +308,9 @@ struct EnumMatchContext<'a, S: AsRef<str>> {
     pid_cache: std::collections::HashMap<u32, Option<String>>,
 }
 
-/// Win32 `EnumWindows` callback that inspects visible, non-minimized windows against title regex or process targets.
+/// Win32 `EnumWindows` callback that inspects visible top-level windows (including minimized taskbar windows) against title regex or process targets.
 unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if is_protected_window(hwnd) {
+    if is_protected_window_base(hwnd) {
         return 1;
     }
     let ctx = &mut *(lparam as *mut EnumMatchContext<'_, S>);
@@ -421,7 +434,7 @@ pub fn close_target_windows<S: AsRef<str>>(
     if is_wildcard {
         unsafe {
             let hwnd = GetForegroundWindow();
-            if !is_protected_window(hwnd) {
+            if !is_protected_foreground_window(hwnd) {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 return 1;
             }
@@ -431,12 +444,35 @@ pub fn close_target_windows<S: AsRef<str>>(
     scan_windows(target_executables, compiled_regex, true).0
 }
 
-/// Finds the first matching visible, non-minimized window and returns the matched title or process name.
+/// Finds the first matching visible top-level window (including minimized taskbar windows) and returns the matched title or process name.
 pub fn find_matching_window<S: AsRef<str>>(
     target_executables: &[S],
     compiled_regex: Option<&Regex>,
 ) -> Option<String> {
     scan_windows(target_executables, compiled_regex, false).1
+}
+
+/// Finds the first running process matching `target_executables` via ToolHelp snapshot,
+/// skipping PID 0 and the current process ID. Returns `None` if targets are empty or wildcard.
+pub fn find_matching_process<S: AsRef<str>>(target_executables: &[S]) -> Option<String> {
+    if target_executables.is_empty() || !has_specific_targets(target_executables) {
+        return None;
+    }
+
+    let my_pid = unsafe { GetCurrentProcessId() };
+    let mut matched_exe = None;
+
+    for_each_process(|pid, exe_name| {
+        if matched_exe.is_some() || pid == my_pid || pid == 0 {
+            return;
+        }
+
+        if exe_name_matches_targets(exe_name, target_executables) {
+            matched_exe = Some(exe_name.to_string());
+        }
+    });
+
+    matched_exe
 }
 
 /// Terminates processes matching target executables via Win32 ToolHelp snapshot.
@@ -448,6 +484,20 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
     let my_pid = unsafe { GetCurrentProcessId() };
     let mut killed_count = 0;
 
+    #[cfg(test)]
+    {
+        for_each_process(|pid, exe_name| {
+            if pid == my_pid || pid == 0 {
+                return;
+            }
+            if exe_name_matches_targets(exe_name, target_executables) {
+                killed_count += 1;
+            }
+        });
+        return killed_count;
+    }
+
+    #[cfg(not(test))]
     for_each_process(|pid, exe_name| {
         if pid == my_pid || pid == 0 {
             return;
@@ -472,6 +522,7 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
         }
     });
 
+    #[cfg(not(test))]
     killed_count
 }
 
@@ -483,7 +534,7 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
 ) -> bool {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if is_protected_window(hwnd) {
+        if is_protected_foreground_window(hwnd) {
             return false;
         }
 
@@ -628,5 +679,22 @@ mod tests {
         assert!(!is_protected_window_class(&to_u16("Chrome_WidgetWin_1")));
         assert!(!is_protected_window_class(&to_u16("ProgmanExtra")));
         assert!(!is_protected_window_class(&[]));
+    }
+
+    #[test]
+    fn test_find_matching_process_safety_guards() {
+        assert_eq!(find_matching_process::<&str>(&[]), None);
+        assert_eq!(find_matching_process(&["*"]), None);
+        assert_eq!(find_matching_process(&["", "   "]), None);
+        assert_eq!(find_matching_process(&["*", ""]), None);
+
+        // Nonexistent process returns None
+        assert_eq!(find_matching_process(&["nonexistent_process_99999.exe"]), None);
+
+        // Standard Windows system process should match if running
+        let explorer = find_matching_process(&["explorer.exe"]);
+        if let Some(name) = explorer {
+            assert!(name.eq_ignore_ascii_case("explorer.exe") || name.eq_ignore_ascii_case("explorer"));
+        }
     }
 }

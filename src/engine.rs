@@ -1112,7 +1112,6 @@ impl Engine {
                     RuleAction::CloseTab
                         | RuleAction::CloseWindow
                         | RuleAction::KillProcess
-                        | RuleAction::LockWorkstation
                 );
 
                 if is_destructive && target_window.is_none() {
@@ -2481,7 +2480,12 @@ pub fn find_matching_window_for_rule(
                         .or_else(|| Some("Active Application".to_string()))
                 }
             } else {
-                enforcer::find_matching_window(&rule.target_executables, None)
+                let win = enforcer::find_matching_window(&rule.target_executables, None);
+                if win.is_none() && rule.action == RuleAction::KillProcess {
+                    enforcer::find_matching_process(&rule.target_executables)
+                } else {
+                    win
+                }
             }
         }
     }
@@ -5475,5 +5479,71 @@ mod tests {
         assert!(rt_kill.grace_countdown.is_none());
         assert!(rt_kill.last_completed_at.is_some());
         assert!(!rt_kill.can_rollback_completion);
+    }
+
+    #[tokio::test]
+    async fn test_lock_workstation_and_kill_process_grace_not_bypassed_when_windows_minimized() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        // 1. Rule with LockWorkstation targeting a nonexistent window (simulating minimized or desktop active)
+        let mut lock_rule = Rule::default_template(0);
+        lock_rule.id = "rule-lock-test".to_string();
+        lock_rule.action = RuleAction::LockWorkstation;
+        lock_rule.trigger = TriggerType::Limit;
+        lock_rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        lock_rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        lock_rule.monitor_selection = MonitorSelection::Executables;
+        lock_rule.target_executables = vec!["nonexistent_closed_app_12345.exe".to_string()];
+
+        // 2. Rule with KillProcess targeting a running process (explorer.exe) that may have no visible window
+        let mut kill_rule = Rule::default_template(1);
+        kill_rule.id = "rule-kill-test".to_string();
+        kill_rule.action = RuleAction::KillProcess;
+        kill_rule.trigger = TriggerType::Limit;
+        kill_rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        kill_rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        kill_rule.monitor_selection = MonitorSelection::Executables;
+        kill_rule.target_executables = vec!["explorer.exe".to_string()];
+
+        cfg.rules = vec![lock_rule.clone(), kill_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Verify find_matching_window_for_rule for KillProcess falls back to find_matching_process
+        let re_kill = engine.runtimes.get("rule-kill-test").and_then(|r| r.compiled_regex.clone());
+        let matched = find_matching_window_for_rule(
+            &kill_rule,
+            re_kill.as_ref(),
+            &[],
+            Utc::now(),
+            10,
+        );
+        assert!(matched.is_some());
+        let matched_name = matched.unwrap();
+        assert!(matched_name.eq_ignore_ascii_case("explorer.exe") || matched_name.eq_ignore_ascii_case("explorer"));
+
+        // Set grace_countdown to 1s on both rules
+        engine.runtimes.get_mut("rule-lock-test").unwrap().grace_countdown = Some((1, 5));
+        engine.runtimes.get_mut("rule-kill-test").unwrap().grace_countdown = Some((1, 5));
+
+        // Tick realtime: grace countdown finishes (1 -> 0)
+        engine.realtime_tick().await;
+
+        // Verify LockWorkstation executed action (grace cleared, action_executed_today is true)
+        let rt_lock = engine.runtimes.get("rule-lock-test").unwrap();
+        assert_eq!(rt_lock.grace_countdown, None);
+        assert!(
+            rt_lock.action_executed_today,
+            "LockWorkstation should execute action and mark today completed even when no matching window is visible"
+        );
+
+        // Verify KillProcess executed action (grace cleared, action_executed_today is true)
+        let rt_kill = engine.runtimes.get("rule-kill-test").unwrap();
+        assert_eq!(rt_kill.grace_countdown, None);
+        assert!(
+            rt_kill.action_executed_today,
+            "KillProcess should execute action and mark today completed when target process is running"
+        );
     }
 }
