@@ -392,7 +392,7 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<Ru
 fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
     let mut updated_config = base_cfg.clone();
 
-    updated_config.general.aw_port = win.get_aw_port().clamp(1000, 65535) as u16;
+    updated_config.general.aw_port = win.get_aw_port().clamp(1, 65535) as u16;
     updated_config.general.poll_interval_seconds =
         win.get_poll_interval_seconds().max(2) as u64;
     updated_config.general.autostart = win.get_autostart();
@@ -724,8 +724,8 @@ fn open_settings_window(
         let ui_client_cell = ui_aw_client.clone();
         let item_pause = item_pause.clone();
         let overlay_mgr_cell = overlay_manager.clone();
-
         let rm = rules_model.clone();
+        let live_state_cell = live_state.clone();
 
         settings_win.on_save_config(move || {
             if let Some(win) = sw.upgrade() {
@@ -745,13 +745,8 @@ fn open_settings_window(
                     "Pause All Rules"
                 });
 
-                if updated_config.stats.threshold_excessive_minutes
-                    != win.get_threshold_excessive_minutes().max(1) as u32
-                {
-                    win.set_threshold_excessive_minutes(
-                        updated_config.stats.threshold_excessive_minutes as i32,
-                    );
-                }
+                apply_config_to_ui(&win, &updated_config, &rm);
+                sync_live_state_to_ui(&win, &rm, &live_state_cell.borrow());
 
                 // Persist config to disk
                 if let Err(e) = updated_config.save() {
@@ -1372,6 +1367,7 @@ fn open_settings_window(
         let slot_for_close = settings_slot.clone();
         let rm_for_close = rules_model.clone();
         let cfg_for_close = current_config.clone();
+        let live_state_for_close = live_state.clone();
         settings_win.window().on_close_requested(move || {
             let slot_inner = slot_for_close.clone();
             let rm_inner = rm_for_close.clone();
@@ -1385,6 +1381,7 @@ fn open_settings_window(
                 });
             } else if let Some(win) = slot_inner.borrow().as_ref() {
                 apply_config_to_ui(win, &cfg_for_close.borrow(), &rm_inner);
+                sync_live_state_to_ui(win, &rm_inner, &live_state_for_close.borrow());
                 win.set_strict_unlock_countdown(0);
                 win.set_strict_unlocked(false);
             }
