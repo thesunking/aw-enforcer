@@ -689,6 +689,16 @@ impl Config {
         };
 
         self.overlay.opacity = self.overlay.opacity.clamp(0.1, 1.0);
+        let default_overlay = OverlayConfig::default();
+        if crate::formatter::parse_hex_color(&self.overlay.accent_color).is_none() {
+            self.overlay.accent_color = default_overlay.accent_color;
+        }
+        if crate::formatter::parse_hex_color(&self.overlay.background_color).is_none() {
+            self.overlay.background_color = default_overlay.background_color;
+        }
+        if crate::formatter::parse_hex_color(&self.overlay.text_color).is_none() {
+            self.overlay.text_color = default_overlay.text_color;
+        }
 
         self.stats.daily_screentime_target_minutes = self.stats.daily_screentime_target_minutes.max(1);
         self.stats.threshold_excessive_minutes = self
@@ -1063,6 +1073,32 @@ mod tests {
             .threshold_excessive_minutes
             .max(cfg.stats.daily_screentime_target_minutes);
         assert_eq!(cfg.stats.threshold_excessive_minutes, 480);
+    }
+
+    #[test]
+    fn test_overlay_hex_color_sanitization() {
+        let mut cfg = Config::default();
+        // Set invalid hex colors
+        cfg.overlay.accent_color = "not-a-color".to_string();
+        cfg.overlay.background_color = "#123".to_string(); // 3-digit shorthand not supported by parse_hex_color
+        cfg.overlay.text_color = "#GGGGGG".to_string(); // invalid hex chars
+
+        cfg.sanitize();
+
+        assert_eq!(cfg.overlay.accent_color, "#3b82f6");
+        assert_eq!(cfg.overlay.background_color, "#0f172a");
+        assert_eq!(cfg.overlay.text_color, "#f8fafc");
+
+        // Valid 6-digit and 8-digit hex colors should be preserved
+        cfg.overlay.accent_color = "#10b981".to_string();
+        cfg.overlay.background_color = "#1e293b".to_string();
+        cfg.overlay.text_color = "#ffffff80".to_string();
+
+        cfg.sanitize();
+
+        assert_eq!(cfg.overlay.accent_color, "#10b981");
+        assert_eq!(cfg.overlay.background_color, "#1e293b");
+        assert_eq!(cfg.overlay.text_color, "#ffffff80");
     }
 
     #[test]

@@ -357,6 +357,13 @@ fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) 
 }
 
 /// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
+/// Returns `true` if `warn_before` is configured (> 0) and is greater than or equal to the rule's trigger threshold.
+fn check_warn_before_exceeds_threshold(rule_view: &RuleView) -> bool {
+    let domain_rule = view_to_rule(rule_view);
+    domain_rule.warn_before.to_seconds() > 0
+        && domain_rule.warn_before.to_seconds() >= domain_rule.trigger_threshold_seconds()
+}
+
 fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<RuleView>) {
     win.set_rule_enabled(rule.enabled);
     win.set_rule_name(rule.name.clone());
@@ -385,6 +392,7 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<Ru
     win.set_rule_strict_mode(rule.strict_mode);
     win.set_editor_message_text(rule.message.clone());
     refresh_message_editor_state(win, &rule.message, 0, Some(rule));
+    win.set_warn_before_exceeds_threshold(check_warn_before_exceeds_threshold(rule));
     refresh_rule_regex_validation(win, rm);
 }
 
@@ -1131,6 +1139,7 @@ fn open_settings_window(
 
                         let cur_line = win.get_selected_message_line() as usize;
                         refresh_message_editor_state(&win, &rule.message, cur_line, Some(&rule));
+                        win.set_warn_before_exceeds_threshold(check_warn_before_exceeds_threshold(&rule));
                         rm.set_row_data(u, rule);
                         refresh_rule_regex_validation(&win, &rm);
                         win.set_has_unsaved_changes(true);
@@ -2036,5 +2045,38 @@ mod tests {
         assert_eq!(rule.notification_duration.value, 1);
         assert_eq!(rule.action, RuleAction::CloseWindow);
         assert_eq!(rule.schedule.to_bool_array(), [false; 168]);
+    }
+
+    #[test]
+    fn test_check_warn_before_exceeds_threshold() {
+        let mut rule = Rule::default_template(0);
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(20, TimeUnit::Min); // 1200s
+        rule.warn_before = DurationConfig::new(0, TimeUnit::Sec);
+        let mut view = rule_to_view(&rule);
+        assert!(!check_warn_before_exceeds_threshold(&view));
+
+        // warn_before < threshold (5m < 20m)
+        view.warn_before_val = 5;
+        view.warn_before_unit = "Min".into();
+        assert!(!check_warn_before_exceeds_threshold(&view));
+
+        // warn_before == threshold (20m == 20m)
+        view.warn_before_val = 20;
+        view.warn_before_unit = "Min".into();
+        assert!(check_warn_before_exceeds_threshold(&view));
+
+        // warn_before > threshold (25m > 20m)
+        view.warn_before_val = 25;
+        view.warn_before_unit = "Min".into();
+        assert!(check_warn_before_exceeds_threshold(&view));
+
+        // Limit rule with 0 limit: threshold is 0s
+        view.trigger = "Limit".into();
+        view.limit_val = 0;
+        view.limit_unit = "Min".into();
+        view.warn_before_val = 1;
+        view.warn_before_unit = "Min".into();
+        assert!(check_warn_before_exceeds_threshold(&view));
     }
 }

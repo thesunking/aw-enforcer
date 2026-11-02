@@ -275,6 +275,7 @@ export component SettingsWindow inherits Window {
     in-out property <string> rule-break-unit: "Min";
     in-out property <bool> rule-click-through: false;
     in-out property <bool> rule-strict-mode: false;
+    in property <bool> warn-before-exceeds-threshold: false;
 
     // Known apps for dropdown picker
     in property <[string]> known-apps;
@@ -606,7 +607,7 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             SpinBox {
                                 value <=> root.aw-port;
-                                minimum: 1000;
+                                minimum: 1;
                                 maximum: 65535;
                                 edited => { root.has-unsaved-changes = true; }
                             }
@@ -617,7 +618,7 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             SpinBox {
                                 value <=> root.poll-interval-seconds;
-                                minimum: 1;
+                                minimum: 2;
                                 maximum: 120;
                                 edited => { root.has-unsaved-changes = true; }
                             }
@@ -803,9 +804,14 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             SpinBox {
                                 value <=> root.daily-target-minutes;
-                                minimum: 60;
+                                minimum: 1;
                                 maximum: 1440;
-                                edited => { root.has-unsaved-changes = true; }
+                                edited(val) => {
+                                    root.has-unsaved-changes = true;
+                                    if root.threshold-excessive-minutes < val {
+                                        root.threshold-excessive-minutes = val;
+                                    }
+                                }
                             }
                         }
 
@@ -814,7 +820,7 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             SpinBox {
                                 value <=> root.threshold-excessive-minutes;
-                                minimum: 60;
+                                minimum: root.daily-target-minutes;
                                 maximum: 1440;
                                 edited => { root.has-unsaved-changes = true; }
                             }
@@ -1497,6 +1503,12 @@ export component SettingsWindow inherits Window {
                                 edited(val, u) => {
                                     root.active-rule-edited();
                                 }
+                            }
+
+                            if root.warn-before-exceeds-threshold : Text {
+                                text: "⚠ Warn Before Action must be shorter than the trigger Period/Limit to fire before enforcement.";
+                                color: #f59e0b;
+                                font-size: 13px;
                             }
 
                             DurationInput {
