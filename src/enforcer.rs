@@ -70,6 +70,24 @@ pub fn get_foreground_app_name() -> Option<String> {
     }
 }
 
+/// Checks if the current foreground window is a non-protected window belonging to an executable in `BROWSER_EXES`.
+pub fn is_foreground_browser() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if is_protected_window(hwnd) {
+            return false;
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if let Some(exe_name) = get_process_name_by_pid(pid) {
+            exe_name_matches_targets(&exe_name, BROWSER_EXES)
+        } else {
+            false
+        }
+    }
+}
+
 /// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`).
 pub fn exe_name_matches_targets<S: AsRef<str>>(
     exe_name: &str,
@@ -215,11 +233,34 @@ pub fn is_protected_window_class(class_name: &[u16]) -> bool {
         b'a' as u16, b'r' as u16, b'y' as u16, b'T' as u16, b'r' as u16, b'a' as u16,
         b'y' as u16, b'W' as u16, b'n' as u16, b'd' as u16,
     ];
+    const NOTIFY_ICON_OVERFLOW: &[u16] = &[
+        b'N' as u16, b'o' as u16, b't' as u16, b'i' as u16, b'f' as u16, b'y' as u16,
+        b'I' as u16, b'c' as u16, b'o' as u16, b'n' as u16, b'O' as u16, b'v' as u16,
+        b'e' as u16, b'r' as u16, b'f' as u16, b'l' as u16, b'o' as u16, b'w' as u16,
+        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
+    ];
+    const TOP_LEVEL_OVERFLOW_XAML: &[u16] = &[
+        b'T' as u16, b'o' as u16, b'p' as u16, b'L' as u16, b'e' as u16, b'v' as u16,
+        b'e' as u16, b'l' as u16, b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16,
+        b'o' as u16, b'w' as u16, b'F' as u16, b'o' as u16, b'r' as u16, b'O' as u16,
+        b'v' as u16, b'e' as u16, b'r' as u16, b'f' as u16, b'l' as u16, b'o' as u16,
+        b'w' as u16, b'X' as u16, b'a' as u16, b'm' as u16, b'l' as u16, b'I' as u16,
+        b's' as u16, b'l' as u16, b'a' as u16, b'n' as u16, b'd' as u16,
+    ];
+    const MULTITASKING_VIEW_FRAME: &[u16] = &[
+        b'M' as u16, b'u' as u16, b'l' as u16, b't' as u16, b'i' as u16, b't' as u16,
+        b'a' as u16, b's' as u16, b'k' as u16, b'i' as u16, b'n' as u16, b'g' as u16,
+        b'V' as u16, b'i' as u16, b'e' as u16, b'w' as u16, b'F' as u16, b'r' as u16,
+        b'a' as u16, b'm' as u16, b'e' as u16,
+    ];
 
     class_name == PROGMAN
         || class_name == WORKERW
         || class_name == SHELL_TRAY
         || class_name == SHELL_SECONDARY_TRAY
+        || class_name == NOTIFY_ICON_OVERFLOW
+        || class_name == TOP_LEVEL_OVERFLOW_XAML
+        || class_name == MULTITASKING_VIEW_FRAME
 }
 
 /// Returns true if the window is invalid, invisible, minimized, owned by current process, or a Windows shell surface.
@@ -572,6 +613,9 @@ mod tests {
         assert!(is_protected_window_class(&to_u16("WorkerW")));
         assert!(is_protected_window_class(&to_u16("Shell_TrayWnd")));
         assert!(is_protected_window_class(&to_u16("Shell_SecondaryTrayWnd")));
+        assert!(is_protected_window_class(&to_u16("NotifyIconOverflowWindow")));
+        assert!(is_protected_window_class(&to_u16("TopLevelWindowForOverflowXamlIsland")));
+        assert!(is_protected_window_class(&to_u16("MultitaskingViewFrame")));
 
         assert!(!is_protected_window_class(&to_u16("Notepad")));
         assert!(!is_protected_window_class(&to_u16("Chrome_WidgetWin_1")));

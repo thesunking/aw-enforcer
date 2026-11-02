@@ -654,6 +654,9 @@ impl Engine {
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 tracing::debug!("Acknowledged app warning for rule {rule_id}");
+                if let Some(rt) = self.runtimes.get_mut(&rule_id) {
+                    rt.can_rollback_completion = false;
+                }
                 if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
                 }
@@ -1396,6 +1399,11 @@ impl Engine {
             })
             .ok();
         if remaining == 0 {
+            if let Some(rule_id) = self.active_overlay_mode.rule_id() {
+                if let Some(rt) = self.runtimes.get_mut(rule_id) {
+                    rt.can_rollback_completion = false;
+                }
+            }
             self.transition_to_active_countdown_or_hide();
         }
     }
@@ -1532,6 +1540,10 @@ impl Engine {
                             rt.last_matched_url = None;
                             rt.set_last_matched_title(None);
                         }
+                    } else {
+                        rt.last_matched_app = None;
+                        rt.last_matched_url = None;
+                        rt.set_last_matched_title(None);
                     }
                 }
                 return false;
@@ -2360,6 +2372,9 @@ pub fn find_matching_window_for_rule(
     match rule.monitor_selection {
         MonitorSelection::Titles => enforcer::find_matching_window::<&str>(&[], compiled_re),
         MonitorSelection::Urls => {
+            if rule.action == RuleAction::CloseTab && !enforcer::is_foreground_browser() {
+                return None;
+            }
             let browser_match = enforcer::find_matching_window(enforcer::BROWSER_EXES, None)?;
             let recency_cutoff =
                 now_utc - Duration::seconds((poll_interval_secs.max(2) as i64) * 2 + 5);
@@ -5060,5 +5075,182 @@ mod tests {
         let win_ev = make_event(base_time, 600.0, "chrome.exe", "Google Chrome", "");
         let filtered = filter_web_events_by_active_browser_windows(&[], &[win_ev]);
         assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_or_expire_toast_clears_rollback_flag() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-toast-rollback".to_string();
+        rule.action = RuleAction::ShowNotification;
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(20, TimeUnit::Min);
+
+        cfg.rules = vec![rule];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let t0 = Local::now() - Duration::hours(2);
+        let t1 = Local::now() - Duration::hours(1);
+
+        // 1. AcknowledgeAppWarning: Acknowledging Stage 3 toast locks in completion
+        {
+            let rt = engine.runtimes.get_mut("rule-toast-rollback").unwrap();
+            rt.prev_completed_at = Some(t0);
+            rt.last_completed_at = Some(t1);
+            rt.can_rollback_completion = true;
+        }
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-toast-rollback".to_string(),
+            title: "Warning".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![15],
+            duration_seconds: 10,
+            remaining_seconds: 8,
+            show_time_remaining: true,
+        };
+
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-toast-rollback".to_string(),
+            })
+            .await;
+
+        assert!(!engine.runtimes.get("rule-toast-rollback").unwrap().can_rollback_completion);
+
+        // Subsequent snooze should not roll back last_completed_at to t0
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-toast-rollback".to_string(),
+                minutes: 15,
+            })
+            .await;
+        assert_eq!(
+            engine.runtimes.get("rule-toast-rollback").unwrap().last_completed_at,
+            Some(t1)
+        );
+
+        // 2. Toast expiry via countdown tick: reaching 0 clears can_rollback_completion
+        {
+            let rt = engine.runtimes.get_mut("rule-toast-rollback").unwrap();
+            rt.prev_completed_at = Some(t0);
+            rt.last_completed_at = Some(t1);
+            rt.can_rollback_completion = true;
+        }
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-toast-rollback".to_string(),
+            title: "Warning".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![15],
+            duration_seconds: 10,
+            remaining_seconds: 1,
+            show_time_remaining: true,
+        };
+
+        engine.send_overlay_countdown_tick(0, 10, true);
+        assert!(!engine.runtimes.get("rule-toast-rollback").unwrap().can_rollback_completion);
+
+        // Subsequent snooze should preserve last_completed_at
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-toast-rollback".to_string(),
+                minutes: 15,
+            })
+            .await;
+        assert_eq!(
+            engine.runtimes.get("rule-toast-rollback").unwrap().last_completed_at,
+            Some(t1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_urls_rule_grace_countdown_stale_or_empty_events_clears_title_and_skips_enforcement() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-stale-grace".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.action = RuleAction::CloseTab;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // 1. Initially in grace countdown with active youtube title
+        let rt = engine.runtimes.get_mut("rule-urls-stale-grace").unwrap();
+        rt.grace_countdown = Some((3, 5));
+        rt.last_matched_app = Some("youtube.com".to_string());
+        rt.last_matched_url = Some("https://youtube.com/watch?v=123".to_string());
+        rt.set_last_matched_title(Some("Video - YouTube".to_string()));
+        assert!(rt.last_matched_title_regex.is_some());
+
+        // 2. Events contain only stale event outside recency window
+        let ev_stale = make_event(
+            now_utc - Duration::seconds(60),
+            2.0,
+            "chrome.exe",
+            "Video - YouTube",
+            "https://youtube.com/watch?v=123",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[ev_stale],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_after_stale = engine.runtimes.get("rule-urls-stale-grace").unwrap();
+        assert_eq!(rt_after_stale.last_matched_app, None);
+        assert_eq!(rt_after_stale.last_matched_url, None);
+        assert_eq!(rt_after_stale.last_matched_title, None);
+        assert!(rt_after_stale.last_matched_title_regex.is_none());
+
+        // 3. Reset title, then evaluate with empty events list
+        let rt = engine.runtimes.get_mut("rule-urls-stale-grace").unwrap();
+        rt.last_matched_app = Some("youtube.com".to_string());
+        rt.last_matched_url = Some("https://youtube.com/watch?v=123".to_string());
+        rt.set_last_matched_title(Some("Video - YouTube".to_string()));
+
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_after_empty = engine.runtimes.get("rule-urls-stale-grace").unwrap();
+        assert_eq!(rt_after_empty.last_matched_app, None);
+        assert_eq!(rt_after_empty.last_matched_url, None);
+        assert_eq!(rt_after_empty.last_matched_title, None);
+        assert!(rt_after_empty.last_matched_title_regex.is_none());
+
+        // 4. Countdown reaches 0: destructive enforcement is skipped and cycle completes safely
+        engine.runtimes.get_mut("rule-urls-stale-grace").unwrap().grace_countdown = Some((1, 5));
+        engine.realtime_tick().await;
+
+        let rt_done = engine.runtimes.get("rule-urls-stale-grace").unwrap();
+        assert_eq!(rt_done.grace_countdown, None);
+        assert!(rt_done.action_executed_today);
     }
 }
