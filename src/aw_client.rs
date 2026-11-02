@@ -132,6 +132,8 @@ pub struct AwEvent {
 #[derive(Clone)]
 pub struct AwClient {
     base_url: String,
+    port: u16,
+    api_key: String,
     client: reqwest::Client,
     buckets_verified: Arc<AtomicBool>,
     has_web_bucket: Arc<AtomicBool>,
@@ -144,9 +146,10 @@ pub struct AwClient {
 impl AwClient {
     /// Creates a new `AwClient` targeting `http://localhost:<port>` with an optional Bearer token.
     pub fn new(port: u16, api_key: &str) -> Self {
+        let trimmed_key = api_key.trim();
         let mut headers = HeaderMap::new();
-        if !api_key.trim().is_empty() {
-            if let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", api_key.trim())) {
+        if !trimmed_key.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", trimmed_key)) {
                 headers.insert(AUTHORIZATION, val);
             }
         }
@@ -159,6 +162,8 @@ impl AwClient {
 
         Self {
             base_url: format!("http://localhost:{}", port),
+            port,
+            api_key: trimmed_key.to_string(),
             client,
             buckets_verified: Arc::new(AtomicBool::new(false)),
             has_web_bucket: Arc::new(AtomicBool::new(false)),
@@ -167,6 +172,11 @@ impl AwClient {
             afk_bucket_id: Arc::new(RwLock::new(None)),
             web_bucket_ids: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Returns true if this client connects to `port` with `api_key` (trimmed).
+    pub fn matches_config(&self, port: u16, api_key: &str) -> bool {
+        self.port == port && self.api_key == api_key.trim()
     }
 
     /// Checks whether the ActivityWatch server is reachable via GET /api/0/info.
@@ -655,5 +665,19 @@ mod tests {
         // afk_bucket_id is None: must return empty without find_bucket fallback
         let web_res = client.query_web_events(start, now).await;
         assert!(web_res.is_empty());
+    }
+
+    #[test]
+    fn test_aw_client_matches_config() {
+        let client = AwClient::new(5600, "my-token");
+        assert!(client.matches_config(5600, "my-token"));
+        assert!(client.matches_config(5600, "  my-token  "));
+        assert!(!client.matches_config(5601, "my-token"));
+        assert!(!client.matches_config(5600, "other-token"));
+
+        let client_empty = AwClient::new(5600, "   ");
+        assert!(client_empty.matches_config(5600, ""));
+        assert!(client_empty.matches_config(5600, "   "));
+        assert!(!client_empty.matches_config(5600, "token"));
     }
 }

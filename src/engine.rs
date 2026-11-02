@@ -223,12 +223,16 @@ impl RuleRuntime {
     }
 
     /// Sets `last_matched_title` and updates `last_matched_title_regex`.
+    /// Normalizes empty/whitespace titles to `None` and avoids recompiling regex if unchanged.
     pub fn set_last_matched_title(&mut self, title: Option<String>) {
-        self.last_matched_title_regex = title
+        let normalized = title.filter(|t| !t.trim().is_empty());
+        if self.last_matched_title == normalized {
+            return;
+        }
+        self.last_matched_title_regex = normalized
             .as_deref()
-            .filter(|t| !t.trim().is_empty())
             .and_then(|t| Regex::new(&regex::escape(t)).ok());
-        self.last_matched_title = title;
+        self.last_matched_title = normalized;
     }
 
     /// Clears active break, grace countdown, pending break, and warning flags for the current cycle.
@@ -668,10 +672,12 @@ impl Engine {
                 tracing::info!("Engine: Reloading configuration ({} rules)", new_cfg.rules.len());
                 let paused = new_cfg.general.pause_all_rules;
                 self.config = *new_cfg;
-                self.aw_client = Arc::new(AwClient::new(
-                    self.config.general.aw_port,
-                    &self.config.general.api_key,
-                ));
+                if !self.aw_client.matches_config(self.config.general.aw_port, &self.config.general.api_key) {
+                    self.aw_client = Arc::new(AwClient::new(
+                        self.config.general.aw_port,
+                        &self.config.general.api_key,
+                    ));
+                }
                 self.runtimes.retain(|id, _| self.config.rules.iter().any(|r| &r.id == id));
                 for rule in &self.config.rules {
                     self.runtimes
@@ -4870,5 +4876,37 @@ mod tests {
         let rt = engine.runtimes.get("rule-live-update-test").unwrap();
         assert!(rt.active_break.is_none());
         assert!(statuses.iter().any(|(id, _)| id == "rule-live-update-test"));
+    }
+
+    #[test]
+    fn test_set_last_matched_title_deduplication_and_whitespace_clearing() {
+        let rule = Rule::default_template(0);
+        let mut rt = RuleRuntime::from_rule(&rule);
+
+        // 1. Initial state is None
+        assert!(rt.last_matched_title.is_none());
+        assert!(rt.last_matched_title_regex.is_none());
+
+        // 2. Setting whitespace-only title normalizes to None without compiling regex
+        rt.set_last_matched_title(Some("   \t\n  ".to_string()));
+        assert!(rt.last_matched_title.is_none());
+        assert!(rt.last_matched_title_regex.is_none());
+
+        // 3. Setting a valid title compiles regex and stores normalized title
+        rt.set_last_matched_title(Some("My Document - Editor".to_string()));
+        assert_eq!(rt.last_matched_title.as_deref(), Some("My Document - Editor"));
+        assert!(rt.last_matched_title_regex.is_some());
+        assert!(rt.last_matched_title_regex.as_ref().unwrap().is_match("My Document - Editor"));
+
+        // 4. Setting identical title preserves existing regex reference without re-compiling
+        let re_ptr = rt.last_matched_title_regex.as_ref().unwrap().as_str().to_string();
+        rt.set_last_matched_title(Some("My Document - Editor".to_string()));
+        assert_eq!(rt.last_matched_title.as_deref(), Some("My Document - Editor"));
+        assert_eq!(rt.last_matched_title_regex.as_ref().unwrap().as_str(), re_ptr);
+
+        // 5. Setting empty string clears title and regex
+        rt.set_last_matched_title(Some("".to_string()));
+        assert!(rt.last_matched_title.is_none());
+        assert!(rt.last_matched_title_regex.is_none());
     }
 }

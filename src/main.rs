@@ -762,10 +762,15 @@ fn open_settings_window(
                 }
 
                 *cfg_cell.borrow_mut() = updated_config.clone();
-                *ui_client_cell.borrow_mut() = Arc::new(AwClient::new(
+                if !ui_client_cell.borrow().matches_config(
                     updated_config.general.aw_port,
                     &updated_config.general.api_key,
-                ));
+                ) {
+                    *ui_client_cell.borrow_mut() = Arc::new(AwClient::new(
+                        updated_config.general.aw_port,
+                        &updated_config.general.api_key,
+                    ));
+                }
                 cmd_tx
                     .send(DaemonCommand::ReloadConfig(Box::new(updated_config)))
                     .ok();
