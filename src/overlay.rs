@@ -739,17 +739,19 @@ impl OverlayManager {
                     win.set_title_text(title.as_str().into());
                     win.set_countdown_text(format_countdown(*remaining_seconds, true).into());
                     win.set_progress_ratio(compute_progress_ratio(*remaining_seconds, *duration_seconds));
-                    win.set_click_through(true);
+                    win.set_click_through(false);
+                    win.set_allow_snooze(true);
+                    win.set_strict_mode(false);
 
                     set_window_paragraphs(win, paragraphs);
                 }
 
                 let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
                 let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
-                let (card_w, card_h, margin) = scale_card_bounds(scale, 420.0, 180.0, 20.0);
+                let (card_w, card_h, margin) = scale_card_bounds(scale, 420.0, 220.0, 20.0);
                 let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
 
-                self.apply_win32_overlay_styles(0, x, y, card_w, card_h, true, true, false);
+                self.apply_win32_overlay_styles(0, x, y, card_w, card_h, false, true, false);
             }
             OverlayMode::HudStatus {
                 title,

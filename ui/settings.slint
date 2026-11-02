@@ -316,6 +316,7 @@ export component SettingsWindow inherits Window {
     callback add-rule();
     callback delete-rule(int /* rule_idx */);
     callback duplicate-rule(int /* rule_idx */);
+    callback move-rule(int /* from_idx */, int /* to_idx */);
     callback toggle-rule-enabled(int /* rule_idx */, bool /* enabled */);
     callback snooze-rule(int /* rule_idx */, int /* minutes */);
     callback reset-rule-session(int /* rule_idx */);
@@ -1134,6 +1135,22 @@ export component SettingsWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 8px;
                                     alignment: end;
+
+                                    Button {
+                                        text: "↑";
+                                        enabled: !root.ui-locked-by-strict && i > 0;
+                                        clicked => {
+                                            root.move-rule(i, i - 1);
+                                        }
+                                    }
+
+                                    Button {
+                                        text: "↓";
+                                        enabled: !root.ui-locked-by-strict && i < root.rules.length - 1;
+                                        clicked => {
+                                            root.move-rule(i, i + 1);
+                                        }
+                                    }
 
                                     Button {
                                         text: "Snooze 15m";

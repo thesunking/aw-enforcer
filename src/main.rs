@@ -1008,6 +1008,41 @@ fn open_settings_window(
         });
     }
 
+    // Move rule (reorder)
+    {
+        let rm = rules_model.clone();
+        let sw = settings_weak.clone();
+        settings_win.on_move_rule(move |from_idx, to_idx| {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+                if from_idx < 0 || to_idx < 0 {
+                    return;
+                }
+                let from_u = from_idx as usize;
+                let to_u = to_idx as usize;
+                let count = rm.row_count();
+                if from_u < count && to_u < count && from_u != to_u {
+                    if let (Some(r1), Some(r2)) = (rm.row_data(from_u), rm.row_data(to_u)) {
+                        rm.set_row_data(from_u, r2);
+                        rm.set_row_data(to_u, r1);
+
+                        let cur = win.get_selected_rule_idx();
+                        if cur == from_idx {
+                            win.set_selected_rule_idx(to_idx);
+                        } else if cur == to_idx {
+                            win.set_selected_rule_idx(from_idx);
+                        }
+
+                        refresh_rule_regex_validation(&win, &rm);
+                        win.set_has_unsaved_changes(true);
+                    }
+                }
+            }
+        });
+    }
+
     // Toggle rule enabled (from overview list)
     {
         let rm = rules_model.clone();

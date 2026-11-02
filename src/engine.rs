@@ -596,13 +596,39 @@ impl Engine {
         }
 
         // 2. Second highest priority: HudTimer (grace_countdown > 0)
-        let grace_rule = self.config.rules.iter().find(|r| {
-            r.enabled && self.runtimes
-                .get(&r.id)
-                .and_then(|rt| rt.grace_countdown)
-                .map(|(rem, _)| rem > 0)
-                .unwrap_or(false)
-        }).cloned();
+        let grace_rule = self
+            .config
+            .rules
+            .iter()
+            .filter(|r| {
+                r.enabled
+                    && self
+                        .runtimes
+                        .get(&r.id)
+                        .and_then(|rt| rt.grace_countdown)
+                        .map(|(rem, _)| rem > 0)
+                        .unwrap_or(false)
+            })
+            .max_by_key(|r| {
+                let rem = self
+                    .runtimes
+                    .get(&r.id)
+                    .and_then(|rt| rt.grace_countdown)
+                    .map(|(rem, _)| rem)
+                    .unwrap_or(u32::MAX);
+                (
+                    r.action == RuleAction::ShowOverlay && r.strict_mode,
+                    matches!(
+                        r.action,
+                        RuleAction::LockWorkstation
+                            | RuleAction::CloseTab
+                            | RuleAction::CloseWindow
+                            | RuleAction::KillProcess
+                    ),
+                    std::cmp::Reverse(rem),
+                )
+            })
+            .cloned();
 
         if let Some(rule) = grace_rule {
             let (rem, total) = self
@@ -673,7 +699,15 @@ impl Engine {
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 tracing::debug!("Acknowledged app warning for rule {rule_id}");
+                let is_strict_break = self
+                    .config
+                    .rules
+                    .iter()
+                    .any(|r| r.id == rule_id && r.action == RuleAction::ShowOverlay && r.strict_mode);
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
+                    if rt.grace_countdown.is_some() && !is_strict_break {
+                        rt.complete_cycle(Local::now());
+                    }
                     rt.can_rollback_completion = false;
                 }
                 if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
@@ -5375,5 +5409,71 @@ mod tests {
         let plain = formatter::format_plain_message(effective_msg, &ctx);
         assert!(!plain.is_empty());
         assert!(plain.contains("Active for"));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_hud_timer_grace_cancellation_and_priority() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut r_notify = Rule::default_template(0);
+        r_notify.id = "rule-notify".to_string();
+        r_notify.action = RuleAction::ShowNotification;
+
+        let mut r_close = Rule::default_template(1);
+        r_close.id = "rule-close".to_string();
+        r_close.action = RuleAction::CloseWindow;
+
+        let mut r_kill = Rule::default_template(2);
+        r_kill.id = "rule-kill".to_string();
+        r_kill.action = RuleAction::KillProcess;
+
+        let mut r_strict_break = Rule::default_template(3);
+        r_strict_break.id = "rule-strict".to_string();
+        r_strict_break.action = RuleAction::ShowOverlay;
+        r_strict_break.strict_mode = true;
+
+        cfg.rules = vec![
+            r_notify.clone(),
+            r_close.clone(),
+            r_kill.clone(),
+            r_strict_break.clone(),
+        ];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Test prioritization:
+        // Set grace_countdown on notify (10s), close (15s), kill (5s)
+        engine.runtimes.get_mut("rule-notify").unwrap().grace_countdown = Some((10, 10));
+        engine.runtimes.get_mut("rule-close").unwrap().grace_countdown = Some((15, 15));
+        engine.runtimes.get_mut("rule-kill").unwrap().grace_countdown = Some((5, 5));
+
+        // transition_to_active_countdown_or_hide should choose destructive action with shortest remaining: rule-kill (5s)
+        engine.transition_to_active_countdown_or_hide();
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-kill"));
+
+        // If strict break also has grace_countdown (20s), strict break should have top priority even over kill (5s)
+        engine.runtimes.get_mut("rule-strict").unwrap().grace_countdown = Some((20, 20));
+        engine.transition_to_active_countdown_or_hide();
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-strict"));
+
+        // 2. AcknowledgeAppWarning on strict break does NOT cancel grace countdown
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-strict".to_string(),
+            })
+            .await;
+        assert!(engine.runtimes.get("rule-strict").unwrap().grace_countdown.is_some());
+
+        // 3. AcknowledgeAppWarning on non-strict rule cancels grace countdown and marks cycle complete
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-kill".to_string(),
+            })
+            .await;
+        let rt_kill = engine.runtimes.get("rule-kill").unwrap();
+        assert!(rt_kill.grace_countdown.is_none());
+        assert!(rt_kill.last_completed_at.is_some());
+        assert!(!rt_kill.can_rollback_completion);
     }
 }

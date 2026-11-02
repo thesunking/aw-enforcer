@@ -719,16 +719,36 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
-    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = Self::config_path();
+    /// Attempts to read, parse, validate, and sanitize `path`, creating a default file if none exists.
+    /// If loading an existing file fails, backs up the corrupted file to `path.with_extension("toml.bak")`.
+    pub fn try_load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
             let default_cfg = Self::default();
-            default_cfg.save()?;
+            default_cfg.save_to_path(path)?;
             return Ok(default_cfg);
         }
 
-        Self::load_from_path(&path)
+        match Self::load_from_path(path) {
+            Ok(cfg) => Ok(cfg),
+            Err(e) => {
+                let bak_path = path.with_extension("toml.bak");
+                let _ = fs::copy(path, &bak_path);
+                tracing::warn!(
+                    "Failed to load existing config at {:?} ({}); backed up corrupted file to {:?}",
+                    path,
+                    e,
+                    bak_path
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
+    /// If loading an existing file fails, backs up the corrupted file to `config.toml.bak`.
+    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = Self::config_path();
+        Self::try_load_from_path(&path)
     }
 
     /// Enforces safety invariants on rules, downgrading `KillProcess` to `CloseWindow`
@@ -739,7 +759,8 @@ impl Config {
         }
     }
 
-    /// Serializes, validates, sanitizes, and writes the configuration to `path`, creating parent directories as needed.
+    /// Serializes, validates, sanitizes, and writes the configuration to `path` atomically via a temporary file,
+    /// creating parent directories as needed.
     pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -747,7 +768,19 @@ impl Config {
         let mut to_save = self.clone();
         to_save.sanitize();
         let serialized = toml::to_string_pretty(&to_save)?;
-        fs::write(path, serialized)?;
+        let tmp_path = path.with_extension("toml.tmp");
+        fs::write(&tmp_path, &serialized)?;
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            tracing::warn!(
+                "Atomic rename from {:?} to {:?} failed ({:?}); falling back to direct write",
+                tmp_path,
+                path,
+                e
+            );
+            let write_res = fs::write(path, &serialized);
+            let _ = fs::remove_file(&tmp_path);
+            write_res?;
+        }
         Ok(())
     }
 
@@ -1137,6 +1170,47 @@ mod tests {
         assert_eq!(loaded.stats.histogram_time_format, "%H:%M");
         assert_eq!(loaded.rules.len(), 1);
         assert_eq!(loaded.rules[0].action, RuleAction::CloseWindow);
+
+        // Clean up
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// Verifies atomic configuration saves via `.toml.tmp` and automatic `.toml.bak` creation when loading corrupted TOML.
+    #[test]
+    fn test_atomic_save_and_corrupted_config_backup() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "aw_enforcer_atomic_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_file = temp_dir.join("config.toml");
+        let tmp_file = config_file.with_extension("toml.tmp");
+        let bak_file = config_file.with_extension("toml.bak");
+
+        let mut cfg = Config::default();
+        cfg.general.aw_port = 5678;
+
+        // 1. Verify atomic save creates config.toml and removes .toml.tmp
+        cfg.save_to_path(&config_file).expect("Atomic save should succeed");
+        assert!(config_file.exists());
+        assert!(!tmp_file.exists());
+
+        // 2. Roundtrip load
+        let loaded = Config::load_from_path(&config_file).expect("Load should succeed");
+        assert_eq!(loaded.general.aw_port, 5678);
+
+        // 3. Corrupt config.toml with invalid TOML
+        fs::write(&config_file, "INVALID_TOML_CONTENT = [[[[[").expect("Write corrupted config");
+
+        // 4. try_load_from_path should fail and produce .toml.bak
+        let load_err = Config::try_load_from_path(&config_file);
+        assert!(load_err.is_err());
+        assert!(bak_file.exists(), ".toml.bak backup file should have been created");
+
+        let bak_content = fs::read_to_string(&bak_file).expect("Read backup file");
+        assert_eq!(bak_content, "INVALID_TOML_CONTENT = [[[[[");
 
         // Clean up
         let _ = fs::remove_dir_all(temp_dir);

@@ -290,6 +290,27 @@ export component OverlayWindow inherits Window {
                     border-radius: 2px;
                 }
             }
+
+            // Controls: Snooze & Dismiss when non-strict and interactive
+            if root.allow-snooze && !root.strict-mode && !root.click-through : HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                height: 30px;
+
+                Button {
+                    text: "Snooze (5m)";
+                    clicked => {
+                        root.snooze-clicked(root.rule-id, 5);
+                    }
+                }
+
+                Button {
+                    text: "Dismiss";
+                    clicked => {
+                        root.acknowledge-toast-clicked(root.rule-id);
+                    }
+                }
+            }
         }
     }
 
