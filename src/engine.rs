@@ -1403,7 +1403,8 @@ impl Engine {
         start_of_day_utc: DateTime<Utc>,
         now_utc: DateTime<Utc>,
     ) -> bool {
-        if !self.is_rule_displayed(&rule.id) {
+        let is_displayed = self.is_rule_displayed(&rule.id);
+        if !is_displayed {
             if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                 rt.can_rollback_completion = false;
             }
@@ -1413,6 +1414,9 @@ impl Engine {
         {
             let Some(rt) = self.runtimes.get_mut(&rule.id) else { return false; };
             if rt.active_break.is_some() || rt.pending_break_since.is_some() {
+                return false;
+            }
+            if is_displayed && rt.can_rollback_completion {
                 return false;
             }
             if rt.grace_countdown.is_some() {
@@ -2139,7 +2143,64 @@ impl Engine {
                     self.show_overlay(mode);
                 }
             }
-            _ => {}
+            RuleAction::ShowStatistics => {
+                let grace_secs = rule.grace_duration.to_seconds();
+                if grace_secs > 0 {
+                    let dur = grace_secs.min(15);
+                    let default_msg = format!(
+                        "[color=#f87171 bold] {} in {}s.",
+                        rule.action.as_str(),
+                        grace_secs
+                    );
+                    let raw_msg = if !rule.message.trim().is_empty() {
+                        &rule.message
+                    } else {
+                        &default_msg
+                    };
+                    let paragraphs = self.parse_rule_message(
+                        raw_msg,
+                        &ctx,
+                        TextHorizontalAlignment::Left,
+                    );
+                    let mode = OverlayMode::HudTimer {
+                        rule_id: "test_preview".to_string(),
+                        title: format!("{}: {}", rule.action.as_str(), rule.name),
+                        paragraphs,
+                        duration_seconds: dur,
+                        remaining_seconds: dur,
+                    };
+                    self.show_overlay(mode);
+                } else if rule.warn_before.to_seconds() > 0 {
+                    let default_msg = format!(
+                        "[color=#f59e0b bold] {} in {}.",
+                        rule.action.as_str(),
+                        &ctx.remaining
+                    );
+                    let raw_msg = if !rule.message.trim().is_empty() {
+                        &rule.message
+                    } else {
+                        &default_msg
+                    };
+                    let paragraphs = self.parse_rule_message(
+                        raw_msg,
+                        &ctx,
+                        TextHorizontalAlignment::Left,
+                    );
+                    let dur = rule.notification_duration.to_seconds().max(1);
+                    let mode = OverlayMode::HudToast {
+                        rule_id: "test_preview".to_string(),
+                        title: format!("Upcoming: {}", rule.name),
+                        paragraphs,
+                        snooze_options_minutes: vec![5, 10, 15],
+                        duration_seconds: dur,
+                        remaining_seconds: dur,
+                        show_time_remaining: rule.show_remaining_time,
+                    };
+                    self.show_overlay(mode);
+                } else {
+                    self.display_stats_overlay(rule.click_through).await;
+                }
+            }
         }
     }
 }
@@ -4565,5 +4626,153 @@ mod tests {
         assert!(rt.grace_countdown.is_none());
         assert!(rt.active_break.is_none());
         assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+    }
+
+    #[tokio::test]
+    async fn test_preview_rule_alert_show_statistics() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        // 1. ShowStatistics with grace_duration > 0 previews HudTimer
+        let mut rule_grace = Rule::default_template(0);
+        rule_grace.id = "rule-stats-grace".to_string();
+        rule_grace.name = "Stats Grace Rule".to_string();
+        rule_grace.action = RuleAction::ShowStatistics;
+        rule_grace.grace_duration = DurationConfig::new(25, TimeUnit::Sec);
+
+        cfg.rules = vec![rule_grace.clone()];
+        let mut engine = Engine::new(cfg.clone(), aw_client.clone(), overlay_tx.clone());
+
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_grace)))
+            .await;
+
+        let action1 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action1 {
+            OverlayAction::Show(OverlayMode::HudTimer {
+                rule_id,
+                title,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(title, "Show Statistics: Stats Grace Rule");
+                assert_eq!(duration_seconds, 15); // clamped to 15s max
+                assert_eq!(remaining_seconds, 15);
+            }
+            other => panic!("Expected HudTimer for ShowStatistics with grace, got: {other:?}"),
+        }
+
+        // 2. ShowStatistics with grace == 0 and warn_before > 0 previews HudToast
+        let mut rule_warn = Rule::default_template(1);
+        rule_warn.id = "rule-stats-warn".to_string();
+        rule_warn.name = "Stats Warn Rule".to_string();
+        rule_warn.action = RuleAction::ShowStatistics;
+        rule_warn.grace_duration = DurationConfig::new(0, TimeUnit::Sec);
+        rule_warn.warn_before = DurationConfig::new(5, TimeUnit::Min);
+        rule_warn.notification_duration = DurationConfig::new(12, TimeUnit::Sec);
+
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_warn)))
+            .await;
+
+        let action2 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action2 {
+            OverlayAction::Show(OverlayMode::HudToast {
+                rule_id,
+                title,
+                duration_seconds,
+                remaining_seconds,
+                ..
+            }) => {
+                assert_eq!(rule_id, "test_preview");
+                assert_eq!(title, "Upcoming: Stats Warn Rule");
+                assert_eq!(duration_seconds, 12);
+                assert_eq!(remaining_seconds, 12);
+            }
+            other => panic!("Expected HudToast for ShowStatistics warning, got: {other:?}"),
+        }
+
+        // 3. ShowStatistics with grace == 0 and warn_before == 0 opens HudStatus
+        let mut rule_stats = Rule::default_template(2);
+        rule_stats.id = "rule-stats-direct".to_string();
+        rule_stats.name = "Stats Direct Rule".to_string();
+        rule_stats.action = RuleAction::ShowStatistics;
+        rule_stats.grace_duration = DurationConfig::new(0, TimeUnit::Sec);
+        rule_stats.warn_before = DurationConfig::new(0, TimeUnit::Sec);
+        rule_stats.click_through = true;
+
+        engine
+            .handle_command(DaemonCommand::PreviewRule(Box::new(rule_stats)))
+            .await;
+
+        let action3 = overlay_rx.recv().await.expect("Expected overlay action");
+        match action3 {
+            OverlayAction::Show(OverlayMode::HudStatus { click_through, .. }) => {
+                assert!(click_through);
+            }
+            other => panic!("Expected HudStatus for direct ShowStatistics preview, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_rule_preserves_active_stage3_hud_toast() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-hud-toast-eval".to_string();
+        rule.action = RuleAction::ShowNotification;
+        rule.notification_method = NotificationMethod::Hud;
+        rule.period = DurationConfig::new(20, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = logical_day_start(now, engine.config.general.day_start_hour).with_timezone(&Utc);
+
+        // Display Stage 3 HudToast for this rule
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-hud-toast-eval".to_string(),
+            title: "Notification Toast".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![5, 10, 15],
+            duration_seconds: 10,
+            remaining_seconds: 10,
+            show_time_remaining: true,
+        };
+
+        let completed_time = now - Duration::seconds(2);
+        {
+            let rt = engine.runtimes.get_mut("rule-hud-toast-eval").unwrap();
+            rt.last_completed_at = Some(completed_time);
+            rt.can_rollback_completion = true;
+            rt.action_executed_today = true;
+        }
+
+        let ev = make_event(
+            now_utc - Duration::minutes(5),
+            300.0,
+            "code.exe",
+            "test.rs",
+            "",
+        );
+
+        let re = Regex::new("(?i)code\\.exe").ok();
+
+        let evaluated = engine
+            .evaluate_rule(&rule, re.as_ref(), now, &[ev], start_of_day_utc, now_utc)
+            .await;
+
+        // Evaluation returns false early and preserves can_rollback_completion == true
+        assert!(!evaluated);
+        let rt = engine.runtimes.get("rule-hud-toast-eval").unwrap();
+        assert!(rt.can_rollback_completion);
+        assert_eq!(rt.last_completed_at, Some(completed_time));
     }
 }
