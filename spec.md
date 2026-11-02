@@ -206,7 +206,7 @@ pub struct Rule {
     #[serde(default)]
     pub click_through: bool,                 // Passes input through overlay (WS_EX_TRANSPARENT)
     #[serde(default)]
-    pub strict_mode: bool,                   // Locks settings and UI during enforcement
+    pub strict_mode: bool,                   // Locks settings and UI during enforcement across all actions
     #[serde(default)]
     pub notification_method: NotificationMethod, // HUD Toast vs. Windows System Toast
     #[serde(default = "default_notification_duration")]
@@ -331,7 +331,8 @@ stateDiagram-v2
 
 #### Stage 2: Grace Countdown (`grace_duration > 0`)
 - **Trigger Condition:** `elapsed >= threshold`.
-- **Behavior:** Initiates `rt.grace_countdown = Some((grace_secs, grace_secs))` and displays `OverlayMode::HudTimer`.
+- **Behavior:** Initiates `rt.grace_countdown = Some((grace_secs, grace_secs))` and displays `OverlayMode::HudTimer`. Populates `allow_snooze: !rule.strict_mode` and `strict_mode: rule.strict_mode`. When `strict_mode` is enabled, Skip and Snooze controls are completely hidden across all actions, and settings/tray bypasses are locked.
+- **Dismissing Destructive Grace Timers:** Clicking "Dismiss" (`AcknowledgeAppWarning`) on a non-strict destructive `HudTimer` (`LockWorkstation`, `CloseTab`, `CloseWindow`, `KillProcess`) hides the banner while allowing `rt.grace_countdown` to continue ticking down in the background to execute the action at 0s (users who want to defer enforcement must click `Snooze (5m)`). On strict rules, `AcknowledgeAppWarning` is rejected entirely. For non-destructive actions (`ShowOverlay`, `ShowNotification`, `ShowStatistics`), dismissing cancels grace and completes the cycle.
 - **Destructive Action Clamping:** When a daily `Limit` rule with destructive actions (`CloseTab`, `CloseWindow`, `KillProcess`, `LockWorkstation`) has already executed once today, subsequent triggers clamp `effective_grace = grace_secs.min(5)` to prevent endless bypasses.
 - **Tab Navigation Safety:** URL rules continuously verify that the matching tab title and hostname remain open. If the offending tab was closed or switched away from during grace, the action safely aborts and completes the cycle.
 - **Minimization & Background Process Resilience:** Minimizing windows during grace does not bypass enforcement. `Close Window` rules scan visible top-level windows (including minimized taskbar windows). `Kill Process` rules verify running targets via ToolHelp snapshots (`find_matching_process`), terminating minimized or tray-resident processes when grace expires. `Lock Workstation` is never skipped when windows are minimized or desktop is active.
@@ -379,7 +380,7 @@ graph LR
     NavLive --> LiveView
 ```
 
-- **Strict Mode Lock:** While a strict break or grace period is active, all rule modification callbacks (`on_add_rule`, `on_delete_rule`, `on_active_rule_edited`, etc.) return early, and the UI displays a 15-second unlock countdown card.
+- **Strict Mode Lock:** While a strict break, grace period, or pending break is active across any rule action, all rule modification callbacks (`on_add_rule`, `on_delete_rule`, `on_active_rule_edited`, etc.) return early, and the UI displays a 15-second unlock countdown card.
 - **Real-Time Regex & Strftime Validation:** Syntax errors in title/URL regexes or strftime formats are displayed in an inline warning banner, disabling the `Save & Apply Changes` button.
 
 ---
@@ -390,7 +391,7 @@ graph LR
 | :--- | :--- | :--- |
 | **Single-Instance Enforcement** | Win32 Named Mutex & Event | `CreateMutexW(..., "Local\\AW_Enforcer_SingleInstance_Mutex")` + `CreateEventW(..., "Local\\AW_Enforcer_Activate_Event")`. Second launches restore existing window and exit. |
 | **Shell & Self Protection** | Protected Window & Process Guards | `enforcer::is_protected_window_base` and `is_protected_foreground_window` exclude current PID and shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `MultitaskingViewFrame`) from window closing and process termination, while allowing `Close Window` to match visible top-level windows minimized to the taskbar. |
-| **Strict Mode Lockout** | Command & UI Interception | Blocks `SnoozeBreak`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeAll`, `SetPauseAll`, `ResetRuleSession`, and tray bypasses when `rt.active_break`, `rt.grace_countdown`, or `rt.pending_break_since` is active. |
+| **Strict Mode Lockout** | Command & UI Interception | Blocks `SnoozeBreak`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeAll`, `SetPauseAll`, `ResetRuleSession`, and tray bypasses when `rt.active_break`, `rt.grace_countdown`, or `rt.pending_break_since` is active for any rule with `strict_mode == true`. |
 | **Atomic Configuration Writes** | Two-Phase Disk Commit | Writes to `config.toml.tmp` and renames to `config.toml`. Corrupted files are preserved to `config.toml.bak` on load failure. |
 | **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis | Clears `VK_SHIFT` and `VK_MENU` state prior to dispatching `Ctrl+W` to avoid accidental `Ctrl+Shift+W` (entire window closure). |
 | **Poisoned Mutex Recovery** | Safe Lock Unwrapping | All synchronization locks use `.unwrap_or_else(|e| e.into_inner())` to prevent daemon panics if an internal thread panics. |

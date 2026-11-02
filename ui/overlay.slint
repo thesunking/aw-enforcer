@@ -202,7 +202,7 @@ export component OverlayWindow inherits Window {
                 alignment: end;
                 height: 34px;
 
-                if root.allow-snooze && !root.strict-mode : HorizontalLayout {
+                if root.allow-snooze && !root.strict-mode && root.snooze-options.length > 0 : HorizontalLayout {
                     spacing: 8px;
 
                     ComboBox {

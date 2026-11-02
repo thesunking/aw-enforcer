@@ -1564,10 +1564,10 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Overlay" : FormRow {
+                            FormRow {
                                 label: "Strict Mode:";
                                 CheckBox {
-                                    text: "Hide Skip/Snooze buttons and lock settings during enforcement";
+                                    text: "Hide Skip/Snooze controls and lock settings during grace & break enforcement";
                                     enabled: !root.ui-locked-by-strict;
                                     checked <=> root.rule-strict-mode;
                                     toggled => {

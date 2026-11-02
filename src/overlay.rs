@@ -77,6 +77,8 @@ pub enum OverlayMode {
         paragraphs: Vec<FormattedParagraph>,
         duration_seconds: u32,
         remaining_seconds: u32,
+        allow_snooze: bool,
+        strict_mode: bool,
     },
     HudStatus {
         title: String,
@@ -727,6 +729,8 @@ impl OverlayManager {
                 paragraphs,
                 duration_seconds,
                 remaining_seconds,
+                allow_snooze,
+                strict_mode,
             } => {
                 self.prepare_windows(1);
 
@@ -740,8 +744,8 @@ impl OverlayManager {
                     win.set_countdown_text(format_countdown(*remaining_seconds, true).into());
                     win.set_progress_ratio(compute_progress_ratio(*remaining_seconds, *duration_seconds));
                     win.set_click_through(false);
-                    win.set_allow_snooze(true);
-                    win.set_strict_mode(false);
+                    win.set_allow_snooze(*allow_snooze);
+                    win.set_strict_mode(*strict_mode);
 
                     set_window_paragraphs(win, paragraphs);
                 }
@@ -1039,6 +1043,8 @@ mod tests {
             paragraphs: Vec::new(),
             duration_seconds: 30,
             remaining_seconds: 30,
+            allow_snooze: true,
+            strict_mode: false,
         };
         mgr.show_mode(timer_mode);
         assert!(matches!(mgr.current_mode, OverlayMode::HudTimer { .. }));

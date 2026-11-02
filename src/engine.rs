@@ -494,10 +494,10 @@ impl Engine {
             .any(|rt| rt.active_break.is_some() || rt.grace_countdown.is_some())
     }
 
-    /// Returns `true` if any enabled `ShowOverlay` rule with `strict_mode` is currently in a break or grace countdown.
+    /// Returns `true` if any enabled rule with `strict_mode` is currently in a break or grace countdown.
     pub fn is_strict_lock_active(&self, _now: DateTime<Local>) -> bool {
         for rule in &self.config.rules {
-            if !rule.enabled || rule.action != RuleAction::ShowOverlay || !rule.strict_mode {
+            if !rule.enabled || !rule.strict_mode {
                 continue;
             }
             if let Some(rt) = self.runtimes.get(&rule.id) {
@@ -617,7 +617,7 @@ impl Engine {
                     .map(|(rem, _)| rem)
                     .unwrap_or(u32::MAX);
                 (
-                    r.action == RuleAction::ShowOverlay && r.strict_mode,
+                    r.strict_mode,
                     matches!(
                         r.action,
                         RuleAction::LockWorkstation
@@ -662,6 +662,8 @@ impl Engine {
                 paragraphs,
                 duration_seconds: total,
                 remaining_seconds: rem,
+                allow_snooze: !rule.strict_mode,
+                strict_mode: rule.strict_mode,
             });
             self.overlay_tx
                 .send(OverlayAction::UpdateCountdown {
@@ -682,8 +684,8 @@ impl Engine {
         match cmd {
             DaemonCommand::SnoozeBreak { rule_id, minutes } => {
                 if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
-                    if rule.action == RuleAction::ShowOverlay && rule.strict_mode {
-                        tracing::warn!("SnoozeBreak ignored: strict break active for rule {}", rule_id);
+                    if rule.strict_mode {
+                        tracing::warn!("SnoozeBreak ignored: strict mode active for rule {}", rule_id);
                         return;
                     }
                 }
@@ -699,25 +701,51 @@ impl Engine {
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
                 tracing::debug!("Acknowledged app warning for rule {rule_id}");
-                let is_strict_break = self
+                let is_strict = self
                     .config
                     .rules
                     .iter()
-                    .any(|r| r.id == rule_id && r.action == RuleAction::ShowOverlay && r.strict_mode);
+                    .any(|r| r.id == rule_id && r.strict_mode);
+                if is_strict {
+                    tracing::warn!("AcknowledgeAppWarning ignored: strict mode active for rule {}", rule_id);
+                    return;
+                }
+
+                let is_destructive = self.config.rules.iter().any(|r| {
+                    r.id == rule_id
+                        && matches!(
+                            r.action,
+                            RuleAction::LockWorkstation
+                                | RuleAction::CloseTab
+                                | RuleAction::CloseWindow
+                                | RuleAction::KillProcess
+                        )
+                });
+
+                let mut destructive_grace_dismissed = false;
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    if rt.grace_countdown.is_some() && !is_strict_break {
-                        rt.complete_cycle(Local::now());
+                    if rt.grace_countdown.is_some() {
+                        if is_destructive {
+                            destructive_grace_dismissed = true;
+                        } else {
+                            rt.complete_cycle(Local::now());
+                        }
                     }
                     rt.can_rollback_completion = false;
                 }
-                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
+
+                if destructive_grace_dismissed {
+                    if self.is_rule_displayed(&rule_id) {
+                        self.hide_overlay();
+                    }
+                } else if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
                 }
             }
             DaemonCommand::SkipBreak { rule_id } => {
                 if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
-                    if rule.action == RuleAction::ShowOverlay && rule.strict_mode {
-                        tracing::warn!("SkipBreak ignored: strict break active for rule {}", rule_id);
+                    if rule.strict_mode {
+                        tracing::warn!("SkipBreak ignored: strict mode active for rule {}", rule_id);
                         return;
                     }
                 }
@@ -1532,7 +1560,7 @@ impl Engine {
                 rule_id: rule.id.clone(),
                 title: warn_title,
                 paragraphs,
-                snooze_options_minutes: if rule.action == RuleAction::ShowOverlay && rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
+                snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                 duration_seconds: dur,
                 remaining_seconds: dur,
                 show_time_remaining: rule.show_remaining_time,
@@ -1806,6 +1834,8 @@ impl Engine {
                     paragraphs,
                     duration_seconds: effective_grace,
                     remaining_seconds: effective_grace,
+                    allow_snooze: !rule.strict_mode,
+                    strict_mode: rule.strict_mode,
                 });
             } else {
                 self.execute_rule_action(rule, compiled_re, now, &matched_app_name, elapsed_secs, threshold_secs).await;
@@ -1895,7 +1925,7 @@ impl Engine {
                             rule_id: rule.id.clone(),
                             title: rule.name.clone(),
                             paragraphs,
-                            snooze_options_minutes: vec![5, 10, 15],
+                            snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                             duration_seconds: dur,
                             remaining_seconds: dur,
                             show_time_remaining: rule.show_remaining_time,
@@ -2174,6 +2204,8 @@ impl Engine {
                     paragraphs,
                     duration_seconds: 30,
                     remaining_seconds: 30,
+                    allow_snooze: true,
+                    strict_mode: false,
                 };
                 self.show_overlay(mode);
             }
@@ -2220,7 +2252,7 @@ impl Engine {
                         rule_id: "test_preview".to_string(),
                         title: rule.name.clone(),
                         paragraphs,
-                        snooze_options_minutes: vec![5, 10, 15],
+                        snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                         duration_seconds: dur,
                         remaining_seconds: dur,
                         show_time_remaining: rule.show_remaining_time,
@@ -2256,6 +2288,8 @@ impl Engine {
                         paragraphs,
                         duration_seconds: dur,
                         remaining_seconds: dur,
+                        allow_snooze: !rule.strict_mode,
+                        strict_mode: rule.strict_mode,
                     };
                     self.show_overlay(mode);
                 } else {
@@ -2279,7 +2313,7 @@ impl Engine {
                         rule_id: "test_preview".to_string(),
                         title: format!("Upcoming: {}", rule.name),
                         paragraphs,
-                        snooze_options_minutes: vec![5, 10, 15],
+                        snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                         duration_seconds: dur,
                         remaining_seconds: dur,
                         show_time_remaining: rule.show_remaining_time,
@@ -2312,6 +2346,8 @@ impl Engine {
                         paragraphs,
                         duration_seconds: dur,
                         remaining_seconds: dur,
+                        allow_snooze: !rule.strict_mode,
+                        strict_mode: rule.strict_mode,
                     };
                     self.show_overlay(mode);
                 } else if rule.warn_before.to_seconds() > 0 {
@@ -2789,6 +2825,8 @@ mod tests {
             paragraphs: Vec::new(),
             duration_seconds: 10,
             remaining_seconds: 10,
+            allow_snooze: true,
+            strict_mode: false,
         });
         assert!(matches!(engine.active_overlay_mode, OverlayMode::BreakEnforcer { .. }));
 
@@ -3416,6 +3454,8 @@ mod tests {
             paragraphs: Vec::new(),
             duration_seconds: 5,
             remaining_seconds: 1,
+            allow_snooze: true,
+            strict_mode: false,
         };
 
         while overlay_rx.try_recv().is_ok() {}
@@ -3583,6 +3623,8 @@ mod tests {
             paragraphs: Vec::new(),
             duration_seconds: 10,
             remaining_seconds: 10,
+            allow_snooze: true,
+            strict_mode: false,
         };
         assert!(engine.is_rule_displayed("rule-2"));
 
@@ -3923,6 +3965,7 @@ mod tests {
                 paragraphs,
                 duration_seconds,
                 remaining_seconds,
+                ..
             }) => {
                 assert_eq!(rule_id, "test_preview");
                 assert_eq!(title, "Close Window: Gaming Limit");
@@ -5469,16 +5512,97 @@ mod tests {
             .await;
         assert!(engine.runtimes.get("rule-strict").unwrap().grace_countdown.is_some());
 
-        // 3. AcknowledgeAppWarning on non-strict rule cancels grace countdown and marks cycle complete
+        // 3. AcknowledgeAppWarning on non-strict non-destructive rule (rule-notify) cancels grace countdown and marks cycle complete
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-notify".to_string(),
+            })
+            .await;
+        let rt_notify = engine.runtimes.get("rule-notify").unwrap();
+        assert!(rt_notify.grace_countdown.is_none());
+        assert!(rt_notify.last_completed_at.is_some());
+        assert!(!rt_notify.can_rollback_completion);
+
+        // 4. AcknowledgeAppWarning on non-strict destructive rule (rule-kill) hides overlay but preserves grace countdown
+        engine.runtimes.get_mut("rule-strict").unwrap().grace_countdown = None;
+        engine.transition_to_active_countdown_or_hide();
+        assert!(engine.is_rule_displayed("rule-kill"));
         engine
             .handle_command(DaemonCommand::AcknowledgeAppWarning {
                 rule_id: "rule-kill".to_string(),
             })
             .await;
         let rt_kill = engine.runtimes.get("rule-kill").unwrap();
-        assert!(rt_kill.grace_countdown.is_none());
-        assert!(rt_kill.last_completed_at.is_some());
-        assert!(!rt_kill.can_rollback_completion);
+        assert!(rt_kill.grace_countdown.is_some(), "Dismissing a destructive grace timer must not abort grace countdown");
+        assert!(!engine.is_rule_displayed("rule-kill"), "Overlay should be hidden after dismissing");
+
+        // SnoozeBreak on non-strict destructive rule pauses enforcement
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-kill".to_string(),
+                minutes: 5,
+            })
+            .await;
+        let rt_kill_snoozed = engine.runtimes.get("rule-kill").unwrap();
+        assert!(rt_kill_snoozed.snoozed_until.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_strict_mode_on_destructive_actions_locks_and_blocks_commands() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut r_kill = Rule::default_template(0);
+        r_kill.id = "rule-strict-kill".to_string();
+        r_kill.action = RuleAction::KillProcess;
+        r_kill.strict_mode = true;
+        r_kill.target_executables = vec!["game.exe".to_string()];
+
+        let mut r_close = Rule::default_template(1);
+        r_close.id = "rule-strict-close".to_string();
+        r_close.action = RuleAction::CloseWindow;
+        r_close.strict_mode = true;
+        r_close.target_executables = vec!["browser.exe".to_string()];
+
+        cfg.rules = vec![r_kill.clone(), r_close.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Setting grace_countdown on strict KillProcess rule activates strict lock
+        engine.runtimes.get_mut("rule-strict-kill").unwrap().grace_countdown = Some((30, 30));
+        assert!(engine.is_strict_lock_active(Local::now()));
+
+        // 2. Strict lock blocks SnoozeBreak
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-strict-kill".to_string(),
+                minutes: 5,
+            })
+            .await;
+        assert!(engine.runtimes.get("rule-strict-kill").unwrap().snoozed_until.is_none());
+        assert_eq!(engine.runtimes.get("rule-strict-kill").unwrap().grace_countdown, Some((30, 30)));
+
+        // 3. Strict lock blocks SnoozeAll
+        engine.handle_command(DaemonCommand::SnoozeAll { minutes: 15 }).await;
+        assert!(engine.global_snoozed_until.is_none());
+
+        // 4. Strict lock blocks SetPauseAll(true)
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+        assert!(!engine.config.general.pause_all_rules);
+
+        // 5. AcknowledgeAppWarning on strict rule is rejected and does not cancel grace
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-strict-kill".to_string(),
+            })
+            .await;
+        assert_eq!(engine.runtimes.get("rule-strict-kill").unwrap().grace_countdown, Some((30, 30)));
+
+        // 6. Strict CloseWindow with active grace also maintains strict lock
+        engine.runtimes.get_mut("rule-strict-kill").unwrap().grace_countdown = None;
+        assert!(!engine.is_strict_lock_active(Local::now()));
+        engine.runtimes.get_mut("rule-strict-close").unwrap().grace_countdown = Some((20, 20));
+        assert!(engine.is_strict_lock_active(Local::now()));
     }
 
     #[tokio::test]
