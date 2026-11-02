@@ -17,6 +17,27 @@ pub fn escape_bucket_id(id: &str) -> String {
     id.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Builds the ActivityWatch query expression string for one or more browser web buckets.
+/// Floods each bucket individually, folds multiple buckets via binary `concat(acc, next)`,
+/// and wraps multiple buckets in `sort_by_timestamp(...)`.
+pub fn build_web_query_expr(web_buckets: &[String]) -> Option<String> {
+    if web_buckets.is_empty() {
+        return None;
+    }
+    if web_buckets.len() == 1 {
+        return Some(format!(
+            "flood(query_bucket(\"{}\"))",
+            escape_bucket_id(&web_buckets[0])
+        ));
+    }
+    let mut it = web_buckets
+        .iter()
+        .map(|b| format!("flood(query_bucket(\"{}\"))", escape_bucket_id(b)));
+    let first = it.next()?;
+    let folded = it.fold(first, |acc, next| format!("concat({}, {})", acc, next));
+    Some(format!("sort_by_timestamp({})", folded))
+}
+
 /// Helper to parse an ISO 8601 / RFC 3339 timestamp from a JSON value field.
 fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
     val.get(field)
@@ -287,17 +308,11 @@ impl AwClient {
         let url = format!("{}/api/0/query/", self.base_url);
         let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
 
-        let web_expr = if web_buckets.len() == 1 {
-            format!("query_bucket(\"{}\")", escape_bucket_id(&web_buckets[0]))
-        } else {
-            let concat_args = web_buckets
-                .iter()
-                .map(|b| format!("query_bucket(\"{}\")", escape_bucket_id(b)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("sort_by_timestamp(concat({concat_args}))")
+        let web_expr = match build_web_query_expr(&web_buckets) {
+            Some(expr) => expr,
+            None => return Vec::new(),
         };
-        let web_line = format!("web = flood({web_expr});");
+        let web_line = format!("web = {web_expr};");
         let afk_line = format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(&afk_id));
 
         let query_body = serde_json::json!({
@@ -568,6 +583,40 @@ mod tests {
         assert_eq!(
             escape_bucket_id("aw-watcher-web-chrome_\"test\"\\pc"),
             "aw-watcher-web-chrome_\\\"test\\\"\\\\pc"
+        );
+    }
+
+    #[test]
+    fn test_build_web_query_expr_single_and_multi_buckets() {
+        // 1. Empty slice returns None
+        assert_eq!(build_web_query_expr(&[]), None);
+
+        // 2. 1 bucket returns flood(query_bucket("aw-watcher-web-chrome"))
+        let single = vec!["aw-watcher-web-chrome".to_string()];
+        assert_eq!(
+            build_web_query_expr(&single),
+            Some("flood(query_bucket(\"aw-watcher-web-chrome\"))".to_string())
+        );
+
+        // 3. 2 buckets returns sort_by_timestamp(concat(flood(query_bucket("aw-watcher-web-brave")), flood(query_bucket("aw-watcher-web-chrome"))))
+        let two = vec![
+            "aw-watcher-web-brave".to_string(),
+            "aw-watcher-web-chrome".to_string(),
+        ];
+        assert_eq!(
+            build_web_query_expr(&two),
+            Some("sort_by_timestamp(concat(flood(query_bucket(\"aw-watcher-web-brave\")), flood(query_bucket(\"aw-watcher-web-chrome\"))))".to_string())
+        );
+
+        // 4. 3+ buckets produces nested binary concat(concat(flood(...), flood(...)), flood(...)) calls and properly escapes quotes/backslashes
+        let three = vec![
+            "aw-watcher-web-brave".to_string(),
+            "aw-watcher-web-chrome_\"test\"\\pc".to_string(),
+            "aw-watcher-web-firefox".to_string(),
+        ];
+        assert_eq!(
+            build_web_query_expr(&three),
+            Some("sort_by_timestamp(concat(concat(flood(query_bucket(\"aw-watcher-web-brave\")), flood(query_bucket(\"aw-watcher-web-chrome_\\\"test\\\"\\\\pc\"))), flood(query_bucket(\"aw-watcher-web-firefox\"))))".to_string())
         );
     }
 
