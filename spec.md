@@ -338,8 +338,8 @@ stateDiagram-v2
 - **Minimization & Background Process Resilience:** Minimizing windows during grace does not bypass enforcement. `Close Window` rules scan visible top-level windows (including minimized taskbar windows). `Kill Process` rules verify running targets via ToolHelp snapshots (`find_matching_process`), terminating minimized or tray-resident processes when grace expires. `Lock Workstation` is never skipped when windows are minimized or desktop is active.
 
 #### Stage 3: Action Execution
-- **`Show Overlay`:** Launches fullscreen multi-monitor `OverlayMode::BreakEnforcer`. Waits for a 1.5s natural pause in physical user input before display. If input is detected during enforcement, progress pauses and displays an idle warning banner.
-- **`Show Notification`:** Emits `OverlayMode::HudToast` or native WinRT toast notification, marking the cycle complete.
+- **`Show Overlay`:** Launches fullscreen multi-monitor `OverlayMode::BreakEnforcer`. Waits for a 1.5s natural pause in physical user input before display. When launching delayed breaks after the natural pause, the engine verifies `suppress_fullscreen_d3d && enforcer::is_fullscreen_or_presentation_active()`; if active, fullscreen display is suppressed, the break cycle is completed immediately, and an unobtrusive native Windows Action Center notification is dispatched instead. If input is detected during enforcement, progress pauses and displays an idle warning banner.
+- **`Show Notification`:** Emits `OverlayMode::HudToast` or native WinRT toast notification, marking the cycle complete. When configured for HUD notifications (`NotificationMethod::Hud`), if a higher-priority overlay (`priority() > 2`, i.e., `HudTimer` or `BreakEnforcer`) is currently active on screen, the engine automatically falls back to dispatching a native Windows Action Center notification so critical alerts are never silently dropped.
 - **`Show Statistics`:** Opens the interactive 24-hour activity HUD (`OverlayMode::HudStatus`).
 - **`Lock Workstation`:** Calls `enforcer::lock_workstation()`. Suppresses redundant calls if the user is already AFK, and is never skipped by window minimization during grace countdowns.
 - **`Close Tab`:** Sends synthesized `Ctrl+W` (`enforcer::close_active_browser_tab`), releasing modifier keys (`VK_SHIFT`, `VK_MENU`) beforehand. Strictly requires an active foreground browser window.
@@ -355,6 +355,8 @@ Overlays are managed authoritatively across all connected monitors:
 
 $$\text{BreakEnforcer (4)} > \text{HudTimer (3)} > \text{HudToast (2)} > \text{HudStatus (1)} > \text{Hidden (0)}$$
 
+- **HudTimer Urgency Tie-Breaking:** When two `HudTimer` overlays compete for display, their priority is tie-broken authoritatively by urgency: `(strict_mode, is_destructive, std::cmp::Reverse(remaining_seconds))`. Destructive actions (`LockWorkstation`, `CloseTab`, `CloseWindow`, `KillProcess`) and lower remaining times take precedence over non-destructive actions, and strict mode supersedes non-strict countdowns.
+- **HudToast Warning Preservation:** Competing `HudToast` notifications preserve strict warnings: a non-strict toast cannot overwrite an active strict toast without snooze options (`snooze_options_minutes.is_empty()`).
 - **Multi-Monitor Hotplug Detection:** Work areas and monitor counts are tracked dynamically. Connecting or disconnecting displays triggers an automatic placement refresh preserving active countdowns.
 - **DirectX D3D / Presentation Suppression:** When `suppress_fullscreen_d3d` is enabled, `SHQueryUserNotificationState` detects games and presentations, downgrading fullscreen overlays to unobtrusive toasts.
 - **Resource Cleanup:** When `destroy_windows_on_hide = true`, dismissing overlays immediately drops Slint window instances, releasing GPU swapchains and framebuffer memory.

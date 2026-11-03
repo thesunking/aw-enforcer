@@ -479,6 +479,68 @@ impl Engine {
                     }
                 }
             }
+
+            if let (
+                OverlayMode::HudTimer {
+                    rule_id: cur_rule_id,
+                    strict_mode: cur_strict,
+                    remaining_seconds: cur_rem,
+                    ..
+                },
+                OverlayMode::HudTimer {
+                    rule_id: new_rule_id,
+                    strict_mode: new_strict,
+                    remaining_seconds: new_rem,
+                    ..
+                },
+            ) = (&self.active_overlay_mode, &mode)
+            {
+                if cur_rule_id != new_rule_id {
+                    let cur_is_destructive = self.config.rules.iter().any(|r| {
+                        &r.id == cur_rule_id
+                            && matches!(
+                                r.action,
+                                RuleAction::LockWorkstation
+                                    | RuleAction::CloseTab
+                                    | RuleAction::CloseWindow
+                                    | RuleAction::KillProcess
+                            )
+                    });
+                    let new_is_destructive = self.config.rules.iter().any(|r| {
+                        &r.id == new_rule_id
+                            && matches!(
+                                r.action,
+                                RuleAction::LockWorkstation
+                                    | RuleAction::CloseTab
+                                    | RuleAction::CloseWindow
+                                    | RuleAction::KillProcess
+                            )
+                    });
+                    let cur_urgency = (*cur_strict, cur_is_destructive, std::cmp::Reverse(*cur_rem));
+                    let new_urgency = (*new_strict, new_is_destructive, std::cmp::Reverse(*new_rem));
+                    if cur_urgency >= new_urgency {
+                        return;
+                    }
+                }
+            }
+
+            if let (
+                OverlayMode::HudToast {
+                    rule_id: cur_rule_id,
+                    snooze_options_minutes: cur_snooze,
+                    ..
+                },
+                OverlayMode::HudToast {
+                    rule_id: new_rule_id,
+                    snooze_options_minutes: new_snooze,
+                    ..
+                },
+            ) = (&self.active_overlay_mode, &mode)
+            {
+                if cur_rule_id != new_rule_id && cur_snooze.is_empty() && !new_snooze.is_empty() {
+                    return;
+                }
+            }
         }
         if !matches!(mode, OverlayMode::HudStatus { .. }) {
             self.stats_cache = None;
@@ -980,14 +1042,28 @@ impl Engine {
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = rule.trigger_threshold_seconds();
                 let break_secs = rule.break_duration.to_seconds().max(1);
+                let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
+                let raw_msg = self.get_effective_rule_message(&rule);
+
+                if self.config.general.suppress_fullscreen_d3d
+                    && enforcer::is_fullscreen_or_presentation_active()
+                {
+                    if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                        rt.complete_cycle(now);
+                    }
+                    enforcer::send_system_notification(
+                        &rule.name,
+                        &formatter::format_plain_message(raw_msg, &ctx),
+                    );
+                    continue;
+                }
+
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.prev_completed_at = rt.last_completed_at;
                     rt.active_break = Some((break_secs, break_secs));
                     rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
-                let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
-                let raw_msg = self.get_effective_rule_message(&rule);
                 let paragraphs = self.parse_rule_message(
                     raw_msg,
                     &ctx,
@@ -1915,6 +1991,17 @@ impl Engine {
                             rt.can_rollback_completion = true;
                         }
                         let raw_msg = self.get_effective_rule_message(rule);
+                        let is_current_test = self
+                            .active_overlay_mode
+                            .rule_id()
+                            .map(|id| id.starts_with("test_"))
+                            .unwrap_or(false);
+                        if self.active_overlay_mode.priority() > 2 && !is_current_test {
+                            enforcer::send_system_notification(
+                                &rule.name,
+                                &formatter::format_plain_message(raw_msg, &ctx),
+                            );
+                        }
                         let paragraphs = self.parse_rule_message(
                             raw_msg,
                             &ctx,
@@ -4051,6 +4138,7 @@ mod tests {
         let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
         let aw_client = Arc::new(AwClient::new(5600, ""));
         let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
 
         let mut rule = Rule::default_template(0);
         rule.id = "rule-break-test".to_string();
@@ -4985,6 +5073,7 @@ mod tests {
         rule.id = "rule-live-update-test".to_string();
         rule.action = RuleAction::ShowOverlay;
         rule.break_duration = DurationConfig::new(10, TimeUnit::Min);
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
 
         cfg.rules = vec![rule.clone()];
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
@@ -5669,5 +5758,119 @@ mod tests {
             rt_kill.action_executed_today,
             "KillProcess should execute action and mark today completed when target process is running"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hud_timer_tie_breaking_in_show_overlay() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut r_nonstrict_short = Rule::default_template(0);
+        r_nonstrict_short.id = "rule-timer-short".to_string();
+        r_nonstrict_short.action = RuleAction::CloseWindow;
+        r_nonstrict_short.strict_mode = false;
+
+        let mut r_nonstrict_long = Rule::default_template(1);
+        r_nonstrict_long.id = "rule-timer-long".to_string();
+        r_nonstrict_long.action = RuleAction::ShowNotification;
+        r_nonstrict_long.strict_mode = false;
+
+        let mut r_strict = Rule::default_template(2);
+        r_strict.id = "rule-timer-strict".to_string();
+        r_strict.action = RuleAction::ShowOverlay;
+        r_strict.strict_mode = true;
+
+        cfg.rules = vec![
+            r_nonstrict_short.clone(),
+            r_nonstrict_long.clone(),
+            r_strict.clone(),
+        ];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. Display non-strict 10s destructive HudTimer
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "rule-timer-short".to_string(),
+            title: "Short Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 10,
+            remaining_seconds: 10,
+            allow_snooze: true,
+            strict_mode: false,
+        });
+        assert_eq!(engine.active_overlay_mode.rule_id(), Some("rule-timer-short"));
+
+        // 2. Attempt to overwrite with a non-strict 60s non-destructive HudTimer:
+        // Because "rule-timer-short" is destructive and has fewer remaining seconds,
+        // it has higher urgency and must NOT be replaced!
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "rule-timer-long".to_string(),
+            title: "Long Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 60,
+            remaining_seconds: 60,
+            allow_snooze: true,
+            strict_mode: false,
+        });
+        assert_eq!(
+            engine.active_overlay_mode.rule_id(),
+            Some("rule-timer-short"),
+            "Non-destructive 60s timer must not replace 10s destructive timer"
+        );
+
+        // 3. Attempt to overwrite with a strict 30s HudTimer:
+        // Strict mode takes precedence over non-strict, so it replaces the active timer!
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "rule-timer-strict".to_string(),
+            title: "Strict Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 30,
+            remaining_seconds: 30,
+            allow_snooze: false,
+            strict_mode: true,
+        });
+        assert_eq!(
+            engine.active_overlay_mode.rule_id(),
+            Some("rule-timer-strict"),
+            "Strict timer must replace non-strict timer"
+        );
+
+        // 4. A non-strict 5s timer cannot replace a strict 30s timer
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "rule-timer-short".to_string(),
+            title: "Short Timer".into(),
+            paragraphs: Vec::new(),
+            duration_seconds: 5,
+            remaining_seconds: 5,
+            allow_snooze: true,
+            strict_mode: false,
+        });
+        assert_eq!(
+            engine.active_overlay_mode.rule_id(),
+            Some("rule-timer-strict"),
+            "Non-strict timer cannot replace active strict timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delayed_break_fullscreen_d3d_suppression() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = true;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-delayed-d3d".to_string();
+        rule.action = RuleAction::ShowOverlay;
+        rule.break_duration = DurationConfig::new(5, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let past = Local::now() - Duration::seconds(20);
+        engine.runtimes.get_mut("rule-delayed-d3d").unwrap().pending_break_since = Some(past);
+
+        engine.realtime_tick().await;
+        assert_eq!(engine.runtimes.get("rule-delayed-d3d").unwrap().pending_break_since, None);
     }
 }
