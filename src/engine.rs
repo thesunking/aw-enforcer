@@ -44,32 +44,59 @@ pub fn merge_overlapping_intervals(
     merged
 }
 
+/// Converts a slice of `AwEvent`s into a merged, non-overlapping sorted list of `(start, end)` intervals.
+pub fn events_to_merged_intervals(events: &[AwEvent]) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let raw: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
+        .iter()
+        .filter_map(|ev| {
+            let e_start = ev.timestamp;
+            let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
+            if e_end > e_start {
+                Some((e_start, e_end))
+            } else {
+                None
+            }
+        })
+        .collect();
+    merge_overlapping_intervals(raw)
+}
+
+/// Computes the total non-overlapping duration in seconds between a pre-merged sorted slice of
+/// `(DateTime<Utc>, DateTime<Utc>)` intervals and `[start_utc, end_utc]` without allocating or sorting.
+pub fn compute_overlap_from_merged_intervals(
+    merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+) -> f64 {
+    if start_utc >= end_utc || merged_intervals.is_empty() {
+        return 0.0;
+    }
+
+    let mut total_ms = 0i64;
+    for (i_start, i_end) in merged_intervals {
+        if *i_start >= end_utc {
+            break;
+        }
+        if *i_end <= start_utc {
+            continue;
+        }
+        let s = (*i_start).max(start_utc);
+        let e = (*i_end).min(end_utc);
+        if e > s {
+            total_ms += (e - s).num_milliseconds();
+        }
+    }
+    total_ms as f64 / 1000.0
+}
+
 /// Computes the total non-overlapping duration in seconds between a slice of events and `[start_utc, end_utc]`.
 pub fn compute_coalesced_overlap_seconds(
     events: &[AwEvent],
     start_utc: DateTime<Utc>,
     end_utc: DateTime<Utc>,
 ) -> f64 {
-    let intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
-        .iter()
-        .filter_map(|ev| {
-            let e_start = ev.timestamp;
-            let e_end = ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64);
-            let start = e_start.max(start_utc);
-            let end = e_end.min(end_utc);
-            if end > start {
-                Some((start, end))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let merged = merge_overlapping_intervals(intervals);
-    merged
-        .iter()
-        .map(|(s, e)| (*e - *s).num_milliseconds() as f64 / 1000.0)
-        .sum()
+    let merged = events_to_merged_intervals(events);
+    compute_overlap_from_merged_intervals(&merged, start_utc, end_utc)
 }
 
 /// Intersects web events from `aw-watcher-web` with active browser window intervals from `window_events` (`aw-watcher-window`).
@@ -1767,6 +1794,68 @@ impl Engine {
             }
         };
 
+        let warn_secs = rule.warn_before.to_seconds();
+        let should_warn = threshold_secs > 0
+            && warn_secs > 0
+            && warn_secs < threshold_secs
+            && elapsed_secs >= threshold_secs.saturating_sub(warn_secs)
+            && elapsed_secs < threshold_secs;
+        let should_trigger = elapsed_secs >= threshold_secs;
+
+        if !should_warn && !should_trigger {
+            if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                let recency_cutoff = now_utc
+                    - Duration::seconds(
+                        (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
+                    );
+                let matching_ev = events
+                    .iter()
+                    .filter(|ev| {
+                        let ev_end = event_end_utc(ev);
+                        ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
+                    })
+                    .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                    .or_else(|| {
+                        events
+                            .iter()
+                            .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                    });
+
+                if let Some(ev) = matching_ev {
+                    if rule.monitor_selection == MonitorSelection::Urls {
+                        rt.last_matched_url = ev.data.url.clone();
+                        if let Some(url_str) = ev.data.url.as_deref() {
+                            let host = url_str
+                                .strip_prefix("https://")
+                                .or_else(|| url_str.strip_prefix("http://"))
+                                .unwrap_or(url_str)
+                                .split('/')
+                                .next()
+                                .unwrap_or(url_str);
+                            rt.last_matched_app = Some(host.to_string());
+                        }
+                    } else if let Some(ref app) = ev.data.app {
+                        rt.last_matched_app = Some(app.clone());
+                    }
+                    if let Some(ref title) = ev.data.title {
+                        if !title.trim().is_empty() {
+                            rt.set_last_matched_title(Some(title.clone()));
+                        } else {
+                            rt.set_last_matched_title(None);
+                        }
+                    } else {
+                        rt.set_last_matched_title(None);
+                    }
+                } else if rule.monitor_selection == MonitorSelection::Urls {
+                    rt.last_matched_url = None;
+                    rt.last_matched_app = None;
+                    rt.set_last_matched_title(None);
+                }
+            }
+            return true;
+        }
+
         let matched_window = find_matching_window_for_rule(
             rule,
             compiled_re,
@@ -1824,16 +1913,10 @@ impl Engine {
             }
         }
 
-        let warn_secs = rule.warn_before.to_seconds();
         let grace_secs = rule.grace_duration.to_seconds();
 
         // 3. Stage 1: Warn Before Action (0 = disabled)
-        if threshold_secs > 0
-            && warn_secs > 0
-            && warn_secs < threshold_secs
-            && elapsed_secs >= threshold_secs.saturating_sub(warn_secs)
-            && elapsed_secs < threshold_secs
-        {
+        if should_warn {
             let already_warned = self
                 .runtimes
                 .get(&rule.id)
@@ -1852,7 +1935,7 @@ impl Engine {
         }
 
         // 4. Stage 2: Threshold Reached
-        if elapsed_secs >= threshold_secs {
+        if should_trigger {
             // For Limit triggers with non-destructive actions (ShowOverlay, ShowNotification, ShowStatistics),
             // only fire once per logical day unless snoozed.
             let is_destructive = matches!(
@@ -2152,6 +2235,8 @@ impl Engine {
             return;
         };
 
+        let merged_intervals = events_to_merged_intervals(events);
+
         if cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins {
             cache.bin_seconds.resize(bin_count, 0.0);
             cache.bin_size_mins = bin_size_mins;
@@ -2174,7 +2259,7 @@ impl Engine {
                 let bin_idx = (bin_count as isize) - 1 - (elapsed_bins as isize) + (i as isize);
                 if bin_idx >= 0 && (bin_idx as usize) < bin_count {
                     let secs =
-                        compute_coalesced_overlap_seconds(events, b_start_utc, b_end_utc) as f32;
+                        compute_overlap_from_merged_intervals(&merged_intervals, b_start_utc, b_end_utc) as f32;
                     cache.bin_seconds[bin_idx as usize] = secs;
                 }
             }
@@ -2184,7 +2269,7 @@ impl Engine {
         let cur_start_utc = cache.current_bin_start.with_timezone(&Utc);
         let cur_end_utc =
             (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-        let cur_secs = compute_coalesced_overlap_seconds(events, cur_start_utc, cur_end_utc) as f32;
+        let cur_secs = compute_overlap_from_merged_intervals(&merged_intervals, cur_start_utc, cur_end_utc) as f32;
         if let Some(last) = cache.bin_seconds.last_mut() {
             *last = cur_secs;
         }
@@ -2229,6 +2314,7 @@ impl Engine {
             return;
         }
 
+        let merged_intervals = events_to_merged_intervals(&events);
         let mut bin_seconds = vec![0.0f32; bin_count];
 
         for i in 0..bin_count {
@@ -2238,7 +2324,7 @@ impl Engine {
             let b_start_utc = b_start.with_timezone(&Utc);
             let b_end_utc = b_end.with_timezone(&Utc);
 
-            bin_seconds[i] = compute_coalesced_overlap_seconds(&events, b_start_utc, b_end_utc) as f32;
+            bin_seconds[i] = compute_overlap_from_merged_intervals(&merged_intervals, b_start_utc, b_end_utc) as f32;
         }
 
         self.stats_cache = Some(StatsHudCache {
@@ -3526,6 +3612,33 @@ mod tests {
         let ev3 = make_event(base_time, 1800.0, "code.exe", "Project A (Window 2)", "");
         let usage_identical = calculate_usage_for_rule(&[ev1, ev3], &rule, None, start_of_day, now_utc);
         assert_eq!(usage_identical, 1800); // exactly 30 minutes (1800s), not 3600s
+    }
+
+    #[test]
+    fn test_compute_overlap_from_merged_intervals_matches_coalesced_seconds() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        // Event 1: 10:00 - 10:45 (2700s)
+        let ev1 = make_event(base_time, 2700.0, "code.exe", "File 1", "");
+        // Event 2: 10:30 - 11:15 (2700s, overlapping with ev1)
+        let ev2 = make_event(base_time + Duration::minutes(30), 2700.0, "code.exe", "File 2", "");
+        // Event 3: 11:30 - 12:30 (3600s, separate)
+        let ev3 = make_event(base_time + Duration::minutes(90), 3600.0, "code.exe", "File 3", "");
+        let events = vec![ev1, ev2, ev3];
+
+        let merged = events_to_merged_intervals(&events);
+
+        for offset_min in (-30..=150).step_by(30) {
+            let b_start = base_time + Duration::minutes(offset_min);
+            let b_end = b_start + Duration::minutes(30);
+
+            let expected = compute_coalesced_overlap_seconds(&events, b_start, b_end);
+            let actual = compute_overlap_from_merged_intervals(&merged, b_start, b_end);
+
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "Mismatch at bin [{b_start}, {b_end}]: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -413,14 +413,15 @@ graph LR
 | **Idle CPU Utilization** | $< 0.2\%$ | $0.0\% - 0.1\%$ between 10-second polling ticks |
 | **Thread Count** | $\le 6\text{ OS Threads}$ | Main Slint GUI Thread + 2 Tokio Workers + 1 Helper Pool Thread |
 | **Offline Network Overhead** | 1 HTTP Request / tick | Pre-poll bucket verification eliminates query flooding when server is down |
-| **Window Scanning Overhead** | $< 1.5\text{ ms} / \text{scan}$ | Zero-allocation UTF-16 shell checks + per-pass `pid_cache: HashMap<u32, Option<String>>` |
+| **Window Scanning Overhead** | $< 1.5\text{ ms} / \text{scan}$ | Zero-allocation UTF-16 shell checks + per-pass `pid_cache`. Lazy window scanning skips Win32 `EnumWindows` scans entirely during `evaluate_rule` until a rule reaches its Stage 1 warning or Stage 2 trigger threshold. |
+| **Histogram Binning Overhead** | $O(N \log N + B)$ | Single-pass interval coalescing merges $N$ telemetry events once via `events_to_merged_intervals` before bin assignment, reducing per-bin computation from $O(B \cdot N \log N)$ to $O(N \log N + B)$. |
 
 ---
 
 ## 9. Verification & Test Plan
 
 The application maintains comprehensive test coverage across all domain components:
-- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion.
+- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion.
 - **Rule Lifecycle & State Machine Tests (`src/engine.rs`):** Invariant testing for Stage 1/2/3 triggers, grace countdown rollbacks, snooze timestamps, and strict mode command rejections.
 - **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.
 - **Format & String Interpolation Tests (`src/formatter.rs`):** Verifies single-pass template parsing, placeholder injection immunity, and Markdown tag stripping for Windows Action Center toasts.
