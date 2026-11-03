@@ -234,7 +234,7 @@ impl OverlayManager {
         }
     }
 
-    /// Pushes opacity, accent color, and backdrop color from `OverlayConfig` to a single `OverlayWindow`.
+    /// Pushes opacity, accent color, backdrop color, and text color from `OverlayConfig` to a single `OverlayWindow`.
     fn apply_theme_to_window(win: &OverlayWindow, cfg: &OverlayConfig) {
         win.set_overlay_opacity(cfg.opacity.clamp(0.1, 1.0));
         if let Some(accent) = formatter::parse_hex_color(&cfg.accent_color) {
@@ -242,6 +242,9 @@ impl OverlayManager {
         }
         if let Some(backdrop) = formatter::parse_hex_color(&cfg.background_color) {
             win.set_backdrop_color(backdrop);
+        }
+        if let Some(text) = formatter::parse_hex_color(&cfg.text_color) {
+            win.set_text_color(text);
         }
     }
 

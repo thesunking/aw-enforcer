@@ -237,8 +237,12 @@ export component SettingsWindow inherits Window {
     callback request-strict-unlock();
     in-out property <float> overlay-opacity: 0.90;
     in-out property <string> accent-color-hex: "#3b82f6";
+    in-out property <string> background-color-hex: "#0f172a";
+    in-out property <string> text-color-hex: "#f8fafc";
     in-out property <int> daily-target-minutes: 480;
     in-out property <int> threshold-excessive-minutes: 600;
+    in-out property <int> histogram-bin-size-minutes: 60;
+    in-out property <int> histogram-bin-count: 24;
     in-out property <string> time-format-code: "%H:%M";
     in property <string> time-format-preview: "✓ Preview: 14:30";
     in property <bool> time-format-valid: true;
@@ -768,6 +772,26 @@ export component SettingsWindow inherits Window {
                         }
 
                         FormRow {
+                            label: "Background Color (Hex):";
+                            label-width: 220px;
+                            LineEdit {
+                                text <=> root.background-color-hex;
+                                placeholder-text: "#0f172a";
+                                edited(val) => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Text Color (Hex):";
+                            label-width: 220px;
+                            LineEdit {
+                                text <=> root.text-color-hex;
+                                placeholder-text: "#f8fafc";
+                                edited(val) => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
                             label: "Test Overlays:";
                             label-width: 220px;
                             VerticalLayout {
@@ -823,6 +847,28 @@ export component SettingsWindow inherits Window {
                                 value <=> root.threshold-excessive-minutes;
                                 minimum: root.daily-target-minutes;
                                 maximum: 1440;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Histogram Bin Size (Mins):";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.histogram-bin-size-minutes;
+                                minimum: 1;
+                                maximum: 1440;
+                                edited => { root.has-unsaved-changes = true; }
+                            }
+                        }
+
+                        FormRow {
+                            label: "Histogram Bin Count:";
+                            label-width: 220px;
+                            SpinBox {
+                                value <=> root.histogram-bin-count;
+                                minimum: 1;
+                                maximum: 96;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -1749,14 +1795,14 @@ export component SettingsWindow inherits Window {
                                         }
                                     }
                                 }
+                            }
+                        }
 
-                                Button {
-                                    text: "Preview This Rule's Alert";
-                                    enabled: !root.ui-locked-by-strict;
-                                    clicked => {
-                                        root.preview-rule-alert();
-                                    }
-                                }
+                        Button {
+                            text: "Preview This Rule's Alert";
+                            enabled: !root.ui-locked-by-strict;
+                            clicked => {
+                                root.preview-rule-alert();
                             }
                         }
                         }

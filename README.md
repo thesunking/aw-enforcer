@@ -30,6 +30,11 @@
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
   - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement.
 
+- **Customizable Appearance & 24-Hour Statistics HUD:**
+  - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
+  - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
+  - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor.
+
 ---
 
 ## Prerequisites

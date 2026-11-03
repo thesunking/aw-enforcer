@@ -5,7 +5,7 @@
 | **Document Title** | Technical Specification: AW-Enforcer (Unified Rule Engine & Slint UI) |
 | **Document Status** | Approved / Living Specification |
 | **Target Platform** | Windows 10 / Windows 11 (x86_64) |
-| **Implementation Language** | Rust (Edition 2021), Slint UI Toolkit (v1.9+) |
+| **Implementation Language** | Rust (Edition 2021), Slint UI Toolkit (v1.8+) |
 | **Primary Dependency** | Local ActivityWatch Server (`http://localhost:5600/api/0/`) |
 | **Last Updated** | November 2026 |
 
@@ -365,6 +365,7 @@ $$\text{BreakEnforcer (4)} > \text{HudTimer (3)} > \text{HudToast (2)} > \text{H
 - **Multi-Monitor Hotplug Detection:** Work areas and monitor counts are tracked dynamically. Connecting or disconnecting displays triggers an automatic placement refresh preserving active countdowns.
 - **DirectX D3D / Presentation Suppression:** When `suppress_fullscreen_d3d` is enabled, `SHQueryUserNotificationState` detects games and presentations, downgrading fullscreen overlays to unobtrusive toasts.
 - **Resource Cleanup:** When `destroy_windows_on_hide = true`, dismissing overlays immediately drops Slint window instances, releasing GPU swapchains and framebuffer memory.
+- **Dynamic Theming & Sizing:** Opacity, accent color, backdrop color, and text color configured in `OverlayConfig` propagate to all overlay windows across all four modes. In `HudStatus`, histogram bars dynamically expand and shrink (`horizontal-stretch: 1; min-width: 2px`) to accommodate any configured bin count (1..=96) and bin size (1..=1440 min), with dynamic label decimation step `(bin_count / 6).max(1)` ensuring crisp, non-overlapping timeline axis labels.
 
 ### 6.2 Settings Window Architecture (`ui/settings.slint`, `src/main.rs`)
 
@@ -377,8 +378,8 @@ graph LR
     end
 
     subgraph TabPanels [Content Views]
-        GenView["General Settings Cards\n• Connection & Autostart\n• Performance & Renderer\n• Overlay Theme\n• Stats Configuration\n• Backup & Transfer"]
-        RuleView["Rule Configuration Sections\n1. General\n2. Monitor Target\n3. Trigger\n4. Action & Message Toolbar\n5. Schedule Grid"]
+        GenView["General Settings Cards\n• Connection & Autostart\n• Performance & Renderer\n• Overlay Theme (Colors & Opacity)\n• Stats Configuration (Bins & Quotas)\n• Backup & Transfer"]
+        RuleView["Rule Configuration Sections\n1. General\n2. Monitor Target\n3. Trigger\n4. Action & Always-Accessible Preview\n5. Schedule Grid"]
         LiveView["Live Telemetry Rows\n• Server Status\n• Session Duration\n• Today Screen Time\n• Active Window"]
     end
 
@@ -389,6 +390,8 @@ graph LR
 
 - **Strict Mode Lock:** While a strict break, grace period, or pending break is active across any rule action, all rule modification callbacks (`on_add_rule`, `on_delete_rule`, `on_active_rule_edited`, etc.) return early, and the UI displays a 15-second unlock countdown card.
 - **Real-Time Regex & Strftime Validation:** Syntax errors in title/URL regexes or strftime formats are displayed in an inline warning banner, disabling the `Save & Apply Changes` button.
+- **Always-Accessible Rule Preview:** The `"Preview This Rule's Alert"` action button is elevated to the root of the Action section card (`SectionCard`), allowing one-click preview verification for all actions (including `Show Statistics` and immediate-action rules without warnings or grace periods).
+- **Exposed Overlay & Histogram Properties:** General settings expose Hex color pickers (`accent_color`, `background_color`, `text_color`) and histogram discretization controls (`histogram_bin_size_minutes` [1–1440], `histogram_bin_count` [1–96]), clamped safely in `Config::sanitize()`.
 
 ---
 

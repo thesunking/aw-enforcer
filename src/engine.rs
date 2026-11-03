@@ -2172,10 +2172,11 @@ impl Engine {
             cache.current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
         let time_fmt = &self.config.stats.histogram_time_format;
 
+        let label_step = (bin_count / 6).max(1);
         let mut bin_labels = Vec::with_capacity(bin_count);
         for i in 0..bin_count {
             let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
-            let label = if i % 4 == 0 || i == bin_count - 1 {
+            let label = if i % label_step == 0 || i == bin_count - 1 {
                 b_start.format(time_fmt).to_string()
             } else {
                 String::new()

@@ -413,6 +413,8 @@ fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
 
     updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
     updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
+    updated_config.overlay.background_color = win.get_background_color_hex().to_string();
+    updated_config.overlay.text_color = win.get_text_color_hex().to_string();
 
     updated_config.stats.daily_screentime_target_minutes =
         win.get_daily_target_minutes().max(1) as u32;
@@ -420,6 +422,10 @@ fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
     let clamped_excessive =
         raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
     updated_config.stats.threshold_excessive_minutes = clamped_excessive;
+    updated_config.stats.histogram_bin_size_minutes =
+        win.get_histogram_bin_size_minutes().clamp(1, 1440) as u32;
+    updated_config.stats.histogram_bin_count =
+        win.get_histogram_bin_count().clamp(1, 96) as u32;
     updated_config.stats.histogram_time_format =
         win.get_time_format_code().to_string();
 
@@ -460,8 +466,12 @@ fn apply_config_to_ui(
     win.set_slint_renderer_display(renderer_display.into());
     win.set_overlay_opacity(cfg.overlay.opacity);
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
+    win.set_background_color_hex(cfg.overlay.background_color.as_str().into());
+    win.set_text_color_hex(cfg.overlay.text_color.as_str().into());
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
     win.set_threshold_excessive_minutes(cfg.stats.threshold_excessive_minutes as i32);
+    win.set_histogram_bin_size_minutes(cfg.stats.histogram_bin_size_minutes as i32);
+    win.set_histogram_bin_count(cfg.stats.histogram_bin_count as i32);
     win.set_time_format_code(cfg.stats.histogram_time_format.as_str().into());
 
     let (valid, preview) = config::validate_strftime_format(&cfg.stats.histogram_time_format);

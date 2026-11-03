@@ -705,8 +705,8 @@ impl Config {
             .stats
             .threshold_excessive_minutes
             .max(self.stats.daily_screentime_target_minutes);
-        self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.max(1);
-        self.stats.histogram_bin_count = self.stats.histogram_bin_count.max(1);
+        self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.clamp(1, 1440);
+        self.stats.histogram_bin_count = self.stats.histogram_bin_count.clamp(1, 96);
 
         self.sanitize_rules();
     }
@@ -969,6 +969,12 @@ mod tests {
         assert_eq!(cfg.stats.threshold_excessive_minutes, 1);
         assert_eq!(cfg.stats.histogram_bin_size_minutes, 1);
         assert_eq!(cfg.stats.histogram_bin_count, 1);
+
+        cfg.stats.histogram_bin_size_minutes = 99999;
+        cfg.stats.histogram_bin_count = 999;
+        cfg.sanitize();
+        assert_eq!(cfg.stats.histogram_bin_size_minutes, 1440);
+        assert_eq!(cfg.stats.histogram_bin_count, 96);
 
         let sanitized_rule = &cfg.rules[0];
         assert_eq!(sanitized_rule.action, RuleAction::CloseWindow);

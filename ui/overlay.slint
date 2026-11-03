@@ -22,6 +22,7 @@ export component OverlayWindow inherits Window {
     in property <float> overlay-opacity: 0.90;
     in property <color> accent-color: #3b82f6;
     in property <color> backdrop-color: #0f172a;
+    in property <color> text-color: #f8fafc;
 
     // Histogram & Status properties
     in property <string> status-level: "Great"; // "Great" | "Okay" | "Excessive"
@@ -72,7 +73,7 @@ export component OverlayWindow inherits Window {
                             text: root.title-text != "" ? root.title-text : "Break Required";
                             font-size: 22px;
                             font-weight: 700;
-                            color: #f8fafc;
+                            color: root.text-color;
                             horizontal-alignment: center;
                         }
 
@@ -175,7 +176,7 @@ export component OverlayWindow inherits Window {
                     text: "🔔 " + (root.title-text != "" ? root.title-text : "Limit Warning");
                     font-size: 16px;
                     font-weight: 700;
-                    color: #f8fafc;
+                    color: root.text-color;
                     vertical-alignment: center;
                 }
 
@@ -256,7 +257,7 @@ export component OverlayWindow inherits Window {
                     text: "⚠️ " + (root.title-text != "" ? root.title-text : "Quota Approaching");
                     font-size: 15px;
                     font-weight: 700;
-                    color: #f8fafc;
+                    color: root.text-color;
                     vertical-alignment: center;
                 }
 
@@ -356,7 +357,7 @@ export component OverlayWindow inherits Window {
                     text: "📊 " + (root.title-text != "" ? root.title-text : "24-Hour Screen Time Activity");
                     font-size: 15px;
                     font-weight: 700;
-                    color: #f8fafc;
+                    color: root.text-color;
                     vertical-alignment: center;
                 }
 
@@ -426,11 +427,12 @@ export component OverlayWindow inherits Window {
                         alignment: space-between;
 
                         for val[idx] in root.histogram-values : Rectangle {
-                            width: 12px;
+                            horizontal-stretch: 1;
+                            min-width: 2px;
                             height: 114px;
 
                             Rectangle {
-                                width: 12px;
+                                width: 100%;
                                 height: Math.max(114px * Math.min(Math.max(val, 0.0), 1.0), 2px);
                                 y: parent.height - self.height;
                                 background: val > 0.8 ? #ef4444 : (val > 0.5 ? #f59e0b : root.accent-color);
@@ -446,7 +448,8 @@ export component OverlayWindow inherits Window {
                         alignment: space-between;
 
                         for lbl[idx] in root.histogram-labels : Rectangle {
-                            width: 12px;
+                            horizontal-stretch: 1;
+                            min-width: 2px;
 
                             Rectangle {
                                 width: 36px;
