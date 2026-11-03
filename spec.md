@@ -299,9 +299,14 @@ sun = "000000000000000000000000"
 
 ### 5.1 Telemetry Aggregation & Web Intersection
 ActivityWatch event streams are processed on each `poll_tick()`:
-1. **Pre-Poll Verification:** `AwClient::prepare_poll_buckets` checks bucket readiness and re-discovers web buckets every 60 seconds. Offline servers produce empty event vectors immediately, reducing network roundtrips from 3 to 1.
-2. **Interval Coalescing (`merge_overlapping_intervals`):** Activity intervals across overlapping windows are merged into contiguous non-overlapping spans.
-3. **Web Event Filtering (`filter_web_events_by_active_browser_windows`):** Raw `aw-watcher-web` events are clipped to overlapping active foreground browser intervals (`enforcer::BROWSER_EXES`). Unfocused background browser tabs are excluded from accumulating screen time.
+1. **Bucket Discovery & Selection (`select_best_bucket`):** When multiple local watcher buckets exist, metadata is ranked authoritatively:
+   - Buckets with `last_updated` are compared first (`b.last_updated.cmp(&a.last_updated)`).
+   - Local machine hostname matching `COMPUTERNAME` (`b.hostname_matches.cmp(&a.hostname_matches)`).
+   - Effective timestamp (`b.effective_time.cmp(&a.effective_time)`).
+   - Ascending lexicographical key order.
+2. **Pre-Poll Verification:** `AwClient::prepare_poll_buckets` checks bucket readiness and re-discovers web buckets every 60 seconds. Offline servers produce empty event vectors immediately, reducing network roundtrips from 3 to 1.
+3. **Interval Coalescing (`merge_overlapping_intervals`):** Activity intervals across overlapping windows are merged into contiguous non-overlapping spans.
+4. **Web Event Filtering & Empty-Window Clearing:** Raw `aw-watcher-web` events are clipped to overlapping active foreground browser intervals (`filter_web_events_by_active_browser_windows`). When no foreground window events were recorded during the polling window (`all_events.is_empty()`), `web_events` are cleared immediately so background browser events never accumulate screen time while the user is AFK or on the desktop.
 
 ### 5.2 Rule Lifecycle State Machine
 

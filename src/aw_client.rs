@@ -49,9 +49,9 @@ fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
 /// Selects the best bucket matching `prefix` among candidate local buckets.
 ///
 /// When multiple local buckets exist (e.g. following a hostname change), metadata is inspected:
-/// 1. Prefer the bucket with the latest effective timestamp (`last_updated` or `created`).
-/// 2. If effective timestamps are equal, prefer the one with `last_updated`.
-/// 3. If timestamps are still equal or missing, prefer a bucket matching the local machine hostname (`COMPUTERNAME`).
+/// 1. Candidates with `last_updated` are compared first (`b.last_updated.cmp(&a.last_updated)`).
+/// 2. Prefer buckets whose `"hostname"` matches the local machine hostname (`COMPUTERNAME`).
+/// 3. Compare effective timestamp (`created`).
 /// 4. Fall back to deterministic ascending lexicographical key order.
 pub fn select_best_bucket<'a>(
     prefix: &str,
@@ -96,10 +96,10 @@ pub fn select_best_bucket<'a>(
     }
 
     candidates.sort_by(|a, b| {
-        b.effective_time
-            .cmp(&a.effective_time)
-            .then_with(|| b.last_updated.cmp(&a.last_updated))
+        b.last_updated
+            .cmp(&a.last_updated)
             .then_with(|| b.hostname_matches.cmp(&a.hostname_matches))
+            .then_with(|| b.effective_time.cmp(&a.effective_time))
             .then_with(|| a.key.cmp(b.key))
     });
 
@@ -603,6 +603,30 @@ mod tests {
 
         let selected = select_best_bucket("aw-watcher-window_", buckets);
         assert_eq!(selected.as_deref(), Some("aw-watcher-window_LATER"));
+    }
+
+    #[test]
+    fn test_select_best_bucket_prefers_hostname_when_no_last_updated() {
+        std::env::set_var("COMPUTERNAME", "MY-LOCAL-PC");
+
+        // Bucket A matches COMPUTERNAME but has an older created timestamp
+        let val_matching = serde_json::json!({
+            "hostname": "MY-LOCAL-PC",
+            "created": "2026-09-01T10:00:00Z"
+        });
+        // Bucket B does not match COMPUTERNAME but has a newer created timestamp
+        let val_other = serde_json::json!({
+            "hostname": "OTHER-PC",
+            "created": "2026-10-25T10:00:00Z"
+        });
+
+        let buckets = [
+            ("aw-watcher-window_OTHER", &val_other),
+            ("aw-watcher-window_MATCHING", &val_matching),
+        ];
+
+        let selected = select_best_bucket("aw-watcher-window_", buckets);
+        assert_eq!(selected.as_deref(), Some("aw-watcher-window_MATCHING"));
     }
 
     #[test]

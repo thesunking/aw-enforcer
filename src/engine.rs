@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
 use regex::Regex;
 use slint::Color;
 use std::collections::HashMap;
@@ -168,6 +168,13 @@ pub fn get_idle_time_millis() -> u32 {
     }
 }
 
+/// Resolves a `NaiveDateTime` to local timezone, safely handling DST gaps (spring-forward) and ambiguities (fall-back).
+fn resolve_local_ndt(ndt: NaiveDateTime) -> Option<DateTime<Local>> {
+    ndt.and_local_timezone(Local)
+        .earliest()
+        .or_else(|| (ndt + Duration::hours(1)).and_local_timezone(Local).earliest())
+}
+
 /// Computes the start timestamp of the current logical day anchored at `day_start_hour` (0..=23).
 pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<Local> {
     let h = day_start_hour.min(23);
@@ -178,29 +185,21 @@ pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<
     };
     base_date
         .and_hms_opt(h, 0, 0)
-        .and_then(|ndt| ndt.and_local_timezone(Local).single())
+        .and_then(resolve_local_ndt)
         .unwrap_or(now)
 }
 
 /// Aligns a timestamp down to the start of its current statistics histogram bin.
 fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
     let bin_size = bin_size_mins.max(1);
-    if bin_size >= 60 {
-        let hour_step = ((bin_size / 60) as u32).max(1);
-        let aligned_hour = (now.hour() / hour_step) * hour_step;
-        now.with_hour(aligned_hour)
-            .and_then(|t| t.with_minute(0))
-            .and_then(|t| t.with_second(0))
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(now)
-    } else {
-        let current_minute = now.minute();
-        let aligned_minute = (current_minute / (bin_size as u32)) * (bin_size as u32);
-        now.with_minute(aligned_minute)
-            .and_then(|t| t.with_second(0))
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(now)
-    }
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(resolve_local_ndt)
+        .unwrap_or(now);
+    let elapsed_mins = (now - midnight).num_minutes().max(0);
+    let aligned_mins = (elapsed_mins / bin_size) * bin_size;
+    midnight + Duration::minutes(aligned_mins)
 }
 
 /// Cached 24-hour histogram bins used to live-update `OverlayMode::HudStatus` on each `poll_tick`
@@ -1334,8 +1333,12 @@ impl Engine {
             )
         };
 
-        if has_url_rules && !all_events.is_empty() {
-            web_events = filter_web_events_by_active_browser_windows(&web_events, &all_events);
+        if has_url_rules && buckets_ready {
+            if all_events.is_empty() {
+                web_events.clear();
+            } else {
+                web_events = filter_web_events_by_active_browser_windows(&web_events, &all_events);
+            }
         }
 
         // 4. Evaluate Unified Rules (skip if all rules are paused indefinitely or globally snoozed)
@@ -3121,6 +3124,15 @@ mod tests {
         // 3 hours (180 mins) - hour 14 should align to 12
         let aligned_180 = align_stats_bin_start(dt, 180);
         assert_eq!(aligned_180, Local.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap());
+
+        // Arbitrary bin: 90 mins (14:27 should align to 13:30)
+        let aligned_90 = align_stats_bin_start(dt, 90);
+        assert_eq!(aligned_90, Local.with_ymd_and_hms(2026, 10, 30, 13, 30, 0).unwrap());
+
+        // 90 mins (01:45 should align to 01:30)
+        let dt_early = Local.with_ymd_and_hms(2026, 10, 30, 1, 45, 0).unwrap();
+        let aligned_90_early = align_stats_bin_start(dt_early, 90);
+        assert_eq!(aligned_90_early, Local.with_ymd_and_hms(2026, 10, 30, 1, 30, 0).unwrap());
     }
 
     #[tokio::test]
