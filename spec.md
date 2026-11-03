@@ -342,7 +342,7 @@ stateDiagram-v2
 - **`Show Notification`:** Emits `OverlayMode::HudToast` or native WinRT toast notification, marking the cycle complete. When configured for HUD notifications (`NotificationMethod::Hud`), if a higher-priority overlay (`priority() > 2`, i.e., `HudTimer` or `BreakEnforcer`) is currently active on screen, the engine automatically falls back to dispatching a native Windows Action Center notification so critical alerts are never silently dropped.
 - **`Show Statistics`:** Opens the interactive 24-hour activity HUD (`OverlayMode::HudStatus`).
 - **`Lock Workstation`:** Calls `enforcer::lock_workstation()`. Suppresses redundant calls if the user is already AFK, and is never skipped by window minimization during grace countdowns.
-- **`Close Tab`:** Sends synthesized `Ctrl+W` (`enforcer::close_active_browser_tab`), releasing modifier keys (`VK_SHIFT`, `VK_MENU`) beforehand. Strictly requires an active foreground browser window.
+- **`Close Tab`:** Sends synthesized `Ctrl+W` (`enforcer::close_active_browser_tab`), releasing modifier keys (`VK_SHIFT`, `VK_LSHIFT`, `VK_RSHIFT`, `VK_MENU`, `VK_LMENU`, `VK_RMENU`) beforehand. Strictly requires an active foreground browser window.
 - **`Close Window`:** Posts `WM_CLOSE` to matching visible top-level windows (including minimized taskbar windows).
 - **`Kill Process`:** Terminates target processes via Win32 process handles (`enforcer::kill_target_processes`), verifying running instances via ToolHelp snapshots (`find_matching_process`) even if minimized or tray-resident, and strictly excluding the `aw-enforcer` PID.
 
@@ -395,7 +395,7 @@ graph LR
 | **Shell & Self Protection** | Protected Window & Process Guards | `enforcer::is_protected_window_base` and `is_protected_foreground_window` exclude current PID and shell classes (`Progman`, `WorkerW`, `Shell_TrayWnd`, `MultitaskingViewFrame`) from window closing and process termination, while allowing `Close Window` to match visible top-level windows minimized to the taskbar. |
 | **Strict Mode Lockout** | Command & UI Interception | Blocks `SnoozeBreak`, `SkipBreak`, `DismissBreakOverlay`, `SnoozeAll`, `SetPauseAll`, `ResetRuleSession`, and tray bypasses when `rt.active_break`, `rt.grace_countdown`, or `rt.pending_break_since` is active for any rule with `strict_mode == true`. |
 | **Atomic Configuration Writes** | Two-Phase Disk Commit | Writes to `config.toml.tmp` and renames to `config.toml`. Corrupted files are preserved to `config.toml.bak` on load failure. |
-| **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis | Clears `VK_SHIFT` and `VK_MENU` state prior to dispatching `Ctrl+W` to avoid accidental `Ctrl+Shift+W` (entire window closure). |
+| **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis | Clears general and physical left/right modifier state (`VK_SHIFT`, `VK_LSHIFT`, `VK_RSHIFT`, `VK_MENU`, `VK_LMENU`, `VK_RMENU`) prior to dispatching `Ctrl+W` to avoid accidental `Ctrl+Shift+W` (entire window closure). |
 | **Poisoned Mutex Recovery** | Safe Lock Unwrapping | All synchronization locks use `.unwrap_or_else(|e| e.into_inner())` to prevent daemon panics if an internal thread panics. |
 
 ---

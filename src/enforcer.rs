@@ -12,8 +12,8 @@ use windows_sys::Win32::System::Threading::{
 #[cfg(not(test))]
 use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
-    VK_SHIFT,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_LMENU,
+    VK_LSHIFT, VK_MENU, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
@@ -592,7 +592,11 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
             };
             let inputs = [
                 make_key(VK_SHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_LSHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_RSHIFT, KEYEVENTF_KEYUP),
                 make_key(VK_MENU, KEYEVENTF_KEYUP),
+                make_key(VK_LMENU, KEYEVENTF_KEYUP),
+                make_key(VK_RMENU, KEYEVENTF_KEYUP),
                 make_key(VK_CONTROL, 0),
                 make_key(b'W' as u16, 0),
                 make_key(b'W' as u16, KEYEVENTF_KEYUP),

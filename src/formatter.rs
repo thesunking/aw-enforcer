@@ -275,20 +275,17 @@ pub fn parse_message(
     };
 
     for line in split_lines(&interpolated) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let (heading_prefix, rest) = split_header_prefix(line);
+        if heading_prefix.is_empty() && rest.is_empty() {
             paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
             continue;
         }
 
-        let (heading_prefix, default_size, rest) = if let Some(r) = trimmed.strip_prefix("## ") {
-            ("## ", 20.0, r.trim_start())
-        } else if let Some(r) = trimmed.strip_prefix("# ") {
-            ("# ", 26.0, r.trim_start())
-        } else {
-            ("", 15.0, trimmed)
+        let default_size = match heading_prefix {
+            "## " => 20.0,
+            "# " => 26.0,
+            _ => 15.0,
         };
-
         let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
 
         // Check for attribute prefix: [attr1 attr2 ...]
@@ -382,13 +379,17 @@ pub struct LineFormattingStatus {
 
 /// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
 fn split_header_prefix(line: &str) -> (&str, &str) {
-    let trimmed = line.trim();
+    let trimmed = line.trim_start().trim_end_matches('\r');
     if let Some(r) = trimmed.strip_prefix("## ") {
         ("## ", r.trim_start())
+    } else if trimmed == "##" {
+        ("## ", "")
     } else if let Some(r) = trimmed.strip_prefix("# ") {
         ("# ", r.trim_start())
+    } else if trimmed == "#" {
+        ("# ", "")
     } else {
-        ("", trimmed)
+        ("", trimmed.trim_end())
     }
 }
 
@@ -463,19 +464,19 @@ pub fn apply_line_style(raw_text: &str, line_idx: usize, style: &str) -> String 
 
         match style {
             "h1" => {
-                let trimmed = target_line.trim_start();
-                if let Some(rest) = trimmed.strip_prefix("# ") {
+                let (header, rest) = split_header_prefix(target_line);
+                if header == "# " {
                     rest.to_string()
                 } else {
-                    format!("# {}", strip_existing_prefix(target_line))
+                    format!("# {rest}")
                 }
             }
             "h2" => {
-                let trimmed = target_line.trim_start();
-                if let Some(rest) = trimmed.strip_prefix("## ") {
+                let (header, rest) = split_header_prefix(target_line);
+                if header == "## " {
                     rest.to_string()
                 } else {
-                    format!("## {}", strip_existing_prefix(target_line))
+                    format!("## {rest}")
                 }
             }
             "bold" | "italic" | "underline" => toggle_attr(target_line, style),
@@ -504,6 +505,7 @@ pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) ->
 }
 
 /// Strips any existing `# ` or `## ` prefix from `line` and returns the inner content.
+#[allow(dead_code)]
 fn strip_existing_prefix(line: &str) -> &str {
     split_header_prefix(line).1
 }
@@ -658,6 +660,94 @@ mod tests {
 
         let plain2 = apply_line_style(&h2, 0, "h2");
         assert_eq!(plain2, "Heading line");
+    }
+
+    /// Verifies toggling h1 -> h2 -> bold -> h2 on an initially empty line, line formatting detection,
+    /// and rendering empty heading lines without literal '#' characters.
+    #[test]
+    fn test_empty_heading_line_style_toggling_and_parsing() {
+        let ctx = MessageContext::sample();
+        let default_color = Color::from_rgb_u8(248, 250, 252);
+        let alignment = TextHorizontalAlignment::Center;
+
+        // 1. Initial empty line ""
+        let text = "";
+        let d0 = detect_line_formatting(text, 0);
+        assert!(!d0.is_h1 && !d0.is_h2 && !d0.is_bold);
+
+        // 2. Toggle H1 on empty line produces "# "
+        let s1 = apply_line_style(text, 0, "h1");
+        assert_eq!(s1, "# ");
+        let d1 = detect_line_formatting(&s1, 0);
+        assert!(d1.is_h1);
+        assert!(!d1.is_h2);
+        assert!(!d1.is_bold);
+
+        // parse_message on "# " renders empty paragraph without literal "#"
+        let p1 = parse_message(&s1, &ctx, default_color, alignment);
+        assert_eq!(p1.len(), 1);
+        assert_eq!(p1[0].text, "\u{00A0}");
+        assert_eq!(p1[0].font_size, 26.0);
+        assert_eq!(p1[0].font_weight, 700);
+
+        // 3. Toggle H2 on "# " replaces prefix to produce "## " (not "## #")
+        let s2 = apply_line_style(&s1, 0, "h2");
+        assert_eq!(s2, "## ");
+        let d2 = detect_line_formatting(&s2, 0);
+        assert!(!d2.is_h1);
+        assert!(d2.is_h2);
+        assert!(!d2.is_bold);
+
+        // parse_message on "## " renders empty paragraph without literal "##"
+        let p2 = parse_message(&s2, &ctx, default_color, alignment);
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].text, "\u{00A0}");
+        assert_eq!(p2[0].font_size, 20.0);
+        assert_eq!(p2[0].font_weight, 700);
+
+        // Verify Bold on "# " produces "# [bold] " and detects both h1 and bold
+        let s_h1_bold = apply_line_style(&s1, 0, "bold");
+        assert_eq!(s_h1_bold, "# [bold] ");
+        let d_h1_bold = detect_line_formatting(&s_h1_bold, 0);
+        assert!(d_h1_bold.is_h1);
+        assert!(d_h1_bold.is_bold);
+
+        // 4. Toggle Bold on "## " produces "## [bold] "
+        let s3 = apply_line_style(&s2, 0, "bold");
+        assert_eq!(s3, "## [bold] ");
+        let d3 = detect_line_formatting(&s3, 0);
+        assert!(!d3.is_h1);
+        assert!(d3.is_h2);
+        assert!(d3.is_bold);
+
+        let p3 = parse_message(&s3, &ctx, default_color, alignment);
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].text, "\u{00A0}");
+        assert_eq!(p3[0].font_size, 20.0);
+        assert_eq!(p3[0].font_weight, 700);
+
+        // 5. Toggle H2 on "## [bold] " toggles off H2 to produce "[bold] "
+        let s4 = apply_line_style(&s3, 0, "h2");
+        assert_eq!(s4, "[bold] ");
+        let d4 = detect_line_formatting(&s4, 0);
+        assert!(!d4.is_h1);
+        assert!(!d4.is_h2);
+        assert!(d4.is_bold);
+
+        let p4 = parse_message(&s4, &ctx, default_color, alignment);
+        assert_eq!(p4.len(), 1);
+        assert_eq!(p4[0].text, "\u{00A0}");
+        assert_eq!(p4[0].font_size, 15.0);
+        assert_eq!(p4[0].font_weight, 700);
+
+        // Also test standalone "#" and "##"
+        let p_hash = parse_message("#", &ctx, default_color, alignment);
+        assert_eq!(p_hash[0].text, "\u{00A0}");
+        assert_eq!(p_hash[0].font_size, 26.0);
+
+        let p_hash2 = parse_message("##", &ctx, default_color, alignment);
+        assert_eq!(p_hash2[0].text, "\u{00A0}");
+        assert_eq!(p_hash2[0].font_size, 20.0);
     }
 
     /// Verifies UI combo-box display labels (`"Color: Sky Blue"`, `"Size: 18px"`) map to their underlying attributes.
