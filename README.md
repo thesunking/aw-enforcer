@@ -18,7 +18,7 @@
   - **7 Enforcement Actions:**
     - **`Show Overlay`:** Displays a full-screen break overlay across all monitors that counts down only while you are physically idle.
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card or a native `Windows` Action Center toast.
-    - **`Show Statistics`:** Opens a 24-Hour Screen Time Summary HUD with an hourly activity histogram.
+    - **`Show Statistics`:** Opens a 24-Hour Screen Time Summary HUD with an hourly activity histogram. Supports optional click-through mode (`click_through`) to interact with underlying windows while monitoring stats.
     - **`Lock Workstation`:** Immediately locks the Windows session.
     - **`Close Tab`:** Closes the active tab of the matching foreground window.
     - **`Close Window`:** Closes matching visible top-level windows (including minimized taskbar windows).
@@ -28,12 +28,12 @@
   1. **Stage 1 — Pre-Action Warning:** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Supports custom formatted message templates across all rules.
   2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. Window minimization does not bypass enforcement: `Close Window` closes minimized taskbar windows, `Kill Process` terminates background/tray targets, and `Lock Workstation` executes reliably regardless of active desktop state. Dismissing a destructive grace timer hides the banner without aborting enforcement (requiring `Snooze (5m)` to defer action).
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
-  - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement.
+  - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement (while warning/notification toasts can still be acknowledged and dismissed).
 
 - **Customizable Appearance & 24-Hour Statistics HUD:**
   - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
   - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
-  - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor.
+  - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor, with real-time countdown ticking and immediate dismissal.
 
 ---
 

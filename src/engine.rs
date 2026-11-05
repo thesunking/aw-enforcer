@@ -795,8 +795,15 @@ impl Engine {
                     .iter()
                     .any(|r| r.id == rule_id && r.strict_mode);
                 if is_strict {
-                    tracing::warn!("AcknowledgeAppWarning ignored: strict mode active for rule {}", rule_id);
-                    return;
+                    if let Some(rt) = self.runtimes.get(&rule_id) {
+                        if rt.grace_countdown.is_some()
+                            || rt.active_break.is_some()
+                            || rt.pending_break_since.is_some()
+                        {
+                            tracing::warn!("AcknowledgeAppWarning ignored: strict mode active for rule {}", rule_id);
+                            return;
+                        }
+                    }
                 }
 
                 let is_destructive = self.config.rules.iter().any(|r| {
@@ -1015,7 +1022,7 @@ impl Engine {
             ..
         } = self.active_overlay_mode
         {
-            if rule_id == "test_timer" && *remaining_seconds > 0 {
+            if rule_id.starts_with("test_") && *remaining_seconds > 0 {
                 *remaining_seconds -= 1;
                 let rem = *remaining_seconds;
                 self.send_overlay_countdown_tick(rem, duration_seconds, is_idle);
@@ -2110,7 +2117,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.complete_cycle(now);
                 }
-                self.display_stats_overlay(false).await;
+                self.display_stats_overlay(rule.click_through).await;
             }
             RuleAction::LockWorkstation => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
@@ -2466,7 +2473,7 @@ impl Engine {
                         duration_seconds: dur,
                         remaining_seconds: dur,
                         allow_snooze: !rule.strict_mode,
-                        strict_mode: rule.strict_mode,
+                        strict_mode: false,
                     };
                     self.show_overlay(mode);
                 } else {
@@ -2524,7 +2531,7 @@ impl Engine {
                         duration_seconds: dur,
                         remaining_seconds: dur,
                         allow_snooze: !rule.strict_mode,
-                        strict_mode: rule.strict_mode,
+                        strict_mode: false,
                     };
                     self.show_overlay(mode);
                 } else if rule.warn_before.to_seconds() > 0 {
@@ -2548,7 +2555,7 @@ impl Engine {
                         rule_id: "test_preview".to_string(),
                         title: format!("Upcoming: {}", rule.name),
                         paragraphs,
-                        snooze_options_minutes: vec![5, 10, 15],
+                        snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                         duration_seconds: dur,
                         remaining_seconds: dur,
                         show_time_remaining: rule.show_remaining_time,
@@ -5998,5 +6005,136 @@ mod tests {
 
         engine.realtime_tick().await;
         assert_eq!(engine.runtimes.get("rule-delayed-d3d").unwrap().pending_break_since, None);
+    }
+
+    #[tokio::test]
+    async fn test_preview_hud_timer_countdown_and_autohide() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-preview-test".to_string();
+        rule.action = RuleAction::CloseWindow;
+        rule.grace_duration = DurationConfig::new(2, TimeUnit::Sec);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client.clone(), overlay_tx.clone());
+
+        engine.handle_command(DaemonCommand::PreviewRule(Box::new(rule))).await;
+
+        let action = overlay_rx.recv().await.expect("Expected preview overlay action");
+        assert!(matches!(action, OverlayAction::Show(OverlayMode::HudTimer { ref rule_id, remaining_seconds: 2, .. }) if rule_id == "test_preview"));
+
+        // Tick 1: decrements remaining_seconds to 1
+        engine.realtime_tick().await;
+        if let OverlayMode::HudTimer { remaining_seconds, .. } = engine.active_overlay_mode {
+            assert_eq!(remaining_seconds, 1);
+        } else {
+            panic!("Expected HudTimer active overlay mode after tick 1");
+        }
+
+        // Tick 2: decrements remaining_seconds to 0 and auto-hides overlay
+        engine.realtime_tick().await;
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_app_warning_on_strict_rule_toast_vs_grace() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut strict_rule = Rule::default_template(0);
+        strict_rule.id = "rule-strict-toast".to_string();
+        strict_rule.strict_mode = true;
+        strict_rule.action = RuleAction::CloseWindow;
+        strict_rule.grace_duration = DurationConfig::new(30, TimeUnit::Sec);
+
+        cfg.rules = vec![strict_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client.clone(), overlay_tx.clone());
+
+        // 1. When a strict rule has a HudToast (e.g. Stage 1 warning) with grace_countdown: None
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-strict-toast".to_string(),
+            title: "Warning".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: Vec::new(),
+            duration_seconds: 10,
+            remaining_seconds: 10,
+            show_time_remaining: false,
+        };
+        let rt = engine.runtimes.get_mut("rule-strict-toast").unwrap();
+        rt.can_rollback_completion = true;
+        rt.grace_countdown = None;
+
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-strict-toast".to_string(),
+            })
+            .await;
+
+        let rt_after = engine.runtimes.get("rule-strict-toast").unwrap();
+        assert!(!rt_after.can_rollback_completion, "AcknowledgeAppWarning should clear can_rollback_completion on strict toast");
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden), "AcknowledgeAppWarning should dismiss strict toast");
+
+        // 2. When a strict rule has active grace_countdown: Some((30, 30))
+        engine.active_overlay_mode = OverlayMode::HudTimer {
+            rule_id: "rule-strict-toast".to_string(),
+            title: "Grace".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 30,
+            remaining_seconds: 30,
+            allow_snooze: false,
+            strict_mode: true,
+        };
+        let rt_grace = engine.runtimes.get_mut("rule-strict-toast").unwrap();
+        rt_grace.grace_countdown = Some((30, 30));
+
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-strict-toast".to_string(),
+            })
+            .await;
+
+        let rt_grace_after = engine.runtimes.get("rule-strict-toast").unwrap();
+        assert_eq!(rt_grace_after.grace_countdown, Some((30, 30)), "AcknowledgeAppWarning must be rejected when strict grace countdown is active");
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::HudTimer { .. }), "Overlay must not be dismissed when strict grace countdown is active");
+    }
+
+    #[tokio::test]
+    async fn test_execute_rule_action_show_statistics_forwards_click_through() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-stats-exec".to_string();
+        rule.action = RuleAction::ShowStatistics;
+        rule.click_through = true;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client.clone(), overlay_tx.clone());
+
+        while overlay_rx.try_recv().is_ok() {}
+
+        engine
+            .execute_rule_action(
+                &rule,
+                None,
+                Local::now(),
+                "test_app",
+                3600,
+                3600,
+            )
+            .await;
+
+        let action = overlay_rx.recv().await.expect("Expected overlay action from execute_rule_action");
+        match action {
+            OverlayAction::Show(OverlayMode::HudStatus { click_through, .. }) => {
+                assert!(click_through, "execute_rule_action must forward rule.click_through to HudStatus");
+            }
+            other => panic!("Expected HudStatus from execute_rule_action for ShowStatistics, got: {other:?}"),
+        }
     }
 }

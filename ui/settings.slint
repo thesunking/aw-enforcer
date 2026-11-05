@@ -1598,7 +1598,7 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Overlay" : FormRow {
+                            if child_rule_view.cur-action == "Show Overlay" || child_rule_view.cur-action == "Show Statistics" : FormRow {
                                 label: "Click-through Overlay:";
                                 CheckBox {
                                     text: "Pass mouse clicks and keystrokes through overlay";

@@ -293,12 +293,12 @@ export component OverlayWindow inherits Window {
             }
 
             // Controls: Snooze & Dismiss when non-strict and interactive
-            if root.allow-snooze && !root.strict-mode && !root.click-through : HorizontalLayout {
+            if (root.allow-snooze || root.rule-id == "test_preview" || root.rule-id == "test_timer") && !root.strict-mode && !root.click-through : HorizontalLayout {
                 spacing: 8px;
                 alignment: end;
                 height: 30px;
 
-                Button {
+                if root.allow-snooze : Button {
                     text: "Snooze (5m)";
                     clicked => {
                         root.snooze-clicked(root.rule-id, 5);
