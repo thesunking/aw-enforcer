@@ -85,6 +85,12 @@ AW-Enforcer automatically loads and saves its configuration to:
 
 ```
 
+Whenever the configuration is loaded or saved, comprehensive sanitization invariants are enforced:
+- **Duration & Quota Clamping:** Polling intervals are clamped to 2–120 seconds, daily screentime targets to 1–1440 minutes, histogram bins to 1–96 bins (1–1440 min/bin), and rule duration inputs to 1–3600 (matching UI SpinBox bounds).
+- **Target Normalization:** Executable target entries are trimmed and empty strings dropped; if specific executables exist, wildcards (`"*"`) are dropped and entries are deduplicated case-insensitively while preserving order.
+- **Schedule Bitmask Normalization:** Weekday active schedules are canonicalized to standard 24-character `'0'`/`'1'` strings.
+- **Rule ID Uniqueness:** Non-empty, unique rule IDs are strictly enforced; duplicate, empty, or `"test_*"` prefixed IDs are automatically assigned the next available `rule-{n}` identifier.
+
 ---
 
 ## Project Structure
@@ -92,7 +98,7 @@ AW-Enforcer automatically loads and saves its configuration to:
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
-| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
+| `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, duration/quota bounds clamping, target/schedule normalization, unique rule ID enforcement, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery and `filter_period_intersect` queries) |
 | `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, interval-coalesced session/quota calculation, and 3-stage rule evaluation |
 | `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |

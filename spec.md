@@ -225,12 +225,15 @@ pub struct Rule {
 ### 4.3 Sanitization Invariants & Clamping
 Both `Config::load_from_path` and `Config::save_to_path` execute `Config::sanitize(&mut self)` to enforce system stability:
 - **Port Clamping:** `aw_port` clamped to valid TCP ports (`1..=65535`).
-- **Polling Rate:** `poll_interval_seconds` clamped to `≥ 2` seconds (upper bound `120s`).
+- **Polling Rate:** `poll_interval_seconds` clamped to `2..=120` seconds.
 - **Logical Day-Start:** `day_start_hour` clamped to `0..=23` (default `4` = 04:00 AM).
-- **Destructive Action Safety:** `RuleAction::KillProcess` is downgraded to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one non-wildcard target is present.
-- **Duration Clamping:** `period.value`, `reset_after_afk.value`, `break_duration.value`, and `notification_duration.value` are clamped to `≥ 1`.
+- **Destructive Action Safety:** `RuleAction::KillProcess` is downgraded to `RuleAction::CloseWindow` unless `monitor_selection == MonitorSelection::Executables` and at least one specific non-wildcard target is present.
+- **Duration Clamping:** Duration parameters are clamped to match UI SpinBox ranges: `period.value`, `reset_after_afk.value`, `break_duration.value`, and `notification_duration.value` to `1..=3600`; `limit.value`, `warn_before.value`, and `grace_duration.value` to `0..=3600`.
+- **Target Executables Normalization:** Entries are trimmed of whitespace and empty strings dropped. When at least one specific executable exists, wildcards (`"*"`) and comment sentinels (`"#"`) are removed, and entries are deduplicated case-insensitively while preserving ordering. If no specific executable remains, falls back to `["*"]`.
+- **Schedule Bitmask Normalization:** Weekday bitmasks are canonicalized via boolean array roundtrip conversion (`RuleSchedule::from_bool_array(&self.schedule.to_bool_array())`), ensuring each day is represented by exactly 24 `'0'`/`'1'` characters.
+- **Unique Rule ID Enforcement:** All rule IDs are tracked in a set during sanitization; empty IDs, runtime test overlay prefixes (`"test_*"`), and duplicates are assigned the next available `rule-{n}` identifier.
 - **Color Validation:** `overlay.accent_color`, `overlay.background_color`, and `overlay.text_color` are parsed using `formatter::parse_hex_color`. Invalid hex entries reset to default values (`#3b82f6`, `#0f172a`, `#f8fafc`).
-- **Stats Consistency:** `daily_screentime_target_minutes ≥ 1`, and `threshold_excessive_minutes ≥ daily_screentime_target_minutes`.
+- **Stats Consistency & Histogram Clamping:** `daily_screentime_target_minutes` clamped to `1..=1440`, `threshold_excessive_minutes` clamped to `daily_screentime_target_minutes..=1440`, `histogram_bin_size_minutes` clamped to `1..=1440`, and `histogram_bin_count` clamped to `1..=96`.
 
 ### 4.4 Reference `config.toml`
 

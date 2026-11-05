@@ -385,12 +385,12 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard) executable name.
+    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard, non-comment) executable name.
     pub fn has_specific_executable(&self) -> bool {
         self.monitor_selection == MonitorSelection::Executables
             && self.target_executables.iter().any(|t| {
                 let s = t.trim();
-                !s.is_empty() && s != "*"
+                !s.is_empty() && s != "*" && s != "#"
             })
     }
 
@@ -402,17 +402,46 @@ impl Rule {
         }
     }
 
-    /// Enforces safety and timing invariants on this rule, downgrading `KillProcess` to `CloseWindow`
-    /// whenever the rule does not target at least one specific executable name, and clamping
-    /// non-zero duration parameters to a minimum value of 1.
+    /// Enforces safety and timing invariants on this rule:
+    /// - Normalizes `target_executables`: trims entries, drops empty/comment strings, removes wildcard if specific targets exist,
+    ///   deduplicates case-insensitively while preserving order, and falls back to `["*"]` if empty.
+    /// - Downgrades `KillProcess` to `CloseWindow` whenever the rule does not target at least one specific executable name.
+    /// - Clamps duration values to match UI SpinBox ranges (1..=3600 for non-zero durations, 0..=3600 for optional durations).
+    /// - Normalizes schedule bitmask strings to canonical 24-character '0'/'1' representations.
     pub fn sanitize(&mut self) {
+        let is_specific = |s: &str| !s.is_empty() && s != "*" && s != "#";
+        let mut seen = std::collections::HashSet::new();
+        let mut normalized_targets = Vec::new();
+
+        for t in &self.target_executables {
+            let trimmed = t.trim();
+            if is_specific(trimmed) {
+                let lower = trimmed.to_ascii_lowercase();
+                if seen.insert(lower) {
+                    normalized_targets.push(trimmed.to_string());
+                }
+            }
+        }
+
+        if normalized_targets.is_empty() {
+            self.target_executables = vec!["*".to_string()];
+        } else {
+            self.target_executables = normalized_targets;
+        }
+
         if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
             self.action = RuleAction::CloseWindow;
         }
-        self.period.value = self.period.value.max(1);
-        self.reset_after_afk.value = self.reset_after_afk.value.max(1);
-        self.break_duration.value = self.break_duration.value.max(1);
-        self.notification_duration.value = self.notification_duration.value.max(1);
+
+        self.period.value = self.period.value.clamp(1, 3600);
+        self.reset_after_afk.value = self.reset_after_afk.value.clamp(1, 3600);
+        self.limit.value = self.limit.value.min(3600);
+        self.warn_before.value = self.warn_before.value.min(3600);
+        self.grace_duration.value = self.grace_duration.value.min(3600);
+        self.break_duration.value = self.break_duration.value.clamp(1, 3600);
+        self.notification_duration.value = self.notification_duration.value.clamp(1, 3600);
+
+        self.schedule = RuleSchedule::from_bool_array(&self.schedule.to_bool_array());
     }
 
     /// Creates a new rule populated with sensible ergonomic defaults for the UI "+ Add Rule" action.
@@ -679,7 +708,7 @@ impl Config {
         }
 
         self.general.aw_port = self.general.aw_port.max(1);
-        self.general.poll_interval_seconds = self.general.poll_interval_seconds.max(2);
+        self.general.poll_interval_seconds = self.general.poll_interval_seconds.clamp(2, 120);
         self.general.day_start_hour = self.general.day_start_hour.min(23);
 
         self.general.slint_renderer = if self.general.slint_renderer.eq_ignore_ascii_case("software") {
@@ -700,11 +729,12 @@ impl Config {
             self.overlay.text_color = default_overlay.text_color;
         }
 
-        self.stats.daily_screentime_target_minutes = self.stats.daily_screentime_target_minutes.max(1);
+        self.stats.daily_screentime_target_minutes =
+            self.stats.daily_screentime_target_minutes.clamp(1, 1440);
         self.stats.threshold_excessive_minutes = self
             .stats
             .threshold_excessive_minutes
-            .max(self.stats.daily_screentime_target_minutes);
+            .clamp(self.stats.daily_screentime_target_minutes, 1440);
         self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.clamp(1, 1440);
         self.stats.histogram_bin_count = self.stats.histogram_bin_count.clamp(1, 96);
 
@@ -751,11 +781,35 @@ impl Config {
         Self::try_load_from_path(&path)
     }
 
-    /// Enforces safety invariants on rules, downgrading `KillProcess` to `CloseWindow`
-    /// whenever a rule does not target at least one specific executable name.
+    /// Enforces safety invariants on rules:
+    /// - Sanitizes each individual rule (duration bounds, target normalization, schedule bitmask canonicalization).
+    /// - Ensures every rule has a non-empty, unique ID that does not collide with runtime "test_" overlays.
     pub fn sanitize_rules(&mut self) {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut next_id_num = 1usize;
+
         for rule in &mut self.rules {
             rule.sanitize();
+
+            let trimmed_id = rule.id.trim().to_string();
+            let is_invalid = trimmed_id.is_empty()
+                || trimmed_id.starts_with("test_")
+                || seen_ids.contains(&trimmed_id);
+
+            if is_invalid {
+                loop {
+                    let candidate = format!("rule-{}", next_id_num);
+                    next_id_num += 1;
+                    if !seen_ids.contains(&candidate) {
+                        rule.id = candidate.clone();
+                        seen_ids.insert(candidate);
+                        break;
+                    }
+                }
+            } else {
+                rule.id = trimmed_id.clone();
+                seen_ids.insert(trimmed_id);
+            }
         }
     }
 
@@ -983,6 +1037,169 @@ mod tests {
         assert_eq!(sanitized_rule.break_duration.value, 1);
         assert_eq!(sanitized_rule.notification_duration.value, 1);
         assert_eq!(sanitized_rule.trigger_threshold_seconds(), 60);
+
+        // Verify upper-bound clamping
+        let mut max_rule = Rule::default_template(0);
+        max_rule.period.value = 9999;
+        max_rule.reset_after_afk.value = 9999;
+        max_rule.limit.value = 9999;
+        max_rule.warn_before.value = 9999;
+        max_rule.grace_duration.value = 9999;
+        max_rule.break_duration.value = 9999;
+        max_rule.notification_duration.value = 9999;
+        max_rule.sanitize();
+
+        assert_eq!(max_rule.period.value, 3600);
+        assert_eq!(max_rule.reset_after_afk.value, 3600);
+        assert_eq!(max_rule.limit.value, 3600);
+        assert_eq!(max_rule.warn_before.value, 3600);
+        assert_eq!(max_rule.grace_duration.value, 3600);
+        assert_eq!(max_rule.break_duration.value, 3600);
+        assert_eq!(max_rule.notification_duration.value, 3600);
+    }
+
+    /// Verifies `poll_interval_seconds` upper-bound clamping to 120 and `stats` minute clamping to 1440.
+    #[test]
+    fn test_poll_interval_and_stats_minute_clamping() {
+        let mut cfg = Config::default();
+
+        // Lower bounds
+        cfg.general.poll_interval_seconds = 0;
+        cfg.stats.daily_screentime_target_minutes = 0;
+        cfg.stats.threshold_excessive_minutes = 0;
+        cfg.sanitize();
+        assert_eq!(cfg.general.poll_interval_seconds, 2);
+        assert_eq!(cfg.stats.daily_screentime_target_minutes, 1);
+        assert_eq!(cfg.stats.threshold_excessive_minutes, 1);
+
+        // Upper bounds
+        cfg.general.poll_interval_seconds = 500;
+        cfg.stats.daily_screentime_target_minutes = 5000;
+        cfg.stats.threshold_excessive_minutes = 6000;
+        cfg.sanitize();
+        assert_eq!(cfg.general.poll_interval_seconds, 120);
+        assert_eq!(cfg.stats.daily_screentime_target_minutes, 1440);
+        assert_eq!(cfg.stats.threshold_excessive_minutes, 1440);
+
+        // Threshold below target clamps up to target
+        cfg.stats.daily_screentime_target_minutes = 500;
+        cfg.stats.threshold_excessive_minutes = 200;
+        cfg.sanitize();
+        assert_eq!(cfg.stats.daily_screentime_target_minutes, 500);
+        assert_eq!(cfg.stats.threshold_excessive_minutes, 500);
+    }
+
+    /// Verifies `target_executables` normalization:
+    /// `[]` -> `["*"]`, and `["*", "steam.exe", "STEAM.EXE"]` -> `["steam.exe"]`.
+    #[test]
+    fn test_target_executables_normalization() {
+        let mut rule = Rule::default_template(0);
+
+        // Empty slice falls back to ["*"]
+        rule.target_executables = vec![];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["*"]);
+
+        // Whitespace and empty strings fall back to ["*"]
+        rule.target_executables = vec!["   ".to_string(), "".to_string()];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["*"]);
+
+        // Wildcard removal, trimming, and case-insensitive deduplication while preserving order
+        rule.target_executables = vec![
+            "*".to_string(),
+            "  steam.exe  ".to_string(),
+            "STEAM.EXE".to_string(),
+            "#".to_string(),
+            "discord.exe".to_string(),
+            "Discord.EXE".to_string(),
+        ];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["steam.exe", "discord.exe"]);
+
+        // Non-executable specific sentinels only fall back to ["*"]
+        rule.target_executables = vec!["*".to_string(), "#".to_string()];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["*"]);
+    }
+
+    /// Verifies `RuleSchedule` normalization from short/corrupted strings to 24-character '0'/'1' strings.
+    #[test]
+    fn test_rule_schedule_normalization() {
+        let mut rule = Rule::default_template(0);
+        rule.schedule.mon = "1".to_string(); // short
+        rule.schedule.tue = "0000abc1111".to_string(); // invalid chars and short
+        rule.schedule.wed = "".to_string(); // empty
+        rule.schedule.thu = "11111111111111111111111199999".to_string(); // too long
+        rule.schedule.fri = "000000000111111111111100".to_string(); // valid 24 chars
+        rule.schedule.sat = "".to_string();
+        rule.schedule.sun = "".to_string();
+
+        rule.sanitize();
+
+        assert_eq!(rule.schedule.mon.len(), 24);
+        assert_eq!(rule.schedule.tue.len(), 24);
+        assert_eq!(rule.schedule.wed.len(), 24);
+        assert_eq!(rule.schedule.thu.len(), 24);
+        assert_eq!(rule.schedule.fri.len(), 24);
+        assert_eq!(rule.schedule.sat.len(), 24);
+        assert_eq!(rule.schedule.sun.len(), 24);
+
+        assert_eq!(rule.schedule.mon, "100000000000000000000000");
+        assert_eq!(rule.schedule.fri, "000000000111111111111100");
+        assert_eq!(rule.schedule.wed, "000000000000000000000000");
+        assert_eq!(rule.schedule.thu, "111111111111111111111111");
+        assert!(rule.schedule.mon.chars().all(|c| c == '0' || c == '1'));
+        assert!(rule.schedule.tue.chars().all(|c| c == '0' || c == '1'));
+    }
+
+    /// Verifies duplicate, empty, and "test_*" rule id deduplication in `sanitize_rules()`.
+    #[test]
+    fn test_sanitize_rules_unique_id_and_test_prefix_deduplication() {
+        let mut cfg = Config::default();
+
+        let mut r1 = Rule::default_template(0);
+        r1.id = "rule-1".to_string();
+
+        let mut r2 = Rule::default_template(1);
+        r2.id = "rule-1".to_string(); // Duplicate of r1
+
+        let mut r3 = Rule::default_template(2);
+        r3.id = "".to_string(); // Empty ID
+
+        let mut r4 = Rule::default_template(3);
+        r4.id = "   ".to_string(); // Whitespace only
+
+        let mut r5 = Rule::default_template(4);
+        r5.id = "test_preview".to_string(); // Starts with "test_"
+
+        let mut r6 = Rule::default_template(5);
+        r6.id = "test_break".to_string(); // Starts with "test_"
+
+        let mut r7 = Rule::default_template(6);
+        r7.id = "custom-id".to_string(); // Valid custom ID
+
+        let mut r8 = Rule::default_template(7);
+        r8.id = "custom-id".to_string(); // Duplicate of custom-id
+
+        cfg.rules = vec![r1, r2, r3, r4, r5, r6, r7, r8];
+        cfg.sanitize_rules();
+
+        assert_eq!(cfg.rules[0].id, "rule-1");
+        assert_eq!(cfg.rules[1].id, "rule-2");
+        assert_eq!(cfg.rules[2].id, "rule-3");
+        assert_eq!(cfg.rules[3].id, "rule-4");
+        assert_eq!(cfg.rules[4].id, "rule-5");
+        assert_eq!(cfg.rules[5].id, "rule-6");
+        assert_eq!(cfg.rules[6].id, "custom-id");
+        assert_eq!(cfg.rules[7].id, "rule-7");
+
+        let mut ids = std::collections::HashSet::new();
+        for r in &cfg.rules {
+            assert!(!r.id.is_empty());
+            assert!(!r.id.starts_with("test_"));
+            assert!(ids.insert(r.id.clone()), "Duplicate ID found: {}", r.id);
+        }
     }
 
     /// Verifies TOML serialization and deserialization roundtrip for `Rule::default_template`.
