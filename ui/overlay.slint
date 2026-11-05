@@ -164,6 +164,15 @@ export component OverlayWindow inherits Window {
         border-width: 1px;
         border-color: root.accent-color.with-alpha(0.5);
 
+        card_drag_toast := TouchArea {
+            mouse-cursor: move;
+            pointer-event(pe) => {
+                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+                    root.drag-status-window();
+                }
+            }
+        }
+
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
@@ -246,6 +255,15 @@ export component OverlayWindow inherits Window {
         border-radius: 8px;
         border-width: 1px;
         border-color: #f59e0b;
+
+        card_drag_timer := TouchArea {
+            mouse-cursor: move;
+            pointer-event(pe) => {
+                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+                    root.drag-status-window();
+                }
+            }
+        }
 
         VerticalLayout {
             padding: 16px;

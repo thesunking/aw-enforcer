@@ -25,16 +25,17 @@
     - **`Kill Process`:** Terminates matching processes via ToolHelp snapshots, verifying running processes even when minimized or resident in the system tray.
 
 - **Three-Stage Enforcement Pipeline:**
-  1. **Stage 1 — Pre-Action Warning:** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Supports custom formatted message templates across all rules.
+  1. **Stage 1 — Pre-Action Warning:** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Configurable delivery method (HUD vs Windows), duration, and countdown visibility across all rule actions. Supports custom formatted message templates.
   2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. Window minimization does not bypass enforcement: `Close Window` closes minimized taskbar windows, `Kill Process` terminates background/tray targets, and `Lock Workstation` executes reliably regardless of active desktop state. Repeat executions of `Limit` + `Lock Workstation` enforce a minimum 15-second grace countdown to prevent immediate lock-out loops upon unlocking the workstation. Dismissing a destructive grace timer hides the banner without aborting enforcement (requiring `Snooze (5m)` to defer action).
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
   - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement (while warning/notification toasts can still be acknowledged and dismissed).
 
 - **Customizable Appearance & 24-Hour Statistics HUD:**
-  - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
+  - Full control over overlay opacity, accent color, background color, and text color in **General Settings**, featuring interactive 24×24px color swatches next to Hex inputs for real-time visual feedback.
+  - Draggable non-fullscreen HUD overlay cards (`HudToast`, `HudTimer`, `HudStatus`): click and drag any card to position it anywhere across the desktop away from active application controls.
   - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
   - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor, with real-time countdown ticking and immediate dismissal.
-  - Rich text formatting with alignment-aware underline rendering sized directly to paragraph text, case-insensitive attribute toggling (e.g., uppercase hex colors), and grace-aware preview context interpolation.
+  - Rich text formatting with alignment-aware underline rendering sized directly to paragraph text, case-insensitive attribute toggling (e.g., uppercase hex colors), grace-aware preview context interpolation, and an adaptive template editor height with line-selection gutter that dynamically expands to avoid overflow.
   - High-performance binary-searched interval intersection (`partition_point`) for $O(\log N)$ overlap queries and web event window clipping, with single-pass merged interval reuse between telemetry and live statistics overlays.
 
 ---

@@ -468,6 +468,15 @@ fn apply_config_to_ui(
     win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
     win.set_background_color_hex(cfg.overlay.background_color.as_str().into());
     win.set_text_color_hex(cfg.overlay.text_color.as_str().into());
+    if let Some(c) = formatter::parse_hex_color(&cfg.overlay.accent_color) {
+        win.set_accent_color_preview(c);
+    }
+    if let Some(c) = formatter::parse_hex_color(&cfg.overlay.background_color) {
+        win.set_background_color_preview(c);
+    }
+    if let Some(c) = formatter::parse_hex_color(&cfg.overlay.text_color) {
+        win.set_text_color_preview(c);
+    }
     win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
     win.set_threshold_excessive_minutes(cfg.stats.threshold_excessive_minutes as i32);
     win.set_histogram_bin_size_minutes(cfg.stats.histogram_bin_size_minutes as i32);
@@ -797,6 +806,23 @@ fn open_settings_window(
                 cmd_tx
                     .send(DaemonCommand::ReloadConfig(Box::new(updated_config)))
                     .ok();
+            }
+        });
+    }
+
+    // Color hex live preview
+    {
+        let sw = settings_weak.clone();
+        settings_win.on_color_hex_edited(move |kind, val| {
+            if let Some(win) = sw.upgrade() {
+                if let Some(color) = formatter::parse_hex_color(&val) {
+                    match kind.as_str() {
+                        "accent" => win.set_accent_color_preview(color),
+                        "background" => win.set_background_color_preview(color),
+                        "text" => win.set_text_color_preview(color),
+                        _ => {}
+                    }
+                }
             }
         });
     }

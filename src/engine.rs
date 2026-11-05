@@ -1650,8 +1650,7 @@ impl Engine {
     fn dispatch_pre_action_warning(&mut self, rule: &Rule, ctx: &MessageContext, rem_secs: u32) {
         let suppress_intrusive = self.config.general.suppress_fullscreen_d3d
             && enforcer::is_fullscreen_or_presentation_active();
-        let use_windows = suppress_intrusive
-            || (rule.action == RuleAction::ShowNotification && rule.notification_method == NotificationMethod::Windows);
+        let use_windows = suppress_intrusive || rule.notification_method == NotificationMethod::Windows;
 
         let warn_title = format!("Upcoming: {}", rule.name);
         let default_body = format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
@@ -6435,6 +6434,60 @@ mod tests {
             rt_long.grace_countdown,
             Some((30, 30)),
             "Longer grace duration (30s) must not be clamped down on LockWorkstation repeat execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_pre_action_warning_respects_notification_method_and_duration() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        // Rule 1: CloseWindow action with NotificationMethod::Hud, 25s duration, show_remaining_time = true
+        let mut rule_hud = Rule::default_template(0);
+        rule_hud.id = "rule-warn-hud".to_string();
+        rule_hud.action = RuleAction::CloseWindow;
+        rule_hud.notification_method = NotificationMethod::Hud;
+        rule_hud.notification_duration = DurationConfig::new(25, TimeUnit::Sec);
+        rule_hud.show_remaining_time = true;
+
+        // Rule 2: ShowOverlay action with NotificationMethod::Windows
+        let mut rule_win = Rule::default_template(1);
+        rule_win.id = "rule-warn-win".to_string();
+        rule_win.action = RuleAction::ShowOverlay;
+        rule_win.notification_method = NotificationMethod::Windows;
+
+        cfg.rules = vec![rule_hud.clone(), rule_win.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let ctx = formatter::build_preview_context(&rule_hud);
+
+        // 1. Dispatch warning for rule_hud: must display HudToast with 25s duration and show_time_remaining = true
+        engine.dispatch_pre_action_warning(&rule_hud, &ctx, 120);
+        match &engine.active_overlay_mode {
+            OverlayMode::HudToast {
+                rule_id,
+                duration_seconds,
+                remaining_seconds,
+                show_time_remaining,
+                ..
+            } => {
+                assert_eq!(rule_id, "rule-warn-hud");
+                assert_eq!(*duration_seconds, 25);
+                assert_eq!(*remaining_seconds, 25);
+                assert!(*show_time_remaining);
+            }
+            other => panic!("Expected HudToast for NotificationMethod::Hud, got {:?}", other),
+        }
+
+        // 2. Dispatch warning for rule_win: NotificationMethod::Windows routes to system toast, NOT HudToast
+        engine.active_overlay_mode = OverlayMode::Hidden;
+        let ctx_win = formatter::build_preview_context(&rule_win);
+        engine.dispatch_pre_action_warning(&rule_win, &ctx_win, 60);
+        assert!(
+            matches!(engine.active_overlay_mode, OverlayMode::Hidden),
+            "NotificationMethod::Windows must not emit HudToast overlay"
         );
     }
 }

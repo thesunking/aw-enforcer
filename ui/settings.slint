@@ -239,6 +239,10 @@ export component SettingsWindow inherits Window {
     in-out property <string> accent-color-hex: "#3b82f6";
     in-out property <string> background-color-hex: "#0f172a";
     in-out property <string> text-color-hex: "#f8fafc";
+    in-out property <color> accent-color-preview: #3b82f6;
+    in-out property <color> background-color-preview: #0f172a;
+    in-out property <color> text-color-preview: #f8fafc;
+    callback color-hex-edited(string /* which */, string /* hex */);
     in-out property <int> daily-target-minutes: 480;
     in-out property <int> threshold-excessive-minutes: 600;
     in-out property <int> histogram-bin-size-minutes: 60;
@@ -764,30 +768,78 @@ export component SettingsWindow inherits Window {
                         FormRow {
                             label: "Accent Color (Hex):";
                             label-width: 220px;
-                            LineEdit {
-                                text <=> root.accent-color-hex;
-                                placeholder-text: "#3b82f6";
-                                edited(val) => { root.has-unsaved-changes = true; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                LineEdit {
+                                    width: 160px;
+                                    text <=> root.accent-color-hex;
+                                    placeholder-text: "#3b82f6";
+                                    edited(val) => {
+                                        root.has-unsaved-changes = true;
+                                        root.color-hex-edited("accent", val);
+                                    }
+                                }
+                                Rectangle {
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    background: root.accent-color-preview;
+                                    border-width: 1px;
+                                    border-color: #475569;
+                                }
                             }
                         }
 
                         FormRow {
                             label: "Background Color (Hex):";
                             label-width: 220px;
-                            LineEdit {
-                                text <=> root.background-color-hex;
-                                placeholder-text: "#0f172a";
-                                edited(val) => { root.has-unsaved-changes = true; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                LineEdit {
+                                    width: 160px;
+                                    text <=> root.background-color-hex;
+                                    placeholder-text: "#0f172a";
+                                    edited(val) => {
+                                        root.has-unsaved-changes = true;
+                                        root.color-hex-edited("background", val);
+                                    }
+                                }
+                                Rectangle {
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    background: root.background-color-preview;
+                                    border-width: 1px;
+                                    border-color: #475569;
+                                }
                             }
                         }
 
                         FormRow {
                             label: "Text Color (Hex):";
                             label-width: 220px;
-                            LineEdit {
-                                text <=> root.text-color-hex;
-                                placeholder-text: "#f8fafc";
-                                edited(val) => { root.has-unsaved-changes = true; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                LineEdit {
+                                    width: 160px;
+                                    text <=> root.text-color-hex;
+                                    placeholder-text: "#f8fafc";
+                                    edited(val) => {
+                                        root.has-unsaved-changes = true;
+                                        root.color-hex-edited("text", val);
+                                    }
+                                }
+                                Rectangle {
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    background: root.text-color-preview;
+                                    border-width: 1px;
+                                    border-color: #475569;
+                                }
                             }
                         }
 
@@ -1351,6 +1403,9 @@ export component SettingsWindow inherits Window {
                                     model: ["Executables", "Titles", "Urls"];
                                     current-value <=> root.rule-monitor-selection;
                                     selected(val) => {
+                                        if val != "Executables" && root.rule-action == "Kill Process" {
+                                            root.rule-action = "Close Window";
+                                        }
                                         root.active-rule-edited();
                                     }
                                 }
@@ -1493,7 +1548,7 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Notification" : FormRow {
+                            if child_rule_view.cur-action == "Show Notification" || root.rule-warn-before-val > 0 : FormRow {
                                 label: "Notification Method:";
                                 HorizontalLayout {
                                     spacing: 8px;
@@ -1532,7 +1587,7 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Notification" && root.rule-notification-method == "HUD" : DurationInput {
+                            if (child_rule_view.cur-action == "Show Notification" || root.rule-warn-before-val > 0) && root.rule-notification-method == "HUD" : DurationInput {
                                 label: "Duration:";
                                 enabled: !root.ui-locked-by-strict;
                                 minimum-value: 1;
@@ -1544,7 +1599,7 @@ export component SettingsWindow inherits Window {
                                 }
                             }
 
-                            if child_rule_view.cur-action == "Show Notification" && root.rule-notification-method == "HUD" : FormRow {
+                            if (child_rule_view.cur-action == "Show Notification" || root.rule-warn-before-val > 0) && root.rule-notification-method == "HUD" : FormRow {
                                 label: "Show Time Remaining:";
                                 CheckBox {
                                     text: "Show countdown timer on notification";
@@ -1706,6 +1761,7 @@ export component SettingsWindow inherits Window {
 
                                 // Multi-line Message TextEdit with Left Line Selection Column
                                 HorizontalLayout {
+                                    height: Math.max(120px, root.message-lines.length * 20px + 14px);
                                     spacing: 8px;
 
                                     // Left Line Selection Gutter
@@ -1769,7 +1825,7 @@ export component SettingsWindow inherits Window {
 
                                     // Single text block TextEdit
                                     TextEdit {
-                                        height: 120px;
+                                        height: Math.max(120px, root.message-lines.length * 20px + 14px);
                                         font-size: 15px;
                                         enabled: !root.ui-locked-by-strict;
                                         text <=> root.editor-message-text;

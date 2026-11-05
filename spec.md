@@ -335,7 +335,7 @@ stateDiagram-v2
 
 #### Stage 1: Pre-Action Warning (`warn_before > 0`)
 - **Trigger Condition:** `threshold > 0 && warn_secs > 0 && warn_secs < threshold && elapsed >= threshold - warn_secs && elapsed < threshold`.
-- **Behavior:** Dispatches a HUD toast or notification once per cycle (`rt.warned_current_cycle = true`). For `ShowOverlay`, dispatches a specific upcoming-break warning to distinguish it from the break screen itself.
+- **Behavior:** Dispatches a HUD toast or native Windows Action Center notification once per cycle (`rt.warned_current_cycle = true`). Pre-action warnings authoritatively respect the rule's configured `notification_method` (`HUD` vs `Windows`), `notification_duration`, and `show_remaining_time` across all rule actions. For `ShowOverlay`, dispatches a specific upcoming-break warning to distinguish it from the break screen itself.
 
 #### Stage 2: Grace Countdown (`grace_duration > 0`)
 - **Trigger Condition:** `elapsed >= threshold`.
@@ -369,9 +369,12 @@ $$\text{BreakEnforcer (4)} > \text{HudTimer (3)} > \text{HudToast (2)} > \text{H
 - **DirectX D3D / Presentation Suppression:** When `suppress_fullscreen_d3d` is enabled, `SHQueryUserNotificationState` detects games and presentations, downgrading fullscreen overlays to unobtrusive toasts.
 - **Resource Cleanup:** When `destroy_windows_on_hide = true`, dismissing overlays immediately drops Slint window instances, releasing GPU swapchains and framebuffer memory.
 - **Dynamic Theming & Sizing:** Opacity, accent color, backdrop color, and text color configured in `OverlayConfig` propagate to all overlay windows across all four modes. In `HudStatus`, histogram bars dynamically expand and shrink (`horizontal-stretch: 1; min-width: 2px`) to accommodate any configured bin count (1..=96) and bin size (1..=1440 min), with dynamic label decimation step `(bin_count / 6).max(1)` ensuring crisp, non-overlapping timeline axis labels.
+- **Draggable HUD Overlays:** All non-fullscreen HUD overlay cards (`HudToast`, `HudTimer`, `HudStatus`) incorporate a background non-client drag area (`TouchArea { mouse-cursor: move; }`) invoking `win.drag-status-window()` on left-click drag, enabling users to move toasts, grace timers, and histograms anywhere across the desktop if they obscure underlying application controls.
 - **Rich Text & Underline Rendering (`ui/formatted_text.slint`, `src/formatter.rs`):** Rich text paragraphs render custom sizes, weights, and colors. Underline rectangles are alignment-aware and dynamically sized to the rendered text content (`width: Math.min(txt.preferred-width, parent.width)`), aligned to the left, center, or right matching paragraph text alignment, and omitted for empty/non-breaking space spacer lines. Preview message contexts (`build_preview_context`) interpolate `{remaining}` using the rule's configured grace duration when `warn_before == 0`, and provide cross-trigger fallbacks for `{limit}` and `{session_duration}`.
 
 ### 6.2 Settings Window Architecture (`ui/settings.slint`, `src/main.rs`)
+- **Action & Delivery Channel Polish:** Section 2 automatically resets `Kill Process` to `Close Window` whenever the selection mode switches away from `Executables`. Section 4 exposes `Notification Method`, `Duration`, and `Show Time Remaining` controls whenever `warn_before > 0` or `action == Show Notification`, allowing full customization of Stage 1 pre-action warnings across all rule types.
+- **Visual Feedback & Editor Layout:** In General Settings (Tab 0), interactive 24×24px color swatches provide instant visual feedback alongside Hex color inputs. In the Message Template editor, the container height dynamically expands (`Math.max(120px, message_lines.length * 20px + 14px)`) to accommodate templates with more than 5 lines without gutter clipping.
 
 ```mermaid
 graph LR
