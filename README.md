@@ -34,6 +34,7 @@
   - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
   - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
   - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor, with real-time countdown ticking and immediate dismissal.
+  - Rich text formatting with alignment-aware underline rendering sized directly to paragraph text, case-insensitive attribute toggling (e.g., uppercase hex colors), and grace-aware preview context interpolation.
   - High-performance binary-searched interval intersection (`partition_point`) for $O(\log N)$ overlap queries and web event window clipping, with single-pass merged interval reuse between telemetry and live statistics overlays.
 
 ---
@@ -104,11 +105,11 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 | `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, O(log N) binary-searched interval intersection, single-pass poll interval reuse, and 3-stage rule evaluation |
 | `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |
 | `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, priority hierarchy, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
-| `src/formatter.rs` | Message template placeholder interpolation and line-level attribute/heading parser |
+| `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, and line-level attribute/heading parser |
 | `src/autostart.rs` | Windows Registry (`HKCU\...\Run`) startup registration |
 | `ui/settings.slint` | Settings window, sidebar navigation, 5-section rule editor, and interactive 7×24 schedule matrix |
 | `ui/overlay.slint` | Full-screen break enforcer, HUD toast, HUD grace countdown timer, and 24-hour screen time histogram cards |
-| `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component |
+| `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component with alignment-aware text underlines |
 | `ui/executable_selector.slint` | Executable chip list, file browser trigger, and running process selector |
 | `ui/duration_input.slint` | Reusable numeric value + `Hr`/`Min`/`Sec` unit selector |
 | `ui/schedule_grid.slint` | Interactive weekly schedule matrix with click-and-drag painting and presets |

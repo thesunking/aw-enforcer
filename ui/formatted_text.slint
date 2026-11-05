@@ -31,10 +31,15 @@ export component FormattedText inherits VerticalLayout {
             wrap: word-wrap;
             width: 100%;
         }
-        if para.underline : Rectangle {
-            width: 100%;
+        if para.underline && para.text != "\u{00A0}" : Rectangle {
             height: 1.5px;
-            background: para.color.with-alpha(0.65);
+            width: 100%;
+            Rectangle {
+                width: Math.min(txt.preferred-width, parent.width);
+                x: para.alignment == TextAlignment.center ? (parent.width - self.width) / 2 : (para.alignment == TextAlignment.right ? parent.width - self.width : 0px);
+                height: 1.5px;
+                background: para.color.with-alpha(0.65);
+            }
         }
     }
 }

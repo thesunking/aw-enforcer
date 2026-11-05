@@ -4917,6 +4917,7 @@ mod tests {
         rule.id = "rule-test-preview".to_string();
         rule.name = "Test Preview Rule".to_string();
         rule.action = RuleAction::CloseWindow;
+        rule.warn_before = DurationConfig::new(0, TimeUnit::Sec);
         rule.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
         rule.message = "Closing {app} in {remaining}!".to_string();
         rule.monitor_selection = MonitorSelection::Urls;
@@ -4932,7 +4933,7 @@ mod tests {
             assert_eq!(*remaining_seconds, 5);
             assert_eq!(paragraphs.len(), 1);
             assert!(paragraphs[0].text.contains("youtube.com"));
-            assert!(paragraphs[0].text.contains("5m"));
+            assert!(paragraphs[0].text.contains("5s"));
         } else {
             panic!("Expected HudTimer mode for CloseWindow preview with grace_duration > 0");
         }
@@ -6365,6 +6366,7 @@ mod tests {
         let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
         let aw_client = Arc::new(AwClient::new(5600, ""));
         let mut cfg = AppConfig::default();
+        cfg.general.poll_interval_seconds = 3600;
 
         let mut rule_zero_grace = Rule::default_template(0);
         rule_zero_grace.id = "rule-lock-zero".to_string();

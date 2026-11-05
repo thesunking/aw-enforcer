@@ -89,8 +89,11 @@ pub struct MessageContext {
 pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
     let threshold_secs = rule.trigger_threshold_seconds().max(1);
     let warn_secs = rule.warn_before.to_seconds();
+    let grace_secs = rule.grace_duration.to_seconds();
     let rem_secs = if warn_secs > 0 {
         warn_secs.min(threshold_secs)
+    } else if grace_secs > 0 {
+        grace_secs.min(threshold_secs)
     } else {
         300.min(threshold_secs)
     };
@@ -122,13 +125,28 @@ pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
         rule.name.trim().to_string()
     };
 
+    let (session_duration, limit) = match rule.trigger {
+        crate::config::TriggerType::Period => {
+            let lim = if rule.limit.to_seconds() == 0 {
+                rule.period.to_short_string()
+            } else {
+                rule.limit.to_short_string()
+            };
+            (rule.period.to_short_string(), lim)
+        }
+        crate::config::TriggerType::Limit => (
+            format_seconds_human(used_secs),
+            rule.limit.to_short_string(),
+        ),
+    };
+
     MessageContext {
         rule_name,
-        session_duration: rule.period.to_short_string(),
+        session_duration,
         break_time: rule.break_duration.to_short_string(),
         app,
         used: format_seconds_human(used_secs),
-        limit: rule.limit.to_short_string(),
+        limit,
         remaining: format_seconds_human(rem_secs),
     }
 }
@@ -533,13 +551,13 @@ fn toggle_attr(line: &str, attr: &str) -> String {
         let mut tokens: Vec<String> =
             inner.split_whitespace().map(|s| s.to_string()).collect();
 
-        if let Some(pos) = tokens.iter().position(|t| t == attr) {
+        if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case(attr)) {
             tokens.remove(pos);
         } else {
-            if attr.starts_with("color=") {
-                tokens.retain(|t| !t.starts_with("color="));
-            } else if attr.starts_with("size=") {
-                tokens.retain(|t| !t.starts_with("size="));
+            if attr.to_ascii_lowercase().starts_with("color=") {
+                tokens.retain(|t| !t.to_ascii_lowercase().starts_with("color="));
+            } else if attr.to_ascii_lowercase().starts_with("size=") {
+                tokens.retain(|t| !t.to_ascii_lowercase().starts_with("size="));
             }
             tokens.push(attr.to_string());
         }
@@ -862,10 +880,39 @@ mod tests {
         assert_eq!(ctx.remaining, "20m"); // clamped to threshold 1200s
         assert_eq!(ctx.used, "0s"); // 1200 - 1200 = 0
 
+        rule.limit = DurationConfig::new(0, TimeUnit::Sec);
         rule.warn_before = DurationConfig::new(0, TimeUnit::Min);
         let ctx2 = build_preview_context(&rule);
         assert_eq!(ctx2.remaining, "5m"); // fallback 300s
         assert_eq!(ctx2.used, "15m"); // 20m - 5m = 15m
+        assert_eq!(ctx2.session_duration, "20m");
+        assert_eq!(ctx2.limit, "20m"); // limit falls back to period when limit == 0
+
+        rule.grace_duration = DurationConfig::new(30, TimeUnit::Sec);
+        let ctx3 = build_preview_context(&rule);
+        assert_eq!(ctx3.remaining, "30s"); // uses configured grace_duration
+        assert_eq!(ctx3.used, "19m 30s"); // 20m - 30s = 19m 30s
+
+        let mut limit_rule = Rule::default_template(0);
+        limit_rule.trigger = TriggerType::Limit;
+        limit_rule.limit = DurationConfig::new(2, TimeUnit::Hr);
+        limit_rule.warn_before = DurationConfig::new(15, TimeUnit::Min);
+        let ctx_limit = build_preview_context(&limit_rule);
+        assert_eq!(ctx_limit.limit, "2h");
+        assert_eq!(ctx_limit.remaining, "15m");
+        assert_eq!(ctx_limit.used, "1h 45m");
+        assert_eq!(ctx_limit.session_duration, "1h 45m");
+    }
+
+    #[test]
+    fn test_toggle_attr_case_insensitive_hex_color() {
+        let line = "[color=#38bdf8] Hello";
+        let toggled_off = apply_line_style(line, 0, "color=#38BDF8");
+        assert_eq!(toggled_off, "Hello");
+
+        let line_upper = "[color=#38BDF8] World";
+        let toggled_off_lower = apply_line_style(line_upper, 0, "color=#38bdf8");
+        assert_eq!(toggled_off_lower, "World");
     }
 
     #[test]
