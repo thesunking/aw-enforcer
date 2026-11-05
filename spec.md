@@ -422,13 +422,15 @@ graph LR
 | **Offline Network Overhead** | 1 HTTP Request / tick | Pre-poll bucket verification eliminates query flooding when server is down |
 | **Window Scanning Overhead** | $< 1.5\text{ ms} / \text{scan}$ | Zero-allocation UTF-16 shell checks + per-pass `pid_cache`. Lazy window scanning skips Win32 `EnumWindows` scans entirely during `evaluate_rule` until a rule reaches its Stage 1 warning or Stage 2 trigger threshold. |
 | **Histogram Binning Overhead** | $O(N \log N + B)$ | Single-pass interval coalescing merges $N$ telemetry events once via `events_to_merged_intervals` before bin assignment, reducing per-bin computation from $O(B \cdot N \log N)$ to $O(N \log N + B)$. |
+| **Interval Intersection** | $O(\log N)$ | `compute_overlap_from_merged_intervals` and `filter_web_events_by_active_browser_windows` use binary search (`partition_point`) on pre-merged sorted interval slices to skip non-overlapping historical spans and break immediately upon exceeding range bounds. |
+| **Poll Cycle Interval Reuse** | Single-pass merge | Step 5 of `poll_tick` merges `all_events` into `merged_all_intervals` once, reusing the pre-merged slice for both `total_today_secs` telemetry and `refresh_stats_overlay_from_events` without duplicate sorting or allocation. |
 
 ---
 
 ## 9. Verification & Test Plan
 
 The application maintains comprehensive test coverage across all domain components:
-- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion.
+- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion, binary-searched partition point behavior, and boundary edge cases across large datasets.
 - **Rule Lifecycle & State Machine Tests (`src/engine.rs`):** Invariant testing for Stage 1/2/3 triggers, grace countdown rollbacks, snooze timestamps, and strict mode command rejections.
 - **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.
 - **Format & String Interpolation Tests (`src/formatter.rs`):** Verifies single-pass template parsing, placeholder injection immunity, and Markdown tag stripping for Windows Action Center toasts.

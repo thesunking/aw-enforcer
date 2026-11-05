@@ -72,13 +72,11 @@ pub fn compute_overlap_from_merged_intervals(
         return 0.0;
     }
 
+    let start_idx = merged_intervals.partition_point(|&(_, i_end)| i_end <= start_utc);
     let mut total_ms = 0i64;
-    for (i_start, i_end) in merged_intervals {
+    for (i_start, i_end) in &merged_intervals[start_idx..] {
         if *i_start >= end_utc {
             break;
-        }
-        if *i_end <= start_utc {
-            continue;
         }
         let s = (*i_start).max(start_utc);
         let e = (*i_end).min(end_utc);
@@ -142,7 +140,11 @@ pub fn filter_web_events_by_active_browser_windows(
             continue;
         }
 
-        for &(b_start, b_end) in &browser_intervals {
+        let start_idx = browser_intervals.partition_point(|&(_, b_end)| b_end <= w_start);
+        for &(b_start, b_end) in &browser_intervals[start_idx..] {
+            if b_start >= w_end {
+                break;
+            }
             let overlap_start = w_start.max(b_start);
             let overlap_end = w_end.min(b_end);
             if overlap_end > overlap_start {
@@ -1453,7 +1455,8 @@ impl Engine {
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
         let max_session_secs = self.runtimes.values().map(|rt| rt.current_session_seconds).max().unwrap_or(0);
 
-        let total_today_secs = compute_coalesced_overlap_seconds(&all_events, start_of_day_utc, now_utc);
+        let merged_all_intervals = events_to_merged_intervals(&all_events);
+        let total_today_secs = compute_overlap_from_merged_intervals(&merged_all_intervals, start_of_day_utc, now_utc);
         let total_today_mins = (total_today_secs / 60.0).round() as u32;
 
         let active_app = all_events
@@ -1568,7 +1571,7 @@ impl Engine {
             .ok();
 
         // 6. Live-refresh the 24-Hour Statistics HUD if currently open (reusing all_events without extra AW queries)
-        self.refresh_stats_overlay_from_events(now, &all_events);
+        self.refresh_stats_overlay_from_events(now, &merged_all_intervals);
     }
 
     /// Returns the effective template message for a rule, falling back to canonical defaults if empty.
@@ -2241,8 +2244,12 @@ impl Engine {
         })
     }
 
-    /// Incrementally updates the open 24-Hour Statistics HUD using the `events` already fetched by `poll_tick`.
-    fn refresh_stats_overlay_from_events(&mut self, now: DateTime<Local>, events: &[AwEvent]) {
+    /// Incrementally updates the open 24-Hour Statistics HUD using the `merged_intervals` already merged by `poll_tick`.
+    fn refresh_stats_overlay_from_events(
+        &mut self,
+        now: DateTime<Local>,
+        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+    ) {
         if !matches!(
             self.active_overlay_mode,
             OverlayMode::HudStatus {
@@ -2260,8 +2267,6 @@ impl Engine {
         let Some(ref mut cache) = self.stats_cache else {
             return;
         };
-
-        let merged_intervals = events_to_merged_intervals(events);
 
         if cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins {
             cache.bin_seconds.resize(bin_count, 0.0);
@@ -2285,7 +2290,7 @@ impl Engine {
                 let bin_idx = (bin_count as isize) - 1 - (elapsed_bins as isize) + (i as isize);
                 if bin_idx >= 0 && (bin_idx as usize) < bin_count {
                     let secs =
-                        compute_overlap_from_merged_intervals(&merged_intervals, b_start_utc, b_end_utc) as f32;
+                        compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc) as f32;
                     cache.bin_seconds[bin_idx as usize] = secs;
                 }
             }
@@ -2295,7 +2300,7 @@ impl Engine {
         let cur_start_utc = cache.current_bin_start.with_timezone(&Utc);
         let cur_end_utc =
             (cache.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-        let cur_secs = compute_overlap_from_merged_intervals(&merged_intervals, cur_start_utc, cur_end_utc) as f32;
+        let cur_secs = compute_overlap_from_merged_intervals(merged_intervals, cur_start_utc, cur_end_utc) as f32;
         if let Some(last) = cache.bin_seconds.last_mut() {
             *last = cur_secs;
         }
@@ -3166,7 +3171,7 @@ mod tests {
         // 1. Same-bin live update at 14:15:00 with 600s of activity in 14:00..14:15
         let now1 = Local.with_ymd_and_hms(2026, 10, 30, 14, 15, 0).unwrap();
         let ev1 = vec![make_event(bin_start.with_timezone(&Utc), 600.0, "code.exe", "VS Code", "")];
-        engine.refresh_stats_overlay_from_events(now1, &ev1);
+        engine.refresh_stats_overlay_from_events(now1, &events_to_merged_intervals(&ev1));
 
         match &engine.active_overlay_mode {
             OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
@@ -3185,7 +3190,7 @@ mod tests {
             make_event(bin_start.with_timezone(&Utc), 1800.0, "code.exe", "VS Code", ""),
             make_event(next_bin_start.with_timezone(&Utc), 180.0, "code.exe", "VS Code", ""),
         ];
-        engine.refresh_stats_overlay_from_events(now2, &ev2);
+        engine.refresh_stats_overlay_from_events(now2, &events_to_merged_intervals(&ev2));
 
         match &engine.active_overlay_mode {
             OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
@@ -3209,7 +3214,7 @@ mod tests {
             make_event(bin_16.with_timezone(&Utc), 900.0, "code.exe", "VS Code", ""),
             make_event(bin_17.with_timezone(&Utc), 300.0, "code.exe", "VS Code", ""),
         ];
-        engine.refresh_stats_overlay_from_events(now3, &ev3);
+        engine.refresh_stats_overlay_from_events(now3, &events_to_merged_intervals(&ev3));
 
         match &engine.active_overlay_mode {
             OverlayMode::HudStatus { bin_values, total_active_minutes, is_loading, .. } => {
@@ -3673,6 +3678,82 @@ mod tests {
                 "Mismatch at bin [{b_start}, {b_end}]: expected {expected}, got {actual}"
             );
         }
+    }
+
+    #[test]
+    fn test_compute_overlap_from_merged_intervals_large_dataset_and_boundaries() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 8, 0, 0).unwrap();
+        // 100 intervals: [base + 20*i min, base + 20*i + 10 min] (10 min active, 10 min gap)
+        let mut intervals = Vec::new();
+        for i in 0..100 {
+            let start = base_time + Duration::minutes(i * 20);
+            let end = start + Duration::minutes(10);
+            intervals.push((start, end));
+        }
+
+        // 1. Boundary: start_utc >= end_utc returns 0.0
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, base_time, base_time),
+            0.0
+        );
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, base_time + Duration::minutes(10), base_time),
+            0.0
+        );
+
+        // 2. Boundary: empty intervals returns 0.0
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&[], base_time, base_time + Duration::hours(1)),
+            0.0
+        );
+
+        // 3. Query range strictly before all intervals
+        let q_before_start = base_time - Duration::hours(5);
+        let q_before_end = base_time - Duration::seconds(1);
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, q_before_start, q_before_end),
+            0.0
+        );
+
+        // 4. Query range strictly after all intervals
+        let last_end = intervals.last().unwrap().1;
+        let q_after_start = last_end + Duration::seconds(1);
+        let q_after_end = last_end + Duration::hours(2);
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, q_after_start, q_after_end),
+            0.0
+        );
+
+        // 5. Query range entirely within a gap between interval 0 and 1
+        let gap_start = base_time + Duration::minutes(11);
+        let gap_end = base_time + Duration::minutes(19);
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, gap_start, gap_end),
+            0.0
+        );
+
+        // 6. Query range exactly matching one interval (interval 5)
+        let (int5_start, int5_end) = intervals[5];
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, int5_start, int5_end),
+            600.0
+        );
+
+        // 7. Query range touching exact boundaries: [int5_end, int6_start] (exact gap)
+        assert_eq!(
+            compute_overlap_from_merged_intervals(&intervals, int5_end, intervals[6].0),
+            0.0
+        );
+
+        // 8. Large span covering intervals 40..60 (20 full intervals of 600s = 12000s, plus partial edges)
+        // Interval 40: 800m..810m. We query from 805m (5 min overlap in int 40 = 300s)
+        // Interval 41..58: 18 intervals * 10 min = 180 min (10800s)
+        // Interval 59: 1180m..1190m. We query until 1185m (5 min overlap in int 59 = 300s)
+        // Total = 300 + 10800 + 300 = 11400s
+        let q_span_start = base_time + Duration::minutes(40 * 20 + 5);
+        let q_span_end = base_time + Duration::minutes(59 * 20 + 5);
+        let actual = compute_overlap_from_merged_intervals(&intervals, q_span_start, q_span_end);
+        assert_eq!(actual, 11400.0);
     }
 
     #[tokio::test]
@@ -5432,6 +5513,74 @@ mod tests {
         let win_ev = make_event(base_time, 600.0, "chrome.exe", "Google Chrome", "");
         let filtered = filter_web_events_by_active_browser_windows(&[], &[win_ev]);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_web_events_large_dataset_and_boundaries() {
+        let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 8, 0, 0).unwrap();
+        // 50 browser window events: [base + 20*i min, base + 20*i + 10 min] (10 min active Chrome, 10 min non-browser)
+        let mut win_events = Vec::new();
+        for i in 0..50 {
+            let start = base_time + Duration::minutes(i * 20);
+            win_events.push(make_event(start, 600.0, "chrome.exe", "Google Chrome", ""));
+        }
+
+        // Web event 1: Zero duration web event (boundary) -> skipped
+        let web_zero = make_event(base_time, 0.0, "", "Zero", "https://zero.com");
+
+        // Web event 2: Before all browser windows -> filtered out
+        let web_before = make_event(base_time - Duration::hours(1), 300.0, "", "Before", "https://before.com");
+
+        // Web event 3: After all browser windows -> filtered out
+        let last_end = base_time + Duration::minutes(49 * 20 + 10);
+        let web_after = make_event(last_end + Duration::minutes(5), 300.0, "", "After", "https://after.com");
+
+        // Web event 4: Entirely within non-browser gap (between window 2 and window 3)
+        // window 2 ends at 2*20 + 10 = 50m. Window 3 starts at 3*20 = 60m. Gap is 50m..60m.
+        let web_gap = make_event(base_time + Duration::minutes(52), 300.0, "", "Gap", "https://gap.com");
+
+        // Web event 5: Inside window 10 (starts at 10*20 = 200m, ends at 210m)
+        let web_inside = make_event(base_time + Duration::minutes(202), 180.0, "", "Inside", "https://inside.com");
+
+        // Web event 6: Spans across multiple windows (from window 25 middle to window 27 middle)
+        // Window 25: 500m..510m
+        // Window 26: 520m..530m
+        // Window 27: 540m..550m
+        // Web event: 505m..545m (spans 505..510 in W25, 520..530 in W26, 540..545 in W27)
+        let web_span = make_event(base_time + Duration::minutes(505), 40.0 * 60.0, "", "Span", "https://span.com");
+
+        let input_web = vec![web_zero, web_before, web_after, web_gap, web_inside, web_span];
+        let filtered = filter_web_events_by_active_browser_windows(&input_web, &win_events);
+
+        // Expected output:
+        // - web_zero: skipped
+        // - web_before: skipped
+        // - web_after: skipped
+        // - web_gap: skipped
+        // - web_inside: 1 clipped event (202m..205m, 180s)
+        // - web_span: 3 clipped events:
+        //    * 505m..510m (300s)
+        //    * 520m..530m (600s)
+        //    * 540m..545m (300s)
+        assert_eq!(filtered.len(), 4);
+
+        // Verify web_inside
+        assert_eq!(filtered[0].timestamp, base_time + Duration::minutes(202));
+        assert_eq!(filtered[0].duration, 180.0);
+        assert_eq!(filtered[0].data.url.as_deref(), Some("https://inside.com"));
+
+        // Verify web_span fragments
+        assert_eq!(filtered[1].timestamp, base_time + Duration::minutes(505));
+        assert_eq!(filtered[1].duration, 300.0);
+        assert_eq!(filtered[1].data.url.as_deref(), Some("https://span.com"));
+
+        assert_eq!(filtered[2].timestamp, base_time + Duration::minutes(520));
+        assert_eq!(filtered[2].duration, 600.0);
+        assert_eq!(filtered[2].data.url.as_deref(), Some("https://span.com"));
+
+        assert_eq!(filtered[3].timestamp, base_time + Duration::minutes(540));
+        assert_eq!(filtered[3].duration, 300.0);
+        assert_eq!(filtered[3].data.url.as_deref(), Some("https://span.com"));
     }
 
     #[tokio::test]

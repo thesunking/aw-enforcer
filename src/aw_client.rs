@@ -57,8 +57,18 @@ pub fn select_best_bucket<'a>(
     prefix: &str,
     buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
 ) -> Option<String> {
-    let local_hostname = std::env::var("COMPUTERNAME").ok();
+    select_best_bucket_with_hostname(
+        prefix,
+        std::env::var("COMPUTERNAME").ok().as_deref(),
+        buckets,
+    )
+}
 
+pub fn select_best_bucket_with_hostname<'a>(
+    prefix: &str,
+    local_hostname: Option<&str>,
+    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<String> {
     struct Candidate<'a> {
         key: &'a str,
         effective_time: Option<DateTime<Utc>>,
@@ -74,7 +84,7 @@ pub fn select_best_bucket<'a>(
             let created = parse_bucket_time(val, "created");
             let effective_time = last_updated.or(created);
 
-            let hostname_matches = if let Some(ref local_h) = local_hostname {
+            let hostname_matches = if let Some(local_h) = local_hostname {
                 val.get("hostname")
                     .and_then(|h| h.as_str())
                     .map_or(false, |h| h.eq_ignore_ascii_case(local_h))
@@ -607,8 +617,6 @@ mod tests {
 
     #[test]
     fn test_select_best_bucket_prefers_hostname_when_no_last_updated() {
-        std::env::set_var("COMPUTERNAME", "MY-LOCAL-PC");
-
         // Bucket A matches COMPUTERNAME but has an older created timestamp
         let val_matching = serde_json::json!({
             "hostname": "MY-LOCAL-PC",
@@ -625,7 +633,11 @@ mod tests {
             ("aw-watcher-window_MATCHING", &val_matching),
         ];
 
-        let selected = select_best_bucket("aw-watcher-window_", buckets);
+        let selected = select_best_bucket_with_hostname(
+            "aw-watcher-window_",
+            Some("MY-LOCAL-PC"),
+            buckets,
+        );
         assert_eq!(selected.as_deref(), Some("aw-watcher-window_MATCHING"));
     }
 
