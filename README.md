@@ -19,14 +19,14 @@
     - **`Show Overlay`:** Displays a full-screen break overlay across all monitors that counts down only while you are physically idle.
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card or a native `Windows` Action Center toast.
     - **`Show Statistics`:** Opens a 24-Hour Screen Time Summary HUD with an hourly activity histogram. Supports optional click-through mode (`click_through`) to interact with underlying windows while monitoring stats.
-    - **`Lock Workstation`:** Immediately locks the Windows session.
-    - **`Close Tab`:** Closes the active tab of the matching foreground window.
+    - **`Lock Workstation`:** Immediately locks the Windows session. Repeat triggers for `Limit` rules enforce a minimum 15-second grace period so users can save work or snooze after unlocking.
+    - **`Close Tab`:** Closes the active tab of the matching foreground window via synthesized `Ctrl+W`. Active tab closure strictly requires a matching foreground window to ensure background windows or unrelated applications are never sent keystrokes.
     - **`Close Window`:** Closes matching visible top-level windows (including minimized taskbar windows).
     - **`Kill Process`:** Terminates matching processes via ToolHelp snapshots, verifying running processes even when minimized or resident in the system tray.
 
 - **Three-Stage Enforcement Pipeline:**
   1. **Stage 1 — Pre-Action Warning:** Alerts you ahead of time (via HUD toast or native Windows Action Center notification) before a break or quota enforcement triggers. Supports custom formatted message templates across all rules.
-  2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. Window minimization does not bypass enforcement: `Close Window` closes minimized taskbar windows, `Kill Process` terminates background/tray targets, and `Lock Workstation` executes reliably regardless of active desktop state. Dismissing a destructive grace timer hides the banner without aborting enforcement (requiring `Snooze (5m)` to defer action).
+  2. **Stage 2 — Grace Countdown:** Displays a non-intrusive top-right `HudTimer` progress card counting down the final seconds so you can save your work. Window minimization does not bypass enforcement: `Close Window` closes minimized taskbar windows, `Kill Process` terminates background/tray targets, and `Lock Workstation` executes reliably regardless of active desktop state. Repeat executions of `Limit` + `Lock Workstation` enforce a minimum 15-second grace countdown to prevent immediate lock-out loops upon unlocking the workstation. Dismissing a destructive grace timer hides the banner without aborting enforcement (requiring `Snooze (5m)` to defer action).
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
   - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement (while warning/notification toasts can still be acknowledged and dismissed).
 

@@ -12,8 +12,8 @@ use windows_sys::Win32::System::Threading::{
 #[cfg(not(test))]
 use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_LMENU,
-    VK_LSHIFT, VK_MENU, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_LCONTROL,
+    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
@@ -526,43 +526,48 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
     killed_count
 }
 
-/// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
-/// returns true if Ctrl+W was sent.
-pub fn close_active_browser_tab<S: AsRef<str>>(
+/// Inspects the current foreground window (`GetForegroundWindow`).
+/// Returns `None` if the foreground window is protected, minimized, or does not match the target executables and/or compiled regex.
+/// Otherwise, returns `Some(window_title)` or `Some(process_name)`.
+pub fn find_matching_foreground_window<S: AsRef<str>>(
     target_executables: &[S],
     compiled_regex: Option<&Regex>,
-) -> bool {
+) -> Option<String> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if is_protected_foreground_window(hwnd) {
-            return false;
+            return None;
         }
 
         let has_wildcard = has_wildcard_target(target_executables);
         let has_exe_targets = has_specific_targets(target_executables);
 
-        let title_matches = if let Some(re) = compiled_regex {
-            let mut title_buf = [0u16; 512];
-            let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
-            if len > 0 {
-                let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-                re.is_match(&title)
-            } else {
-                false
-            }
-        } else {
-            false
+        let mut window_title = String::new();
+        let mut title_buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
+        if len > 0 {
+            window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
+        }
+
+        let title_matches = match compiled_regex {
+            Some(re) => !window_title.is_empty() && re.is_match(&window_title),
+            None => false,
         };
 
         if compiled_regex.is_some() && !title_matches {
-            return false;
+            return None;
         }
 
+        let mut matched_exe_name = None;
         let exe_matches = if has_exe_targets {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
             if let Some(exe_name) = get_process_name_by_pid(pid) {
-                exe_name_matches_targets(&exe_name, target_executables)
+                let matches = exe_name_matches_targets(&exe_name, target_executables);
+                if matches {
+                    matched_exe_name = Some(exe_name);
+                }
+                matches
             } else {
                 false
             }
@@ -578,6 +583,30 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
         };
 
         if matches {
+            if !window_title.is_empty() {
+                Some(window_title)
+            } else if let Some(exe) = matched_exe_name {
+                Some(exe)
+            } else {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                get_process_name_by_pid(pid).or_else(|| Some("foreground_window".to_string()))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
+/// returns true if Ctrl+W was sent.
+pub fn close_active_browser_tab<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+) -> bool {
+    if find_matching_foreground_window(target_executables, compiled_regex).is_some() {
+        unsafe {
+            let hwnd = GetForegroundWindow();
             let make_key = |vk: u16, flags: u32| INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
@@ -601,6 +630,8 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
                 make_key(b'W' as u16, 0),
                 make_key(b'W' as u16, KEYEVENTF_KEYUP),
                 make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+                make_key(VK_LCONTROL, KEYEVENTF_KEYUP),
+                make_key(VK_RCONTROL, KEYEVENTF_KEYUP),
             ];
             SendInput(
                 inputs.len() as u32,
@@ -623,6 +654,9 @@ mod tests {
         // Empty targets or empty title regex must safely return 0 without actions
         assert_eq!(close_target_windows::<&str>(&[], None), 0);
         assert!(!close_active_browser_tab::<&str>(&[], None));
+        assert!(find_matching_foreground_window::<&str>(&[], None).is_none());
+        assert!(find_matching_foreground_window::<&str>(&[""], None).is_none());
+        assert!(find_matching_foreground_window::<&str>(&["   "], None).is_none());
 
         // kill_target_processes must refuse to terminate on empty or wildcard targets
         assert_eq!(kill_target_processes::<&str>(&[]), 0);

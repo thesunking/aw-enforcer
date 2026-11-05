@@ -1212,7 +1212,11 @@ impl Engine {
                         .get(&rule.id)
                         .and_then(|r| r.last_matched_title_regex.as_ref());
                     if let Some(title_re) = maybe_title_re {
-                        enforcer::find_matching_window(enforcer::BROWSER_EXES, Some(title_re))
+                        if rule.action == RuleAction::CloseTab {
+                            enforcer::find_matching_foreground_window(enforcer::BROWSER_EXES, Some(title_re))
+                        } else {
+                            enforcer::find_matching_window(enforcer::BROWSER_EXES, Some(title_re))
+                        }
                     } else if matches!(rule.action, RuleAction::CloseTab | RuleAction::CloseWindow) {
                         None
                     } else {
@@ -1823,10 +1827,14 @@ impl Engine {
                     })
                     .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
                     .or_else(|| {
-                        events
-                            .iter()
-                            .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                        if rule.monitor_selection == MonitorSelection::Urls {
+                            None
+                        } else {
+                            events
+                                .iter()
+                                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                                .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                        }
                     });
 
                 if let Some(ev) = matching_ev {
@@ -1896,10 +1904,14 @@ impl Engine {
                 })
                 .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
                 .or_else(|| {
-                    events
-                        .iter()
-                        .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                    if rule.monitor_selection == MonitorSelection::Urls {
+                        None
+                    } else {
+                        events
+                            .iter()
+                            .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+                    }
                 });
 
             if let Some(ev) = matching_ev {
@@ -1971,8 +1983,14 @@ impl Engine {
                 return true;
             }
 
-            let effective_grace = if rule.trigger == TriggerType::Limit && already_executed && grace_secs > 0 {
-                grace_secs.min(5)
+            let effective_grace = if rule.trigger == TriggerType::Limit && already_executed {
+                if rule.action == RuleAction::LockWorkstation {
+                    grace_secs.max(15)
+                } else if grace_secs > 0 {
+                    grace_secs.min(5)
+                } else {
+                    0
+                }
             } else {
                 grace_secs
             };
@@ -2647,7 +2665,13 @@ pub fn find_matching_window_for_rule(
     poll_interval_secs: u64,
 ) -> Option<String> {
     match rule.monitor_selection {
-        MonitorSelection::Titles => enforcer::find_matching_window::<&str>(&[], compiled_re),
+        MonitorSelection::Titles => {
+            if rule.action == RuleAction::CloseTab {
+                enforcer::find_matching_foreground_window::<&str>(&[], compiled_re)
+            } else {
+                enforcer::find_matching_window::<&str>(&[], compiled_re)
+            }
+        }
         MonitorSelection::Urls => {
             if rule.action == RuleAction::CloseTab && !enforcer::is_foreground_browser() {
                 return None;
@@ -2699,6 +2723,8 @@ pub fn find_matching_window_for_rule(
                         .or(latest_app)
                         .or_else(|| Some("Active Application".to_string()))
                 }
+            } else if rule.action == RuleAction::CloseTab {
+                enforcer::find_matching_foreground_window(&rule.target_executables, None)
             } else {
                 let win = enforcer::find_matching_window(&rule.target_executables, None);
                 if win.is_none() && rule.action == RuleAction::KillProcess {
@@ -6136,5 +6162,128 @@ mod tests {
             }
             other => panic!("Expected HudStatus from execute_rule_action for ShowStatistics, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_urls_rule_does_not_populate_from_stale_events_outside_recency_cutoff() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-urls-stale".to_string();
+        rule.monitor_selection = MonitorSelection::Urls;
+        rule.action = RuleAction::CloseTab;
+        rule.url_regex = "(?i)youtube\\.com".to_string();
+        rule.limit = DurationConfig::new(10, TimeUnit::Hr);
+        rule.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // Stale event ended 2 hours ago (outside poll_interval recency cutoff)
+        let stale_ev = make_event(
+            now_utc - Duration::hours(2),
+            60.0,
+            "chrome.exe",
+            "Old Video - YouTube",
+            "https://www.youtube.com/watch?v=old",
+        );
+
+        let re = Regex::new(&rule.url_regex).ok();
+        engine
+            .evaluate_rule(
+                &rule,
+                re.as_ref(),
+                now,
+                &[stale_ev],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt = engine.runtimes.get("rule-urls-stale").unwrap();
+        assert_eq!(rt.last_matched_url, None, "Stale URL event outside recency_cutoff must not populate last_matched_url");
+        assert_eq!(rt.last_matched_title, None, "Stale URL event outside recency_cutoff must not populate last_matched_title");
+    }
+
+    #[tokio::test]
+    async fn test_limit_lock_workstation_repeat_execution_enforces_15s_min_grace() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule_zero_grace = Rule::default_template(0);
+        rule_zero_grace.id = "rule-lock-zero".to_string();
+        rule_zero_grace.action = RuleAction::LockWorkstation;
+        rule_zero_grace.trigger = TriggerType::Limit;
+        rule_zero_grace.limit = DurationConfig::new(1, TimeUnit::Hr);
+        rule_zero_grace.grace_duration = DurationConfig::new(0, TimeUnit::Sec);
+
+        let mut rule_long_grace = Rule::default_template(1);
+        rule_long_grace.id = "rule-lock-long".to_string();
+        rule_long_grace.action = RuleAction::LockWorkstation;
+        rule_long_grace.trigger = TriggerType::Limit;
+        rule_long_grace.limit = DurationConfig::new(1, TimeUnit::Hr);
+        rule_long_grace.grace_duration = DurationConfig::new(30, TimeUnit::Sec);
+
+        cfg.rules = vec![rule_zero_grace.clone(), rule_long_grace.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        let ev = make_event(
+            now_utc - Duration::hours(2),
+            7200.0,
+            "work.exe",
+            "Working",
+            "",
+        );
+
+        // Case A: rule_zero_grace with already_executed = true
+        engine.runtimes.get_mut("rule-lock-zero").unwrap().action_executed_today = true;
+        engine
+            .evaluate_rule(
+                &rule_zero_grace,
+                None,
+                now,
+                &[ev.clone()],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_zero = engine.runtimes.get("rule-lock-zero").unwrap();
+        assert_eq!(
+            rt_zero.grace_countdown,
+            Some((15, 15)),
+            "Zero-grace LockWorkstation repeat execution must enforce 15s minimum grace"
+        );
+
+        // Case B: rule_long_grace with already_executed = true
+        engine.runtimes.get_mut("rule-lock-long").unwrap().action_executed_today = true;
+        engine
+            .evaluate_rule(
+                &rule_long_grace,
+                None,
+                now,
+                &[ev.clone()],
+                start_of_day_utc,
+                now_utc,
+            )
+            .await;
+
+        let rt_long = engine.runtimes.get("rule-lock-long").unwrap();
+        assert_eq!(
+            rt_long.grace_countdown,
+            Some((30, 30)),
+            "Longer grace duration (30s) must not be clamped down on LockWorkstation repeat execution"
+        );
     }
 }
