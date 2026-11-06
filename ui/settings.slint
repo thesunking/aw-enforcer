@@ -618,6 +618,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.aw-port;
                                 minimum: 1;
                                 maximum: 65535;
+                                enabled: !root.ui-locked-by-strict;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -629,6 +630,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.poll-interval-seconds;
                                 minimum: 2;
                                 maximum: 120;
+                                enabled: !root.ui-locked-by-strict;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -639,6 +641,7 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 checked <=> root.autostart;
                                 text: "Launch minimized to system tray on login";
+                                enabled: !root.ui-locked-by-strict;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -649,6 +652,7 @@ export component SettingsWindow inherits Window {
                             LineEdit {
                                 text <=> root.api-key;
                                 placeholder-text: "Optional Bearer auth token";
+                                enabled: !root.ui-locked-by-strict;
                                 edited(val) => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -661,6 +665,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.day-start-hour;
                                 minimum: 0;
                                 maximum: 23;
+                                enabled: !root.ui-locked-by-strict;
                                 edited(val) => {
                                     root.has-unsaved-changes = true;
                                 }
@@ -673,6 +678,7 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 text: "Downgrade breaks during fullscreen apps & presentations";
                                 checked <=> root.suppress-fullscreen-d3d;
+                                enabled: !root.ui-locked-by-strict;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -711,6 +717,7 @@ export component SettingsWindow inherits Window {
                                     width: 280px;
                                     model: ["OpenGL (renderer-femtovg)", "CPU Software (renderer-software)"];
                                     current-value <=> root.slint-renderer-display;
+                                    enabled: !root.ui-locked-by-strict;
                                     selected(val) => {
                                         if val == "CPU Software (renderer-software)" {
                                             root.slint-renderer = "software";
@@ -736,6 +743,7 @@ export component SettingsWindow inherits Window {
                             CheckBox {
                                 text: "Release GPU surfaces and memory when windows are closed or hidden";
                                 checked <=> root.destroy-windows-on-hide;
+                                enabled: !root.ui-locked-by-strict;
                                 toggled => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -759,6 +767,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.overlay-opacity;
                                 minimum: 0.1;
                                 maximum: 1.0;
+                                enabled: !root.ui-locked-by-strict;
                                 changed(val) => {
                                     root.has-unsaved-changes = true;
                                 }
@@ -775,6 +784,7 @@ export component SettingsWindow inherits Window {
                                     width: 160px;
                                     text <=> root.accent-color-hex;
                                     placeholder-text: "#3b82f6";
+                                    enabled: !root.ui-locked-by-strict;
                                     edited(val) => {
                                         root.has-unsaved-changes = true;
                                         root.color-hex-edited("accent", val);
@@ -801,6 +811,7 @@ export component SettingsWindow inherits Window {
                                     width: 160px;
                                     text <=> root.background-color-hex;
                                     placeholder-text: "#0f172a";
+                                    enabled: !root.ui-locked-by-strict;
                                     edited(val) => {
                                         root.has-unsaved-changes = true;
                                         root.color-hex-edited("background", val);
@@ -827,6 +838,7 @@ export component SettingsWindow inherits Window {
                                     width: 160px;
                                     text <=> root.text-color-hex;
                                     placeholder-text: "#f8fafc";
+                                    enabled: !root.ui-locked-by-strict;
                                     edited(val) => {
                                         root.has-unsaved-changes = true;
                                         root.color-hex-edited("text", val);
@@ -883,6 +895,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.daily-target-minutes;
                                 minimum: 1;
                                 maximum: 1440;
+                                enabled: !root.ui-locked-by-strict;
                                 edited(val) => {
                                     root.has-unsaved-changes = true;
                                     if root.threshold-excessive-minutes < val {
@@ -899,6 +912,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.threshold-excessive-minutes;
                                 minimum: root.daily-target-minutes;
                                 maximum: 1440;
+                                enabled: !root.ui-locked-by-strict;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -910,6 +924,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.histogram-bin-size-minutes;
                                 minimum: 1;
                                 maximum: 1440;
+                                enabled: !root.ui-locked-by-strict;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -921,6 +936,7 @@ export component SettingsWindow inherits Window {
                                 value <=> root.histogram-bin-count;
                                 minimum: 1;
                                 maximum: 96;
+                                enabled: !root.ui-locked-by-strict;
                                 edited => { root.has-unsaved-changes = true; }
                             }
                         }
@@ -930,6 +946,7 @@ export component SettingsWindow inherits Window {
                             label-width: 220px;
                             LineEdit {
                                 text <=> root.time-format-code;
+                                enabled: !root.ui-locked-by-strict;
                                 edited(val) => {
                                     root.validate-time-format(val);
                                     root.has-unsaved-changes = true;
@@ -1252,7 +1269,7 @@ export component SettingsWindow inherits Window {
 
                                     Button {
                                         text: "Snooze 15m";
-                                        enabled: !root.ui-locked-by-strict;
+                                        enabled: !root.ui-locked-by-strict && r.enabled && !r.strict-mode;
                                         clicked => {
                                             root.snooze-rule(i, 15);
                                         }
@@ -1260,7 +1277,7 @@ export component SettingsWindow inherits Window {
 
                                     Button {
                                         text: "Reset Timer";
-                                        enabled: !root.ui-locked-by-strict;
+                                        enabled: !root.strict-lock-active && r.enabled;
                                         clicked => {
                                             root.reset-rule-session(i);
                                         }
@@ -1345,7 +1362,7 @@ export component SettingsWindow inherits Window {
 
                                 Button {
                                     text: "Snooze 15m";
-                                    enabled: !root.ui-locked-by-strict;
+                                    enabled: !root.ui-locked-by-strict && root.rule-enabled && !root.rule-strict-mode;
                                     clicked => {
                                         root.snooze-rule(root.selected-rule-idx, 15);
                                     }
@@ -1353,7 +1370,7 @@ export component SettingsWindow inherits Window {
 
                                 Button {
                                     text: "Reset Timer";
-                                    enabled: !root.ui-locked-by-strict;
+                                    enabled: !root.strict-lock-active && root.rule-enabled;
                                     clicked => {
                                         root.reset-rule-session(root.selected-rule-idx);
                                     }
