@@ -292,6 +292,55 @@ impl RuleSchedule {
             sun: day_str(6),
         }
     }
+
+    /// Returns a pre-configured `RuleSchedule` for known preset names, or `None` if unrecognized.
+    /// - `"select_all"`: All days and hours active.
+    /// - `"clear"`: All days and hours inactive.
+    /// - `"work_hours"`: Monday-Friday 09:00 - 17:59 active, weekends inactive.
+    /// - `"evenings"`: Monday-Friday 18:00 - 23:59 active, weekends 08:00 - 23:59 active.
+    /// - `"weekends"`: Monday-Friday completely inactive, Saturday-Sunday active all 24 hours.
+    pub fn from_preset(preset: &str) -> Option<Self> {
+        match preset {
+            "select_all" => Some(Self {
+                mon: "111111111111111111111111".to_string(),
+                tue: "111111111111111111111111".to_string(),
+                wed: "111111111111111111111111".to_string(),
+                thu: "111111111111111111111111".to_string(),
+                fri: "111111111111111111111111".to_string(),
+                sat: "111111111111111111111111".to_string(),
+                sun: "111111111111111111111111".to_string(),
+            }),
+            "clear" => Some(Self {
+                mon: "000000000000000000000000".to_string(),
+                tue: "000000000000000000000000".to_string(),
+                wed: "000000000000000000000000".to_string(),
+                thu: "000000000000000000000000".to_string(),
+                fri: "000000000000000000000000".to_string(),
+                sat: "000000000000000000000000".to_string(),
+                sun: "000000000000000000000000".to_string(),
+            }),
+            "work_hours" => Some(Self::default()),
+            "evenings" => Some(Self {
+                mon: "000000000000000000111111".to_string(),
+                tue: "000000000000000000111111".to_string(),
+                wed: "000000000000000000111111".to_string(),
+                thu: "000000000000000000111111".to_string(),
+                fri: "000000000000000000111111".to_string(),
+                sat: "000000001111111111111111".to_string(),
+                sun: "000000001111111111111111".to_string(),
+            }),
+            "weekends" => Some(Self {
+                mon: "000000000000000000000000".to_string(),
+                tue: "000000000000000000000000".to_string(),
+                wed: "000000000000000000000000".to_string(),
+                thu: "000000000000000000000000".to_string(),
+                fri: "000000000000000000000000".to_string(),
+                sat: "111111111111111111111111".to_string(),
+                sun: "111111111111111111111111".to_string(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Serde default helper for continuous active period (50 minutes).
@@ -1158,6 +1207,72 @@ mod tests {
         assert_eq!(rule.schedule.thu, "111111111111111111111111");
         assert!(rule.schedule.mon.chars().all(|c| c == '0' || c == '1'));
         assert!(rule.schedule.tue.chars().all(|c| c == '0' || c == '1'));
+    }
+
+    /// Verifies `RuleSchedule::from_preset` for all preset names and invalid inputs.
+    #[test]
+    fn test_rule_schedule_presets() {
+        // 1. work_hours
+        let work = RuleSchedule::from_preset("work_hours").expect("work_hours preset should exist");
+        assert_eq!(work.mon, "000000000111111111000000");
+        assert_eq!(work.tue, "000000000111111111000000");
+        assert_eq!(work.wed, "000000000111111111000000");
+        assert_eq!(work.thu, "000000000111111111000000");
+        assert_eq!(work.fri, "000000000111111111000000");
+        assert_eq!(work.sat, "000000000000000000000000");
+        assert_eq!(work.sun, "000000000000000000000000");
+        assert!(work.is_active(0, 9));
+        assert!(work.is_active(4, 17));
+        assert!(!work.is_active(0, 8));
+        assert!(!work.is_active(5, 12));
+
+        // 2. evenings
+        let evenings = RuleSchedule::from_preset("evenings").expect("evenings preset should exist");
+        assert_eq!(evenings.mon, "000000000000000000111111");
+        assert_eq!(evenings.fri, "000000000000000000111111");
+        assert_eq!(evenings.sat, "000000001111111111111111");
+        assert_eq!(evenings.sun, "000000001111111111111111");
+        assert!(!evenings.is_active(0, 17));
+        assert!(evenings.is_active(0, 18));
+        assert!(evenings.is_active(5, 8));
+        assert!(!evenings.is_active(5, 7));
+
+        // 3. weekends
+        let weekends = RuleSchedule::from_preset("weekends").expect("weekends preset should exist");
+        assert_eq!(weekends.mon, "000000000000000000000000");
+        assert_eq!(weekends.tue, "000000000000000000000000");
+        assert_eq!(weekends.wed, "000000000000000000000000");
+        assert_eq!(weekends.thu, "000000000000000000000000");
+        assert_eq!(weekends.fri, "000000000000000000000000");
+        assert_eq!(weekends.sat, "111111111111111111111111");
+        assert_eq!(weekends.sun, "111111111111111111111111");
+        for d in 0..5 {
+            for h in 0..24 {
+                assert!(!weekends.is_active(d, h));
+            }
+        }
+        for d in 5..7 {
+            for h in 0..24 {
+                assert!(weekends.is_active(d, h));
+            }
+        }
+
+        // 4. select_all
+        let all = RuleSchedule::from_preset("select_all").expect("select_all preset should exist");
+        assert_eq!(all.mon, "111111111111111111111111");
+        assert_eq!(all.sat, "111111111111111111111111");
+        let all_slots = all.to_bool_array();
+        assert!(all_slots.iter().all(|&b| b));
+
+        // 5. clear
+        let clear = RuleSchedule::from_preset("clear").expect("clear preset should exist");
+        assert_eq!(clear.mon, "000000000000000000000000");
+        assert_eq!(clear.sat, "000000000000000000000000");
+        let clear_slots = clear.to_bool_array();
+        assert!(clear_slots.iter().all(|&b| !b));
+
+        // Unknown preset returns None
+        assert!(RuleSchedule::from_preset("invalid_preset").is_none());
     }
 
     /// Verifies duplicate, empty, and "test_*" rule id deduplication in `sanitize_rules()`.

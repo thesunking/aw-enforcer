@@ -96,6 +96,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 - **Pattern Validation for Titles & URLs:** Rules with `Titles` or `Urls` monitoring require a non-empty, valid regular expression pattern. Empty or whitespace-only patterns are rejected with an inline error in the editor and prevent saving until a valid regex is provided.
 - **Global Session & Telemetry Accuracy:** Live status and system tray tooltip session telemetry track continuous active screen time walking backward across merged activity intervals with a 5-minute AFK reset gap, providing continuous session metrics even when only `Limit` rules are configured or `Period` rules are snoozed.
 - **Sub-Minute Snooze Badge Precision:** Live telemetry and rule overview status badges report remaining snooze durations with second-level precision (`Snoozed (Xs)`) when under 1 minute, and ceiling-rounded minute precision (`Snoozed (Xm)`) when 1 minute or greater.
+- **Schedule Matrix Presets & Alignment:** Interactive 7×24 weekly schedule grid with pixel-exact hour row alignment and one-click presets via `RuleSchedule::from_preset`: "Work Hours (M-F 9-5)", "Evenings", "Weekends", "Select All", and "Clear All".
 
 ---
 

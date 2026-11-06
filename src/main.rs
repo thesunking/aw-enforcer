@@ -1391,35 +1391,8 @@ fn open_settings_window(
                 }
             }
             update_rule_schedule(&rm, &sw, rule_idx, |slots| {
-                match preset.as_str() {
-                    "select_all" => {
-                        slots.fill(true);
-                    }
-                    "work_hours" => {
-                        slots.fill(false);
-                        for d in 0..5 {
-                            for h in 9..=17 {
-                                slots[d * 24 + h] = true;
-                            }
-                        }
-                    }
-                    "evenings" => {
-                        slots.fill(false);
-                        for d in 0..5 {
-                            for h in 18..=23 {
-                                slots[d * 24 + h] = true;
-                            }
-                        }
-                        for d in 5..7 {
-                            for h in 8..=23 {
-                                slots[d * 24 + h] = true;
-                            }
-                        }
-                    }
-                    "clear" => {
-                        slots.fill(false);
-                    }
-                    _ => {}
+                if let Some(schedule) = RuleSchedule::from_preset(preset.as_str()) {
+                    slots.copy_from_slice(&schedule.to_bool_array());
                 }
             });
         });

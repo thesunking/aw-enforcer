@@ -44,6 +44,12 @@ export component ScheduleGrid inherits VerticalLayout {
         }
 
         Button {
+            text: "Weekends";
+            enabled: root.enabled;
+            clicked => { root.apply-preset("weekends"); }
+        }
+
+        Button {
             text: "Select All";
             enabled: root.enabled;
             clicked => { root.apply-preset("select_all"); }
@@ -103,7 +109,10 @@ export component ScheduleGrid inherits VerticalLayout {
             // Hour labels column (Left)
             VerticalLayout {
                 width: 45px;
+                height: 432px;
                 spacing: 2px;
+                padding-top: 1px;
+                padding-bottom: 1px;
 
                 for hour-name[h] in [
                     "00:00", "01:00", "02:00", "03:00", "04:00", "05:00",
@@ -135,6 +144,7 @@ export component ScheduleGrid inherits VerticalLayout {
 
             // Interactive 7x24 Matrix with Single TouchArea
             grid-container := Rectangle {
+                height: 432px;
                 clip: true;
                 border-radius: 4px;
                 border-width: 1px;
