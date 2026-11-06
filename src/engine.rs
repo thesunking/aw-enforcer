@@ -5255,6 +5255,7 @@ mod tests {
         rule.period = DurationConfig::new(50, TimeUnit::Min);
         rule.warn_before = DurationConfig::new(5, TimeUnit::Min);
         rule.reset_after_afk = DurationConfig::new(5, TimeUnit::Min);
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
 
         cfg.rules = vec![rule.clone()];
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
