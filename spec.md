@@ -406,6 +406,7 @@ graph LR
 - **Click-Through Support on Overlays & Statistics:** The `"Click-through Overlay:"` setting is exposed in Section 4 for both `Show Overlay` and `Show Statistics`, forwarding `rule.click_through` to Slint overlays and Win32 extended window styles (`WS_EX_TRANSPARENT`).
 - **Exposed Overlay & Histogram Properties:** General settings expose Hex color pickers (`accent_color`, `background_color`, `text_color`) and histogram discretization controls (`histogram_bin_size_minutes` [1–1440], `histogram_bin_count` [1–96]), clamped safely in `Config::sanitize()`.
 - **Global Session Telemetry & Limit Rules:** Live Status (Tab 2) and system tray tooltip session telemetry track the user's overall continuous active screen time via `calculate_continuous_session_from_merged` across all merged ActivityWatch intervals (`merged_all_intervals`), ensuring session duration is reported accurately even when the user only has daily `Limit` rules or app-specific rules configured, and snoozed `Period` rules continue updating `current_session_seconds` for telemetry.
+- **Snooze Status Badges & Sub-Minute Formatting:** Live Status (Tab 2) and rule overview badges format remaining snooze durations via `format_snooze_badge`, displaying `Snoozed (Xs)` when remaining time drops below 60 seconds and ceiling-rounded `Snoozed (Xm)` when 60 seconds or more, providing real-time countdown feedback as snoozes near expiration.
 
 ---
 

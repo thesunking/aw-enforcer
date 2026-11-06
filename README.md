@@ -95,6 +95,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 - **Rule ID Uniqueness:** Non-empty, unique rule IDs are strictly enforced; duplicate, empty, or `"test_*"` prefixed IDs are automatically assigned the next available `rule-{n}` identifier.
 - **Pattern Validation for Titles & URLs:** Rules with `Titles` or `Urls` monitoring require a non-empty, valid regular expression pattern. Empty or whitespace-only patterns are rejected with an inline error in the editor and prevent saving until a valid regex is provided.
 - **Global Session & Telemetry Accuracy:** Live status and system tray tooltip session telemetry track continuous active screen time walking backward across merged activity intervals with a 5-minute AFK reset gap, providing continuous session metrics even when only `Limit` rules are configured or `Period` rules are snoozed.
+- **Sub-Minute Snooze Badge Precision:** Live telemetry and rule overview status badges report remaining snooze durations with second-level precision (`Snoozed (Xs)`) when under 1 minute, and ceiling-rounded minute precision (`Snoozed (Xm)`) when 1 minute or greater.
 
 ---
 

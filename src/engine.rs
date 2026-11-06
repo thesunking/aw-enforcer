@@ -218,6 +218,17 @@ pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<
         .unwrap_or(now)
 }
 
+/// Formats a snooze expiration badge relative to `now`.
+/// Returns `"Snoozed (Xs)"` when remaining time is under 60 seconds, and `"Snoozed (Xm)"` when 60 seconds or more.
+pub fn format_snooze_badge(until: DateTime<Local>, now: DateTime<Local>) -> String {
+    let rem_secs = (until - now).num_seconds().max(0);
+    if rem_secs < 60 {
+        format!("Snoozed ({}s)", rem_secs)
+    } else {
+        format!("Snoozed ({}m)", (rem_secs + 59) / 60)
+    }
+}
+
 /// Aligns a timestamp down to the start of its current statistics histogram bin.
 fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
     let bin_size = bin_size_mins.max(1);
@@ -1501,11 +1512,9 @@ impl Engine {
             } else if !rule.schedule.is_active(day_index, hour_index) {
                 "Off-schedule".to_string()
             } else if let Some(until) = self.global_snoozed_until.filter(|&u| u > now) {
-                let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
-                format!("Snoozed ({}m)", rem_mins)
+                format_snooze_badge(until, now)
             } else if let Some(until) = rt.snoozed_until.filter(|&u| u > now) {
-                let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
-                format!("Snoozed ({}m)", rem_mins)
+                format_snooze_badge(until, now)
             } else if rule.trigger == TriggerType::Period {
                 format!(
                     "Session: {} / {}",
@@ -4485,16 +4494,15 @@ mod tests {
         engine.runtimes.get_mut("rule-2").unwrap().snoozed_until = Some(now + Duration::minutes(10));
 
         let rt2 = engine.runtimes.get("rule-2").unwrap();
-        let rem2 = ((rt2.snoozed_until.unwrap() - now).num_seconds().max(1) + 59) / 60;
-        let badge2 = format!("Snoozed ({}m)", rem2);
+        let badge2 = format_snooze_badge(rt2.snoozed_until.unwrap(), now);
         assert_eq!(badge2, "Snoozed (10m)");
 
         // Set global snooze for 15 minutes
         engine.global_snoozed_until = Some(now + Duration::minutes(15));
-        let rem_global = ((engine.global_snoozed_until.unwrap() - now).num_seconds().max(1) + 59) / 60;
-        let badge_global = format!("Snoozed ({}m)", rem_global);
+        let badge_global = format_snooze_badge(engine.global_snoozed_until.unwrap(), now);
         assert_eq!(badge_global, "Snoozed (15m)");
 
+        let rem_global = ((engine.global_snoozed_until.unwrap() - now).num_seconds().max(1) + 59) / 60;
         let tooltip = format!(
             "AW-Enforcer (Snoozed {}m) — Today: {}h {}m",
             rem_global, 2, 30
@@ -7001,5 +7009,24 @@ mod tests {
         engine.evaluate_rule(&rule_limit, None, now, &events, start_of_day_utc, now_utc, &merged_all).await;
         let rt_limit = engine.runtimes.get("rule-wildcard-limit").unwrap();
         assert_eq!(rt_limit.daily_usage_seconds, fast_limit_a);
+    }
+
+    #[test]
+    fn test_format_snooze_badge_sub_minute_and_multi_minute() {
+        let now = Local::now();
+
+        // < 60s remaining
+        assert_eq!(format_snooze_badge(now + Duration::seconds(0), now), "Snoozed (0s)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(1), now), "Snoozed (1s)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(30), now), "Snoozed (30s)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(59), now), "Snoozed (59s)");
+
+        // >= 60s remaining
+        assert_eq!(format_snooze_badge(now + Duration::seconds(60), now), "Snoozed (1m)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(61), now), "Snoozed (2m)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(119), now), "Snoozed (2m)");
+        assert_eq!(format_snooze_badge(now + Duration::seconds(120), now), "Snoozed (2m)");
+        assert_eq!(format_snooze_badge(now + Duration::minutes(5), now), "Snoozed (5m)");
+        assert_eq!(format_snooze_badge(now + Duration::minutes(15), now), "Snoozed (15m)");
     }
 }
