@@ -444,7 +444,7 @@ graph LR
 ## 9. Verification & Test Plan
 
 The application maintains comprehensive test coverage across all domain components:
-- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, `compute_coalesced_overlap_seconds`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion, binary-searched partition point behavior, and boundary edge cases across large datasets.
+- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion, binary-searched partition point behavior, and boundary edge cases across large datasets.
 - **Rule Lifecycle & State Machine Tests (`src/engine.rs`):** Invariant testing for Stage 1/2/3 triggers, grace countdown rollbacks, snooze timestamps, and strict mode command rejections.
 - **Native Notification & Enforcer Tests (`src/enforcer.rs`):** Verifies AUMID registry registration (`HKCU\Software\Classes\AppUserModelId\AW-Enforcer`) idempotency, safety guards on wildcard and empty process targets, and protected window class exclusions.
 - **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.

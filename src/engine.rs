@@ -87,16 +87,6 @@ pub fn compute_overlap_from_merged_intervals(
     total_ms as f64 / 1000.0
 }
 
-/// Computes the total non-overlapping duration in seconds between a slice of events and `[start_utc, end_utc]`.
-pub fn compute_coalesced_overlap_seconds(
-    events: &[AwEvent],
-    start_utc: DateTime<Utc>,
-    end_utc: DateTime<Utc>,
-) -> f64 {
-    let merged = events_to_merged_intervals(events);
-    compute_overlap_from_merged_intervals(&merged, start_utc, end_utc)
-}
-
 /// Intersects web events from `aw-watcher-web` with active browser window intervals from `window_events` (`aw-watcher-window`).
 ///
 /// Prevents background/unfocused browser windows from accumulating URL usage while the user is actively working in non-browser applications.
@@ -2605,11 +2595,6 @@ pub fn matched_url_or_app_matches_rule(
     }
 }
 
-/// Helper checking whether a rule's URL regex matches the hostname or URL representation in `last_matched_app`.
-pub fn matched_app_matches_url_rule(app: &str, compiled_re: Option<&Regex>) -> bool {
-    matched_url_or_app_matches_rule(None, Some(app), compiled_re)
-}
-
 /// Helper predicate returning true when a rule monitors all executables via wildcard or empty target list.
 pub fn is_wildcard_executables_rule(rule: &Rule) -> bool {
     rule.monitor_selection == MonitorSelection::Executables
@@ -3699,7 +3684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_overlap_from_merged_intervals_matches_coalesced_seconds() {
+    fn test_compute_overlap_from_merged_intervals_coalesced_seconds() {
         let base_time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
         // Event 1: 10:00 - 10:45 (2700s)
         let ev1 = make_event(base_time, 2700.0, "code.exe", "File 1", "");
@@ -3711,11 +3696,20 @@ mod tests {
 
         let merged = events_to_merged_intervals(&events);
 
-        for offset_min in (-30..=150).step_by(30) {
+        let expected_seconds = [
+            (-30, 0.0),
+            (0, 1800.0),
+            (30, 1800.0),
+            (60, 900.0),
+            (90, 1800.0),
+            (120, 1800.0),
+            (150, 0.0),
+        ];
+
+        for (offset_min, expected) in expected_seconds {
             let b_start = base_time + Duration::minutes(offset_min);
             let b_end = b_start + Duration::minutes(30);
 
-            let expected = compute_coalesced_overlap_seconds(&events, b_start, b_end);
             let actual = compute_overlap_from_merged_intervals(&merged, b_start, b_end);
 
             assert!(
@@ -4658,7 +4652,6 @@ mod tests {
         let re = Regex::new(r"(?i)youtube\.com/shorts").unwrap();
 
         // 1. Hostname alone in last_matched_app does not match a path-based regex
-        assert!(!matched_app_matches_url_rule("youtube.com", Some(&re)));
         assert!(!matched_url_or_app_matches_rule(None, Some("youtube.com"), Some(&re)));
 
         // 2. Full URL in last_matched_url matches path-based regex
