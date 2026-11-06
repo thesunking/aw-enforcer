@@ -150,25 +150,8 @@ pub fn filter_web_events_by_active_browser_windows(
     filtered
 }
 
-/// Returns the fallback template message when `rule.message.trim().is_empty()` for Stage 3 actions and preview alerts.
-pub fn rule_message_fallback(rule: &Rule) -> &'static str {
-    match rule.action {
-        RuleAction::ShowOverlay => {
-            "# Time for a Break\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
-        }
-        RuleAction::ShowNotification => match rule.trigger {
-            TriggerType::Period => {
-                "[color=#38bdf8 bold] {rule_name}: Active for {session_duration} on {app}."
-            }
-            TriggerType::Limit => {
-                "[color=#f59e0b bold] {rule_name}: Daily limit ({limit}) reached for {app}."
-            }
-        },
-        _ => "",
-    }
-}
-
 pub use crate::enforcer::get_idle_time_millis;
+pub use crate::formatter::{format_snooze_badge, rule_message_fallback};
 
 /// Resolves a `NaiveDateTime` to local timezone, safely handling DST gaps (spring-forward) and ambiguities (fall-back).
 fn resolve_local_ndt(ndt: NaiveDateTime) -> Option<DateTime<Local>> {
@@ -189,17 +172,6 @@ pub fn logical_day_start(now: DateTime<Local>, day_start_hour: u32) -> DateTime<
         .and_hms_opt(h, 0, 0)
         .and_then(resolve_local_ndt)
         .unwrap_or(now)
-}
-
-/// Formats a snooze expiration badge relative to `now`.
-/// Returns `"Snoozed (Xs)"` when remaining time is under 60 seconds, and `"Snoozed (Xm)"` when 60 seconds or more.
-pub fn format_snooze_badge(until: DateTime<Local>, now: DateTime<Local>) -> String {
-    let rem_secs = (until - now).num_seconds().max(0);
-    if rem_secs < 60 {
-        format!("Snoozed ({}s)", rem_secs)
-    } else {
-        format!("Snoozed ({}m)", (rem_secs + 59) / 60)
-    }
 }
 
 /// Aligns a timestamp down to the start of its current statistics histogram bin.
@@ -7233,25 +7205,6 @@ mod tests {
         engine.evaluate_rule(&rule_limit, None, now, &events, start_of_day_utc, now_utc, &merged_all).await;
         let rt_limit = engine.runtimes.get("rule-wildcard-limit").unwrap();
         assert_eq!(rt_limit.daily_usage_seconds, fast_limit_a);
-    }
-
-    #[test]
-    fn test_format_snooze_badge_sub_minute_and_multi_minute() {
-        let now = Local::now();
-
-        // < 60s remaining
-        assert_eq!(format_snooze_badge(now + Duration::seconds(0), now), "Snoozed (0s)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(1), now), "Snoozed (1s)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(30), now), "Snoozed (30s)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(59), now), "Snoozed (59s)");
-
-        // >= 60s remaining
-        assert_eq!(format_snooze_badge(now + Duration::seconds(60), now), "Snoozed (1m)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(61), now), "Snoozed (2m)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(119), now), "Snoozed (2m)");
-        assert_eq!(format_snooze_badge(now + Duration::seconds(120), now), "Snoozed (2m)");
-        assert_eq!(format_snooze_badge(now + Duration::minutes(5), now), "Snoozed (5m)");
-        assert_eq!(format_snooze_badge(now + Duration::minutes(15), now), "Snoozed (15m)");
     }
 
     #[tokio::test]
