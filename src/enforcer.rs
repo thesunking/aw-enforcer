@@ -44,6 +44,51 @@ pub const BROWSER_EXES: &[&str] = &[
     "thorium.exe",
 ];
 
+/// Helper retrieving the process ID owning the given window handle.
+#[inline]
+unsafe fn get_window_pid(hwnd: HWND) -> u32 {
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    pid
+}
+
+/// Helper retrieving the window title as a UTF-8 string on a 512-word stack buffer.
+unsafe fn get_window_title(hwnd: HWND) -> String {
+    let mut title_buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
+    if len > 0 {
+        String::from_utf16_lossy(&title_buf[..len as usize])
+    } else {
+        String::new()
+    }
+}
+
+/// Helper retrieving the executable name of the process owning the given window handle.
+#[inline]
+unsafe fn get_window_process_name(hwnd: HWND) -> Option<String> {
+    get_process_name_by_pid(get_window_pid(hwnd))
+}
+
+/// Helper to post WM_CLOSE to a window with logging.
+unsafe fn post_wm_close(hwnd: HWND, title: Option<&str>) -> bool {
+    if let Some(t) = title {
+        tracing::info!(
+            "Posting WM_CLOSE to matching window (HWND: {:?}, Title: '{}')",
+            hwnd,
+            t
+        );
+    }
+    if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+        true
+    } else {
+        tracing::warn!(
+            "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
+            hwnd
+        );
+        false
+    }
+}
+
 /// Returns the process executable name (or non-empty title fallback) of the current foreground window,
 /// returning None if there is no foreground window, or if it is a protected shell / application window.
 pub fn get_foreground_app_name() -> Option<String> {
@@ -53,25 +98,19 @@ pub fn get_foreground_app_name() -> Option<String> {
             return None;
         }
 
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if let Some(exe_name) = get_process_name_by_pid(pid) {
+        if let Some(exe_name) = get_window_process_name(hwnd) {
             if !exe_name.trim().is_empty() {
                 return Some(exe_name);
             }
         }
 
-        let mut title_buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
-        if len > 0 {
-            let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-            let trimmed = title.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        let title = get_window_title(hwnd);
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            Some(trimmed.to_string())
+        } else {
+            None
         }
-
-        None
     }
 }
 
@@ -82,14 +121,8 @@ pub fn is_foreground_browser() -> bool {
         if is_protected_foreground_window(hwnd) {
             return false;
         }
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        if let Some(exe_name) = get_process_name_by_pid(pid) {
-            exe_name_matches_targets(&exe_name, BROWSER_EXES)
-        } else {
-            false
-        }
+        get_window_process_name(hwnd)
+            .map_or(false, |exe| exe_name_matches_targets(&exe, BROWSER_EXES))
     }
 }
 
@@ -101,19 +134,25 @@ pub fn normalize_exe_stem(name: &str) -> (&str, &str) {
         Some((_, base)) => base.trim(),
         None => trimmed,
     };
-    let stem = basename
-        .strip_suffix(".exe")
-        .or_else(|| basename.strip_suffix(".EXE"))
-        .unwrap_or_else(|| {
-            if basename.len() > 4
-                && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe")
-            {
-                &basename[..basename.len() - 4]
-            } else {
-                basename
-            }
-        });
+    let stem = if basename.len() >= 4 && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &basename[..basename.len() - 4]
+    } else {
+        basename
+    };
     (basename, stem)
+}
+
+#[inline]
+fn stem_or_base_matches(
+    exe_base: &str,
+    exe_stem: &str,
+    target_base: &str,
+    target_stem: &str,
+) -> bool {
+    exe_base.eq_ignore_ascii_case(target_base)
+        || exe_base.eq_ignore_ascii_case(target_stem)
+        || exe_stem.eq_ignore_ascii_case(target_base)
+        || exe_stem.eq_ignore_ascii_case(target_stem)
 }
 
 /// Returns true if `exe_name` matches any `!`-prefixed exclusion entry in `target_executables`.
@@ -126,13 +165,8 @@ pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &
         let t = target.as_ref().trim();
         if let Some(rest) = t.strip_prefix('!') {
             let (target_base, target_stem) = normalize_exe_stem(rest);
-            if target_base.is_empty() {
-                continue;
-            }
-            if exe_base.eq_ignore_ascii_case(target_base)
-                || exe_base.eq_ignore_ascii_case(target_stem)
-                || exe_stem.eq_ignore_ascii_case(target_base)
-                || exe_stem.eq_ignore_ascii_case(target_stem)
+            if !target_base.is_empty()
+                && stem_or_base_matches(exe_base, exe_stem, target_base, target_stem)
             {
                 return true;
             }
@@ -170,14 +204,7 @@ pub fn exe_name_matches_targets<S: AsRef<str>>(
             continue;
         }
         let (t_base, t_stem) = normalize_exe_stem(t);
-        if t_base.is_empty() {
-            continue;
-        }
-        if exe_base.eq_ignore_ascii_case(t_base)
-            || exe_base.eq_ignore_ascii_case(t_stem)
-            || exe_stem.eq_ignore_ascii_case(t_base)
-            || exe_stem.eq_ignore_ascii_case(t_stem)
-        {
+        if !t_base.is_empty() && stem_or_base_matches(exe_base, exe_stem, t_base, t_stem) {
             return true;
         }
     }
@@ -249,10 +276,10 @@ pub fn is_fullscreen_or_presentation_active() -> bool {
     unsafe {
         let mut state: i32 = 0;
         if SHQueryUserNotificationState(&mut state) == 0 {
-            state == QUNS_RUNNING_D3D_FULL_SCREEN
-                || state == QUNS_PRESENTATION_MODE
-                || state == QUNS_BUSY
-                || state == QUNS_QUIET_TIME
+            matches!(
+                state,
+                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_BUSY | QUNS_QUIET_TIME
+            )
         } else {
             false
         }
@@ -364,72 +391,33 @@ pub fn lock_workstation() -> bool {
     unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
 }
 
+const PROTECTED_CLASSES: &[&str] = &[
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+    "MultitaskingViewFrame",
+    "Windows.UI.Core.CoreWindow",
+    "XamlExplorerHostIslandWindow",
+    "ForegroundStaging",
+];
+
+#[inline]
+fn utf16_matches_ascii(utf16: &[u16], ascii: &str) -> bool {
+    utf16.len() == ascii.len()
+        && utf16
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(&u, b)| u == b as u16)
+}
+
 /// Returns true if the UTF-16 class name corresponds to a protected Windows shell class without heap allocation.
 pub fn is_protected_window_class(class_name: &[u16]) -> bool {
-    const PROGMAN: &[u16] = &[
-        b'P' as u16, b'r' as u16, b'o' as u16, b'g' as u16, b'm' as u16, b'a' as u16, b'n' as u16,
-    ];
-    const WORKERW: &[u16] = &[
-        b'W' as u16, b'o' as u16, b'r' as u16, b'k' as u16, b'e' as u16, b'r' as u16, b'W' as u16,
-    ];
-    const SHELL_TRAY: &[u16] = &[
-        b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'_' as u16,
-        b'T' as u16, b'r' as u16, b'a' as u16, b'y' as u16, b'W' as u16, b'n' as u16, b'd' as u16,
-    ];
-    const SHELL_SECONDARY_TRAY: &[u16] = &[
-        b'S' as u16, b'h' as u16, b'e' as u16, b'l' as u16, b'l' as u16, b'_' as u16,
-        b'S' as u16, b'e' as u16, b'c' as u16, b'o' as u16, b'n' as u16, b'd' as u16,
-        b'a' as u16, b'r' as u16, b'y' as u16, b'T' as u16, b'r' as u16, b'a' as u16,
-        b'y' as u16, b'W' as u16, b'n' as u16, b'd' as u16,
-    ];
-    const NOTIFY_ICON_OVERFLOW: &[u16] = &[
-        b'N' as u16, b'o' as u16, b't' as u16, b'i' as u16, b'f' as u16, b'y' as u16,
-        b'I' as u16, b'c' as u16, b'o' as u16, b'n' as u16, b'O' as u16, b'v' as u16,
-        b'e' as u16, b'r' as u16, b'f' as u16, b'l' as u16, b'o' as u16, b'w' as u16,
-        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
-    ];
-    const TOP_LEVEL_OVERFLOW_XAML: &[u16] = &[
-        b'T' as u16, b'o' as u16, b'p' as u16, b'L' as u16, b'e' as u16, b'v' as u16,
-        b'e' as u16, b'l' as u16, b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16,
-        b'o' as u16, b'w' as u16, b'F' as u16, b'o' as u16, b'r' as u16, b'O' as u16,
-        b'v' as u16, b'e' as u16, b'r' as u16, b'f' as u16, b'l' as u16, b'o' as u16,
-        b'w' as u16, b'X' as u16, b'a' as u16, b'm' as u16, b'l' as u16, b'I' as u16,
-        b's' as u16, b'l' as u16, b'a' as u16, b'n' as u16, b'd' as u16,
-    ];
-    const MULTITASKING_VIEW_FRAME: &[u16] = &[
-        b'M' as u16, b'u' as u16, b'l' as u16, b't' as u16, b'i' as u16, b't' as u16,
-        b'a' as u16, b's' as u16, b'k' as u16, b'i' as u16, b'n' as u16, b'g' as u16,
-        b'V' as u16, b'i' as u16, b'e' as u16, b'w' as u16, b'F' as u16, b'r' as u16,
-        b'a' as u16, b'm' as u16, b'e' as u16,
-    ];
-    const CORE_WINDOW: &[u16] = &[
-        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16, b's' as u16,
-        b'.' as u16, b'U' as u16, b'I' as u16, b'.' as u16, b'C' as u16, b'o' as u16, b'r' as u16,
-        b'e' as u16, b'.' as u16, b'C' as u16, b'o' as u16, b'r' as u16, b'e' as u16,
-        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
-    ];
-    const XAML_EXPLORER_HOST_ISLAND: &[u16] = &[
-        b'X' as u16, b'a' as u16, b'm' as u16, b'l' as u16,
-        b'E' as u16, b'x' as u16, b'p' as u16, b'l' as u16, b'o' as u16, b'r' as u16, b'e' as u16, b'r' as u16,
-        b'H' as u16, b'o' as u16, b's' as u16, b't' as u16,
-        b'I' as u16, b's' as u16, b'l' as u16, b'a' as u16, b'n' as u16, b'd' as u16,
-        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
-    ];
-    const FOREGROUND_STAGING: &[u16] = &[
-        b'F' as u16, b'o' as u16, b'r' as u16, b'e' as u16, b'g' as u16, b'r' as u16, b'o' as u16, b'u' as u16, b'n' as u16, b'd' as u16,
-        b'S' as u16, b't' as u16, b'a' as u16, b'g' as u16, b'i' as u16, b'n' as u16, b'g' as u16,
-    ];
-
-    class_name == PROGMAN
-        || class_name == WORKERW
-        || class_name == SHELL_TRAY
-        || class_name == SHELL_SECONDARY_TRAY
-        || class_name == NOTIFY_ICON_OVERFLOW
-        || class_name == TOP_LEVEL_OVERFLOW_XAML
-        || class_name == MULTITASKING_VIEW_FRAME
-        || class_name == CORE_WINDOW
-        || class_name == XAML_EXPLORER_HOST_ISLAND
-        || class_name == FOREGROUND_STAGING
+    PROTECTED_CLASSES
+        .iter()
+        .any(|&cls| utf16_matches_ascii(class_name, cls))
 }
 
 /// Returns true if the window is invalid, invisible, owned by current process, or a Windows shell surface.
@@ -439,9 +427,7 @@ unsafe fn is_protected_window_base(hwnd: HWND) -> bool {
         return true;
     }
 
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == GetCurrentProcessId() {
+    if get_window_pid(hwnd) == GetCurrentProcessId() {
         return true;
     }
 
@@ -477,8 +463,7 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     }
     let ctx = &mut *(lparam as *mut EnumMatchContext<'_, S>);
 
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
+    let pid = get_window_pid(hwnd);
     let cached_exe = ctx
         .pid_cache
         .entry(pid)
@@ -491,14 +476,11 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
         }
     }
 
-    let mut title = String::new();
-    if ctx.compiled_regex.is_some() || ctx.close_matched {
-        let mut title_buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
-        if len > 0 {
-            title = String::from_utf16_lossy(&title_buf[..len as usize]);
-        }
-    }
+    let title = if ctx.compiled_regex.is_some() || ctx.close_matched {
+        get_window_title(hwnd)
+    } else {
+        String::new()
+    };
 
     let title_matches = match ctx.compiled_regex {
         Some(re) => !title.is_empty() && re.is_match(&title),
@@ -538,18 +520,8 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
             };
         }
         if ctx.close_matched {
-            tracing::info!(
-                "Posting WM_CLOSE to matching window (HWND: {:?}, Title: '{}')",
-                hwnd,
-                title
-            );
-            if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+            if post_wm_close(hwnd, Some(&title)) {
                 ctx.matched_count += 1;
-            } else {
-                tracing::warn!(
-                    "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
-                    hwnd
-                );
             }
         } else {
             ctx.matched_count += 1;
@@ -619,20 +591,13 @@ pub fn close_target_windows<S: AsRef<str>>(
         unsafe {
             let hwnd = GetForegroundWindow();
             if !is_protected_foreground_window(hwnd) {
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                if let Some(exe_name) = get_process_name_by_pid(pid) {
+                if let Some(exe_name) = get_window_process_name(hwnd) {
                     if exe_name_is_excluded(&exe_name, target_executables) {
                         return 0;
                     }
                 }
-                if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+                if post_wm_close(hwnd, None) {
                     return 1;
-                } else {
-                    tracing::warn!(
-                        "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
-                        hwnd
-                    );
                 }
             }
         }
@@ -681,20 +646,6 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
     let my_pid = unsafe { GetCurrentProcessId() };
     let mut killed_count = 0;
 
-    #[cfg(test)]
-    {
-        for_each_process(|pid, exe_name| {
-            if pid == my_pid || pid == 0 {
-                return;
-            }
-            if exe_name_matches_targets(exe_name, target_executables) {
-                killed_count += 1;
-            }
-        });
-        return killed_count;
-    }
-
-    #[cfg(not(test))]
     for_each_process(|pid, exe_name| {
         if pid == my_pid || pid == 0 {
             return;
@@ -702,24 +653,30 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
 
         // Never allow wildcard "*" to terminate all system processes
         if exe_name_matches_targets(exe_name, target_executables) {
-            tracing::info!(
-                "Terminating target process: {} (PID: {})",
-                exe_name,
-                pid
-            );
-            unsafe {
-                let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if !h_proc.is_null() {
-                    if TerminateProcess(h_proc, 1) != 0 {
-                        killed_count += 1;
+            #[cfg(test)]
+            {
+                killed_count += 1;
+            }
+            #[cfg(not(test))]
+            {
+                tracing::info!(
+                    "Terminating target process: {} (PID: {})",
+                    exe_name,
+                    pid
+                );
+                unsafe {
+                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !h_proc.is_null() {
+                        if TerminateProcess(h_proc, 1) != 0 {
+                            killed_count += 1;
+                        }
+                        CloseHandle(h_proc);
                     }
-                    CloseHandle(h_proc);
                 }
             }
         }
     });
 
-    #[cfg(not(test))]
     killed_count
 }
 
@@ -736,9 +693,7 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
             return None;
         }
 
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        let fg_exe = get_process_name_by_pid(pid);
+        let fg_exe = get_window_process_name(hwnd);
         if let Some(ref exe) = fg_exe {
             if exe_name_is_excluded(exe, target_executables) {
                 return None;
@@ -748,12 +703,7 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
         let has_wildcard = has_wildcard_target(target_executables);
         let has_exe_targets = has_specific_targets(target_executables);
 
-        let mut window_title = String::new();
-        let mut title_buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
-        if len > 0 {
-            window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
-        }
+        let window_title = get_window_title(hwnd);
 
         let title_matches = match compiled_regex {
             Some(re) => !window_title.is_empty() && re.is_match(&window_title),
@@ -792,9 +742,7 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
             } else if let Some(exe) = matched_exe_name {
                 Some(exe)
             } else {
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, &mut pid);
-                get_process_name_by_pid(pid).or_else(|| Some("foreground_window".to_string()))
+                get_window_process_name(hwnd).or_else(|| Some("foreground_window".to_string()))
             }
         } else {
             None
