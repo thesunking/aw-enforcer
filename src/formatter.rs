@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Local};
 use slint::{Color, SharedString};
 
 use crate::config::{Rule, RuleAction, TriggerType};
