@@ -94,6 +94,7 @@ flowchart TD
 
 - **Win32 Enforcer Subsystem (`src/enforcer.rs`):** Centralizes all platform-specific Win32 FFI calls (`windows_sys`), including window enumeration (`EnumWindows`), process inspection and termination, simulated keyboard input (`SendInput`), workstation locking, fullscreen/presentation state querying (`SHQueryUserNotificationState`), physical user idle tracking (`GetLastInputInfo`, `GetTickCount`), and WinRT toast notifications.
 - **Rule Engine & State Machine (`src/engine.rs`):** Implemented in 100% safe Rust with zero direct Win32 FFI dependencies, evaluating telemetry against user-configured rules and delegating OS interactions to `src/enforcer.rs`.
+- **Interval & Time Arithmetic Subsystem (`src/engine/intervals.rs`):** Isolates stateless interval operations, including non-overlapping interval coalescing (`merge_overlapping_intervals`), binary-searched overlap duration calculation (`compute_overlap_from_merged_intervals`), browser window web event intersection (`filter_web_events_by_active_browser_windows`), zero-allocation backward continuous session traversal (`calculate_continuous_session_from_merged`, `calculate_continuous_session_from_merged_clipped`), and logical day anchoring (`logical_day_start`).
 
 ### 3.2 Threading & Communication
 1. **Slint Event Loop (Main Thread):** Owns window handles, OpenGL/FemtoVG render contexts, and the Win32 message pump for the system tray. It periodically polls for activation events via a 250ms timer.
@@ -303,7 +304,7 @@ sun = "000000000000000000000000"
 
 ## 5. Unified Rule Evaluation & Enforcement Subsystem
 
-### 5.1 Telemetry Aggregation & Web Intersection
+### 5.1 Telemetry Aggregation & Web Intersection (`src/engine/intervals.rs`)
 ActivityWatch event streams are processed on each `poll_tick()`:
 1. **Bucket Discovery & Selection (`select_best_bucket`):** When multiple local watcher buckets exist, metadata is ranked authoritatively:
    - Buckets with `last_updated` are compared first (`b.last_updated.cmp(&a.last_updated)`).
@@ -451,7 +452,7 @@ graph LR
 ## 9. Verification & Test Plan
 
 The application maintains comprehensive test coverage across all domain components:
-- **Interval Arithmetic Tests (`src/engine.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, and `filter_web_events_by_active_browser_windows` ensuring background browser exclusion, binary-searched partition point behavior, and boundary edge cases across large datasets.
+- **Interval Arithmetic Tests (`src/engine/intervals.rs`):** Tests for `merge_overlapping_intervals`, `compute_overlap_from_merged_intervals`, `filter_web_events_by_active_browser_windows`, `calculate_continuous_session_from_merged_clipped`, and `logical_day_start` ensuring background browser exclusion, binary-searched partition point behavior, and boundary edge cases across large datasets.
 - **Rule Lifecycle & State Machine Tests (`src/engine.rs`):** Invariant testing for Stage 1/2/3 triggers, grace countdown rollbacks, snooze timestamps, and strict mode command rejections.
 - **Native Notification & Enforcer Tests (`src/enforcer.rs`):** Verifies AUMID registry registration (`HKCU\Software\Classes\AppUserModelId\AW-Enforcer`) idempotency, safety guards on wildcard and empty process targets, and protected window class exclusions.
 - **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.
