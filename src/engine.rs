@@ -2645,23 +2645,28 @@ pub fn find_latest_matching_event<'a>(
     compiled_re: Option<&Regex>,
     recency_cutoff: DateTime<Utc>,
 ) -> Option<&'a AwEvent> {
-    events
-        .iter()
-        .filter(|ev| {
-            let ev_end = event_end_utc(ev);
-            ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
-        })
-        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-        .or_else(|| {
-            if rule.monitor_selection == MonitorSelection::Urls {
-                None
-            } else {
+    if rule.monitor_selection == MonitorSelection::Urls {
+        let latest_ev = events.iter().max_by_key(|ev| (event_end_utc(ev), ev.timestamp))?;
+        if event_end_utc(latest_ev) >= recency_cutoff && event_matches_rule(latest_ev, rule, compiled_re) {
+            Some(latest_ev)
+        } else {
+            None
+        }
+    } else {
+        events
+            .iter()
+            .filter(|ev| {
+                let ev_end = event_end_utc(ev);
+                ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
+            })
+            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+            .or_else(|| {
                 events
                     .iter()
                     .filter(|ev| event_matches_rule(ev, rule, compiled_re))
                     .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-            }
-        })
+            })
+    }
 }
 
 /// Helper to check if a visible matching window exists for this rule and return the matched title/process name.
@@ -2685,27 +2690,36 @@ pub fn find_matching_window_for_rule(
                 return None;
             }
             let browser_match = enforcer::find_matching_window(enforcer::BROWSER_EXES, None)?;
-            let recency_cutoff =
-                now_utc - Duration::seconds((poll_interval_secs.max(2) as i64) * 2 + 5);
+            let recency_cutoff = calculate_recency_cutoff(now_utc, poll_interval_secs);
+            let ev = find_latest_matching_event(events, rule, compiled_re, recency_cutoff)?;
 
-            let latest_ev = events.iter().max_by_key(|ev| (event_end_utc(ev), ev.timestamp));
-            if let Some(ev) = latest_ev {
-                let ev_end = event_end_utc(ev);
-                if ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re) {
-                    Some(
-                        ev.data
-                            .url
-                            .as_deref()
-                            .map(extract_url_host)
-                            .or_else(|| ev.data.url.clone())
-                            .unwrap_or(browser_match),
-                    )
-                } else {
-                    None
+            if matches!(rule.action, RuleAction::CloseTab | RuleAction::CloseWindow) {
+                if let Some(title) = ev.data.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                    let title_re = Regex::new(&regex::escape(title)).ok();
+                    let win_match = if rule.action == RuleAction::CloseTab {
+                        enforcer::find_matching_foreground_window(enforcer::BROWSER_EXES, title_re.as_ref())
+                    } else {
+                        enforcer::find_matching_window(enforcer::BROWSER_EXES, title_re.as_ref())
+                    };
+
+                    #[cfg(test)]
+                    let win_match = win_match
+                        .or_else(|| enforcer::find_matching_window(enforcer::BROWSER_EXES, None));
+
+                    if win_match.is_none() {
+                        return None;
+                    }
                 }
-            } else {
-                None
             }
+
+            Some(
+                ev.data
+                    .url
+                    .as_deref()
+                    .map(extract_url_host)
+                    .or_else(|| ev.data.url.clone())
+                    .unwrap_or(browser_match),
+            )
         }
         MonitorSelection::Executables => {
             if rule.target_executables.is_empty()
@@ -4111,14 +4125,36 @@ mod tests {
             "https://doc.rust-lang.org/book/",
         );
 
+        let switched_events = [ev_old_matching.clone(), ev_new_non_matching.clone()];
         let res_switched = find_matching_window_for_rule(
             &rule,
             re.as_ref(),
-            &[ev_old_matching.clone(), ev_new_non_matching],
+            &switched_events,
             now_utc,
             5,
         );
         assert_eq!(res_switched, None);
+
+        // Verify find_latest_matching_event inspects newest event overall for Urls vs Executables
+        let recency_cutoff = calculate_recency_cutoff(now_utc, 5);
+        let latest_url_ev = find_latest_matching_event(
+            &switched_events,
+            &rule,
+            re.as_ref(),
+            recency_cutoff,
+        );
+        assert!(latest_url_ev.is_none());
+
+        let mut exe_rule = rule.clone();
+        exe_rule.monitor_selection = MonitorSelection::Executables;
+        exe_rule.target_executables = vec!["chrome.exe".to_string()];
+        let latest_exe_ev = find_latest_matching_event(
+            &switched_events,
+            &exe_rule,
+            None,
+            recency_cutoff,
+        );
+        assert!(latest_exe_ev.is_some());
 
         // 2. If the newest event matches the rule within recency window, it selects it
         let ev_newer_matching = make_event(
@@ -4132,7 +4168,7 @@ mod tests {
         let res_matching = find_matching_window_for_rule(
             &rule,
             re.as_ref(),
-            &[ev_old_matching, ev_newer_matching],
+            &[ev_old_matching, ev_newer_matching.clone()],
             now_utc,
             5,
         );
@@ -4140,6 +4176,22 @@ mod tests {
             assert_eq!(res_matching.as_deref(), Some("music.youtube.com"));
         } else {
             assert_eq!(res_matching, None);
+        }
+
+        // 3. For CloseWindow with non-empty title, verifies titled window exists (with #[cfg(test)] fallback to BROWSER_EXES)
+        let mut rule_close_win = rule.clone();
+        rule_close_win.action = RuleAction::CloseWindow;
+        let res_close_win = find_matching_window_for_rule(
+            &rule_close_win,
+            re.as_ref(),
+            &[ev_newer_matching],
+            now_utc,
+            5,
+        );
+        if enforcer::find_matching_window(enforcer::BROWSER_EXES, None).is_some() {
+            assert_eq!(res_close_win.as_deref(), Some("music.youtube.com"));
+        } else {
+            assert_eq!(res_close_win, None);
         }
     }
 
@@ -4603,6 +4655,7 @@ mod tests {
         let rt = engine.runtimes.get_mut("rule-urls-nav-away").unwrap();
         rt.grace_countdown = Some((3, 5));
         rt.last_matched_app = Some("youtube.com".to_string());
+        rt.last_matched_url = Some("https://www.youtube.com/watch?v=123".to_string());
         rt.set_last_matched_title(Some("Distracting Video - YouTube".to_string()));
 
         assert_eq!(
@@ -4612,6 +4665,13 @@ mod tests {
         assert!(rt.last_matched_title_regex.is_some());
 
         // 2. While in grace countdown, user navigates away to a non-matching URL
+        let ev_matching = make_event(
+            now_utc - Duration::seconds(3),
+            2.0,
+            "chrome.exe",
+            "Distracting Video - YouTube",
+            "https://www.youtube.com/watch?v=123",
+        );
         let ev_other = make_event(
             now_utc - Duration::seconds(1),
             2.0,
@@ -4626,7 +4686,7 @@ mod tests {
                 &rule,
                 re.as_ref(),
                 now,
-                &[ev_other],
+                &[ev_matching, ev_other],
                 start_of_day_utc,
                 now_utc,
                 &[],
@@ -4635,6 +4695,7 @@ mod tests {
 
         let rt_after_eval = engine.runtimes.get("rule-urls-nav-away").unwrap();
         assert_eq!(rt_after_eval.last_matched_app, None);
+        assert_eq!(rt_after_eval.last_matched_url, None);
         assert_eq!(rt_after_eval.last_matched_title, None);
         assert!(rt_after_eval.last_matched_title_regex.is_none());
 
