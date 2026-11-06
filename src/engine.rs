@@ -481,6 +481,7 @@ pub struct Engine {
     overlay_tx: mpsc::UnboundedSender<OverlayAction>,
     active_overlay_mode: OverlayMode,
     stats_cache: Option<StatsHudCache>,
+    last_global_session_seconds: u32,
 }
 
 impl Engine {
@@ -507,6 +508,7 @@ impl Engine {
             overlay_tx,
             active_overlay_mode: OverlayMode::Hidden,
             stats_cache: None,
+            last_global_session_seconds: 0,
         }
     }
 
@@ -1353,7 +1355,8 @@ impl Engine {
         let mut has_url_rules = false;
 
         if !self.config.general.pause_all_rules {
-            let default_session_lookback = (now - Duration::seconds(3600 + 300)).with_timezone(&Utc);
+            let session_lookback_secs = (3600 + 300).max((self.last_global_session_seconds as i64) + 3600);
+            let default_session_lookback = (now - Duration::seconds(session_lookback_secs)).with_timezone(&Utc);
             min_start_utc = min_start_utc.min(default_session_lookback);
 
             for rule in &self.config.rules {
@@ -1405,11 +1408,55 @@ impl Engine {
         let mut evaluated_in_step_4 = std::collections::HashSet::new();
         let mut should_transition_after_eval = false;
 
-        if self.config.general.pause_all_rules || is_globally_snoozed {
+        if self.config.general.pause_all_rules {
             for idx in 0..self.config.rules.len() {
                 let rule_id = self.config.rules[idx].id.clone();
                 if self.deactivate_rule_runtime(&rule_id) {
                     should_transition_after_eval = true;
+                }
+            }
+        } else if is_globally_snoozed {
+            for idx in 0..self.config.rules.len() {
+                let rule_id = self.config.rules[idx].id.clone();
+                if self.deactivate_rule_runtime(&rule_id) {
+                    should_transition_after_eval = true;
+                }
+                let rule = &self.config.rules[idx];
+                if rule.enabled
+                    && rule.schedule.is_active(day_index, hour_index)
+                    && rule.trigger == TriggerType::Period
+                {
+                    let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
+                        &web_events
+                    } else {
+                        &all_events
+                    };
+                    if let Some(rt) = self.runtimes.get_mut(&rule_id) {
+                        let last_completed = rt.last_completed_at;
+                        let reset_gap = rule.reset_after_afk.to_seconds().max(1);
+                        let compiled_re = rt.compiled_regex.as_ref();
+                        let session_duration = if is_wildcard_executables_rule(rule) {
+                            calculate_continuous_session_from_merged_clipped(
+                                &merged_all_intervals,
+                                now_utc,
+                                last_completed.map(|dt| dt.with_timezone(&Utc)),
+                                reset_gap,
+                            )
+                        } else {
+                            calculate_continuous_session_for_rule(
+                                events_for_rule,
+                                now,
+                                last_completed,
+                                reset_gap,
+                                rule,
+                                compiled_re,
+                            )
+                        };
+                        if session_duration == 0 {
+                            rt.warned_current_cycle = false;
+                        }
+                        rt.current_session_seconds = session_duration;
+                    }
                 }
             }
         } else {
@@ -1462,6 +1509,7 @@ impl Engine {
         } else {
             calculate_continuous_session_from_merged(&merged_all_intervals, now_utc, 300)
         };
+        self.last_global_session_seconds = global_session_secs;
         let max_session_secs = global_session_secs.max(max_rule_session_secs);
 
         let total_today_secs = compute_overlap_from_merged_intervals(&merged_all_intervals, start_of_day_utc, now_utc);
@@ -1504,7 +1552,7 @@ impl Engine {
                         .daily_reset_at
                         .map(|dt| dt.with_timezone(&Utc).max(start_of_day_utc))
                         .unwrap_or(start_of_day_utc);
-                    let used = if is_wildcard_executables_rule(rule) && !merged_all_intervals.is_empty() {
+                    let used = if is_wildcard_executables_rule(rule) {
                         compute_overlap_from_merged_intervals(
                             &merged_all_intervals,
                             effective_start_utc,
@@ -1788,6 +1836,17 @@ impl Engine {
         now_utc: DateTime<Utc>,
         merged_all_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
     ) -> bool {
+        let merged_fallback;
+        let merged_all_intervals = if merged_all_intervals.is_empty()
+            && !events.is_empty()
+            && is_wildcard_executables_rule(rule)
+        {
+            merged_fallback = events_to_merged_intervals(events);
+            &merged_fallback[..]
+        } else {
+            merged_all_intervals
+        };
+
         let is_displayed = self.is_rule_displayed(&rule.id);
         if !is_displayed {
             if let Some(rt) = self.runtimes.get_mut(&rule.id) {
@@ -1817,7 +1876,7 @@ impl Engine {
                     if rule.trigger == TriggerType::Period {
                         let last_completed = rt.last_completed_at;
                         let reset_gap = rule.reset_after_afk.to_seconds().max(1);
-                        let session_duration = if is_wildcard_executables_rule(rule) && !merged_all_intervals.is_empty() {
+                        let session_duration = if is_wildcard_executables_rule(rule) {
                             calculate_continuous_session_from_merged_clipped(
                                 merged_all_intervals,
                                 now_utc,
@@ -1849,7 +1908,7 @@ impl Engine {
                 let last_completed = self.runtimes.get(&rule.id).and_then(|r| r.last_completed_at);
                 let reset_gap = rule.reset_after_afk.to_seconds().max(1);
                 let period_secs = rule.period.to_seconds().max(1);
-                let session_duration = if is_wildcard_executables_rule(rule) && !merged_all_intervals.is_empty() {
+                let session_duration = if is_wildcard_executables_rule(rule) {
                     calculate_continuous_session_from_merged_clipped(
                         merged_all_intervals,
                         now_utc,
@@ -1881,7 +1940,7 @@ impl Engine {
                     .and_then(|rt| rt.daily_reset_at)
                     .map(|dt| dt.with_timezone(&Utc).max(start_of_day_utc))
                     .unwrap_or(start_of_day_utc);
-                let used = if is_wildcard_executables_rule(rule) && !merged_all_intervals.is_empty() {
+                let used = if is_wildcard_executables_rule(rule) {
                     compute_overlap_from_merged_intervals(
                         merged_all_intervals,
                         effective_start_utc,
@@ -2885,23 +2944,37 @@ pub fn calculate_continuous_session_from_merged_clipped(
     min_allowed_utc: Option<DateTime<Utc>>,
     reset_gap_secs: u32,
 ) -> u32 {
-    let clipped: Vec<(DateTime<Utc>, DateTime<Utc>)> = merged
-        .iter()
-        .filter_map(|&(s, e)| {
-            let start = if let Some(min_dt) = min_allowed_utc {
-                s.max(min_dt)
-            } else {
-                s
-            };
-            let end = e.min(now_utc);
-            if end > start {
-                Some((start, end))
-            } else {
-                None
+    let reset_gap_sec = reset_gap_secs as i64;
+    let mut session_millis = 0i64;
+    let mut prev_start: Option<DateTime<Utc>> = None;
+
+    for &(s, e) in merged.iter().rev() {
+        if let Some(min_dt) = min_allowed_utc {
+            if e <= min_dt {
+                break;
             }
-        })
-        .collect();
-    calculate_continuous_session_from_merged(&clipped, now_utc, reset_gap_secs)
+        }
+
+        let end = e.min(now_utc);
+        let start = min_allowed_utc.map_or(s, |m| s.max(m));
+        if end <= start {
+            continue;
+        }
+
+        if let Some(p_start) = prev_start {
+            let gap = (p_start - end).num_seconds();
+            if gap >= reset_gap_sec {
+                break;
+            }
+        } else if (now_utc - end).num_seconds() >= reset_gap_sec {
+            return 0;
+        }
+
+        session_millis += (end - start).num_milliseconds();
+        prev_start = Some(start);
+    }
+
+    ((session_millis.max(0) as f64) / 1000.0).round() as u32
 }
 
 /// Computes continuous active session duration by walking backward from now.
@@ -7482,5 +7555,95 @@ mod tests {
         // Toast was blocked, BreakEnforcer is still displayed
         assert!(engine.is_rule_displayed("rule-break-active-warn"));
         assert!(!engine.is_rule_displayed("rule-warn-hud"));
+    }
+
+    #[test]
+    fn test_calculate_continuous_session_from_merged_clipped_edge_cases() {
+        let now_utc = Utc::now();
+
+        // 1. Empty slices
+        assert_eq!(calculate_continuous_session_from_merged_clipped(&[], now_utc, None, 300), 0);
+        let min_dt = now_utc - Duration::minutes(30);
+        assert_eq!(calculate_continuous_session_from_merged_clipped(&[], now_utc, Some(min_dt), 300), 0);
+
+        // 2. Intervals completely before min_allowed_utc (early break triggers)
+        let merged_old = vec![
+            (now_utc - Duration::minutes(70), now_utc - Duration::minutes(65)),
+            (now_utc - Duration::minutes(60), now_utc - Duration::minutes(40)),
+        ];
+        assert_eq!(
+            calculate_continuous_session_from_merged_clipped(&merged_old, now_utc, Some(min_dt), 300),
+            0
+        );
+
+        // 3. Boundary clipping where s < min_dt < e
+        let merged_boundary = vec![
+            (now_utc - Duration::minutes(20), now_utc), // 20m span, min_dt is 15m ago
+        ];
+        let min_dt_15m = now_utc - Duration::minutes(15);
+        assert_eq!(
+            calculate_continuous_session_from_merged_clipped(&merged_boundary, now_utc, Some(min_dt_15m), 300),
+            900
+        );
+
+        // 4. Boundary clipping where e > now_utc
+        let merged_future = vec![
+            (now_utc - Duration::minutes(10), now_utc + Duration::minutes(5)),
+        ];
+        assert_eq!(
+            calculate_continuous_session_from_merged_clipped(&merged_future, now_utc, None, 300),
+            600
+        );
+
+        // 5. Gap exceeding reset_gap_secs between intervals
+        let merged_gap = vec![
+            (now_utc - Duration::minutes(20), now_utc - Duration::minutes(12)), // gap of 7m (420s > 300s)
+            (now_utc - Duration::minutes(5), now_utc),                          // 5m span (300s)
+        ];
+        assert_eq!(
+            calculate_continuous_session_from_merged_clipped(&merged_gap, now_utc, None, 300),
+            300
+        );
+
+        // 6. Gap from now_utc exceeding reset_gap_secs
+        let merged_stale = vec![
+            (now_utc - Duration::minutes(20), now_utc - Duration::minutes(10)), // ended 10m ago (> 5m gap)
+        ];
+        assert_eq!(
+            calculate_continuous_session_from_merged_clipped(&merged_stale, now_utc, None, 300),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_snooze_updates_session_and_resets_warned_on_afk() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-period-global-snooze".to_string();
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(50, TimeUnit::Min);
+        rule.warn_before = DurationConfig::new(5, TimeUnit::Min);
+        rule.reset_after_afk = DurationConfig::new(5, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Set warned_current_cycle to true
+        engine.runtimes.get_mut("rule-period-global-snooze").unwrap().warned_current_cycle = true;
+
+        // Engage global snooze for 15 minutes
+        engine.handle_command(DaemonCommand::SnoozeAll { minutes: 15 }).await;
+        assert!(engine.global_snoozed_until.is_some());
+
+        // Run poll_tick (no events from client mock -> AFK gap / empty intervals)
+        engine.poll_tick().await;
+
+        let rt = engine.runtimes.get("rule-period-global-snooze").unwrap();
+        assert_eq!(rt.current_session_seconds, 0, "AFK during global snooze should reset current_session_seconds to 0");
+        assert_eq!(rt.warned_current_cycle, false, "AFK during global snooze should reset warned_current_cycle");
     }
 }
