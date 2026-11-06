@@ -83,11 +83,54 @@ impl AwClient {
 
     /// Checks whether the ActivityWatch server is reachable via GET /api/0/info.
     pub async fn check_connection(&self) -> bool {
-        let url = format!("{}/api/0/info", self.base_url);
+        let url = self.endpoint_url("/api/0/info");
         match self.client.get(&url).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
+    }
+
+    /// Queries canonical active window events intersected with not-afk status.
+    pub async fn query_intersected_events(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<AwEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.has_required_buckets().await {
+            return Ok(Vec::new());
+        }
+
+        let Some(window_id) = self.window_bucket_id.read().await.clone() else {
+            return Ok(Vec::new());
+        };
+        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
+            return Ok(Vec::new());
+        };
+
+        let target_expr = flood_bucket_expr(&window_id);
+        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &target_expr, &afk_id);
+
+        self.execute_query(&self.query_url(), &query_body).await
+    }
+
+    /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
+    pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
+        if !self.prepare_poll_buckets(true).await || !self.has_web_bucket.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+
+        let web_buckets = self.web_bucket_ids.read().await.clone();
+        let Some(web_expr) = build_web_query_expr(&web_buckets) else {
+            return Vec::new();
+        };
+
+        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
+            return Vec::new();
+        };
+
+        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &web_expr, &afk_id);
+
+        self.execute_query(&self.query_url(), &query_body).await.unwrap_or_default()
     }
 
     /// Prepares buckets before polling, refreshing `/api/0/buckets/` if unverified or if web buckets need a 60s refresh.
@@ -113,7 +156,7 @@ impl AwClient {
     /// and sets `buckets_verified` if both window and afk buckets exist.
     pub async fn refresh_buckets(&self) -> bool {
         *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        let url = format!("{}/api/0/buckets/", self.base_url);
+        let url = self.endpoint_url("/api/0/buckets/");
         let resp = match self.client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             _ => {
@@ -123,22 +166,15 @@ impl AwClient {
         };
 
         if let Ok(Value::Object(map)) = resp.json::<Value>().await {
-            let window_bucket = select_best_bucket("aw-watcher-window_", map.iter().map(|(k, v)| (k.as_str(), v)));
-            let afk_bucket = select_best_bucket("aw-watcher-afk_", map.iter().map(|(k, v)| (k.as_str(), v)));
-            let mut web_buckets: Vec<String> = map
-                .keys()
-                .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
-                .cloned()
-                .collect();
-            web_buckets.sort();
+            let discovered = DiscoveredBuckets::from_bucket_map(&map);
+            let has_window = discovered.window_bucket.is_some();
+            let has_afk = discovered.afk_bucket.is_some();
+            let has_web = !discovered.web_buckets.is_empty();
+            let ready = discovered.is_ready();
 
-            let has_window = window_bucket.is_some();
-            let has_afk = afk_bucket.is_some();
-            let has_web = !web_buckets.is_empty();
-
-            *self.window_bucket_id.write().await = window_bucket;
-            *self.afk_bucket_id.write().await = afk_bucket;
-            *self.web_bucket_ids.write().await = web_buckets;
+            *self.window_bucket_id.write().await = discovered.window_bucket;
+            *self.afk_bucket_id.write().await = discovered.afk_bucket;
+            *self.web_bucket_ids.write().await = discovered.web_buckets;
 
             self.has_web_bucket.store(has_web, Ordering::Relaxed);
             if !has_window || !has_afk {
@@ -148,56 +184,12 @@ impl AwClient {
                     has_afk
                 );
             }
-            let ready = has_window && has_afk;
             self.buckets_verified.store(ready, Ordering::Relaxed);
             ready
         } else {
             self.buckets_verified.store(false, Ordering::Relaxed);
             false
         }
-    }
-
-    /// Queries canonical active window events intersected with not-afk status.
-    pub async fn query_intersected_events(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Vec<AwEvent>, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.has_required_buckets().await {
-            return Ok(Vec::new());
-        }
-
-        let Some(window_id) = self.window_bucket_id.read().await.clone() else {
-            return Ok(Vec::new());
-        };
-        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
-            return Ok(Vec::new());
-        };
-
-        let target_expr = format!("flood(query_bucket(\"{}\"))", escape_bucket_id(&window_id));
-        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &target_expr, &afk_id);
-
-        self.execute_query(&self.query_url(), &query_body).await
-    }
-
-    /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
-    pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
-        if !self.prepare_poll_buckets(true).await || !self.has_web_bucket.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-
-        let web_buckets = self.web_bucket_ids.read().await.clone();
-        let Some(web_expr) = build_web_query_expr(&web_buckets) else {
-            return Vec::new();
-        };
-
-        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
-            return Vec::new();
-        };
-
-        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &web_expr, &afk_id);
-
-        self.execute_query(&self.query_url(), &query_body).await.unwrap_or_default()
     }
 
     /// Dispatches a query request to ActivityWatch `/api/0/query/`, checking HTTP status and parsing returned events.
@@ -239,9 +231,51 @@ impl AwClient {
         last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
     }
 
+    /// Resolves an ActivityWatch API endpoint URL given an API path.
+    fn endpoint_url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
     /// URL for the ActivityWatch query endpoint.
     fn query_url(&self) -> String {
-        format!("{}/api/0/query/", self.base_url)
+        self.endpoint_url("/api/0/query/")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discovered Buckets Structure
+// ---------------------------------------------------------------------------
+
+/// Discovered window, AFK, and web buckets parsed from the ActivityWatch `/api/0/buckets/` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredBuckets {
+    pub window_bucket: Option<String>,
+    pub afk_bucket: Option<String>,
+    pub web_buckets: Vec<String>,
+}
+
+impl DiscoveredBuckets {
+    /// Extracts canonical local window, afk, and sorted web buckets from an ActivityWatch bucket map.
+    pub fn from_bucket_map(map: &serde_json::Map<String, Value>) -> Self {
+        let window_bucket = select_best_bucket("aw-watcher-window_", map.iter().map(|(k, v)| (k.as_str(), v)));
+        let afk_bucket = select_best_bucket("aw-watcher-afk_", map.iter().map(|(k, v)| (k.as_str(), v)));
+        let mut web_buckets: Vec<String> = map
+            .keys()
+            .filter(|k| k.starts_with("aw-watcher-web") && is_local_bucket(k))
+            .cloned()
+            .collect();
+        web_buckets.sort();
+
+        Self {
+            window_bucket,
+            afk_bucket,
+            web_buckets,
+        }
+    }
+
+    /// Returns `true` if both window and AFK buckets are present.
+    pub fn is_ready(&self) -> bool {
+        self.window_bucket.is_some() && self.afk_bucket.is_some()
     }
 }
 
@@ -256,11 +290,12 @@ pub fn parse_query_response_events(batches: Vec<Vec<AwEvent>>) -> Vec<AwEvent> {
 
 /// Builds an ActivityWatch query body intersecting `target_expr` with `not_afk` status.
 fn build_not_afk_intersect_query(timeperiod: String, target_expr: &str, afk_id: &str) -> Value {
+    let afk_expr = flood_bucket_expr(afk_id);
     serde_json::json!({
         "timeperiods": [timeperiod],
         "query": [
             format!("events = {target_expr};"),
-            format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id)),
+            format!("not_afk = {afk_expr};"),
             "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
             "events = filter_period_intersect(events, not_afk);",
             "RETURN = events;"
@@ -276,17 +311,17 @@ pub fn build_web_query_expr(web_buckets: &[String]) -> Option<String> {
         return None;
     }
     if web_buckets.len() == 1 {
-        return Some(format!(
-            "flood(query_bucket(\"{}\"))",
-            escape_bucket_id(&web_buckets[0])
-        ));
+        return Some(flood_bucket_expr(&web_buckets[0]));
     }
-    let mut it = web_buckets
-        .iter()
-        .map(|b| format!("flood(query_bucket(\"{}\"))", escape_bucket_id(b)));
+    let mut it = web_buckets.iter().map(|b| flood_bucket_expr(b));
     let first = it.next()?;
     let folded = it.fold(first, |acc, next| format!("concat({}, {})", acc, next));
     Some(format!("sort_by_timestamp({})", folded))
+}
+
+/// Wraps an escaped bucket ID in ActivityWatch's query expression `flood(query_bucket("..."))`.
+pub fn flood_bucket_expr(bucket_id: &str) -> String {
+    format!("flood(query_bucket(\"{}\"))", escape_bucket_id(bucket_id))
 }
 
 /// Formats a start/end time range into an ActivityWatch `start/end` timeperiod string.
@@ -321,6 +356,7 @@ pub fn select_best_bucket<'a>(
     )
 }
 
+/// Selects the best bucket matching `prefix` using an explicit hostname override for ranking.
 pub fn select_best_bucket_with_hostname<'a>(
     prefix: &str,
     local_hostname: Option<&str>,
@@ -341,13 +377,11 @@ pub fn select_best_bucket_with_hostname<'a>(
             let created = parse_bucket_time(val, "created");
             let effective_time = last_updated.or(created);
 
-            let hostname_matches = if let Some(local_h) = local_hostname {
+            let hostname_matches = local_hostname.is_some_and(|local_h| {
                 val.get("hostname")
                     .and_then(|h| h.as_str())
-                    .map_or(false, |h| h.eq_ignore_ascii_case(local_h))
-            } else {
-                false
-            };
+                    .is_some_and(|h| h.eq_ignore_ascii_case(local_h))
+            });
 
             Candidate {
                 key,
@@ -627,6 +661,60 @@ mod tests {
             escape_bucket_id("aw-watcher-web-chrome_\"test\"\\pc"),
             "aw-watcher-web-chrome_\\\"test\\\"\\\\pc"
         );
+    }
+
+    #[test]
+    fn test_flood_bucket_expr() {
+        assert_eq!(
+            flood_bucket_expr("aw-watcher-window_LOCAL"),
+            "flood(query_bucket(\"aw-watcher-window_LOCAL\"))"
+        );
+        assert_eq!(
+            flood_bucket_expr("aw-watcher-web-chrome_\"quoted\""),
+            "flood(query_bucket(\"aw-watcher-web-chrome_\\\"quoted\\\"\"))"
+        );
+    }
+
+    #[test]
+    fn test_discovered_buckets_from_bucket_map() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "aw-watcher-window_LOCAL".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+        map.insert(
+            "aw-watcher-afk_LOCAL".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+        map.insert(
+            "aw-watcher-web-firefox".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+        map.insert(
+            "aw-watcher-web-chrome".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+        map.insert(
+            "aw-watcher-web-edge_synced".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+
+        let discovered = DiscoveredBuckets::from_bucket_map(&map);
+        assert_eq!(discovered.window_bucket.as_deref(), Some("aw-watcher-window_LOCAL"));
+        assert_eq!(discovered.afk_bucket.as_deref(), Some("aw-watcher-afk_LOCAL"));
+        assert_eq!(
+            discovered.web_buckets,
+            vec!["aw-watcher-web-chrome".to_string(), "aw-watcher-web-firefox".to_string()]
+        );
+        assert!(discovered.is_ready());
+
+        let mut partial_map = serde_json::Map::new();
+        partial_map.insert(
+            "aw-watcher-window_LOCAL".to_string(),
+            serde_json::json!({ "created": "2026-11-01T10:00:00Z" }),
+        );
+        let partial_discovered = DiscoveredBuckets::from_bucket_map(&partial_map);
+        assert!(!partial_discovered.is_ready());
     }
 
     #[test]
