@@ -36,7 +36,7 @@
   - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
   - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor, with real-time countdown ticking and immediate dismissal.
   - Rich text formatting with alignment-aware underline rendering sized directly to paragraph text, case-insensitive attribute toggling (e.g., uppercase hex colors), grace-aware preview context interpolation, and an adaptive template editor height with line-selection gutter that dynamically expands to avoid overflow.
-  - High-performance binary-searched interval intersection (`partition_point`) for $O(\log N)$ overlap queries and web event window clipping, with single-pass merged interval reuse between telemetry and live statistics overlays.
+  - High-performance binary-searched interval intersection (`partition_point`) for $O(\log N)$ overlap queries and web event window clipping, with single-pass merged interval reuse computed once per poll tick across wildcard rule evaluations, live telemetry, and 24-hour statistics overlays.
 
 ---
 
@@ -105,7 +105,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 | `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
 | `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, duration/quota bounds clamping, target/schedule normalization, unique rule ID enforcement, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery, thread-safe hostname ranking, and `filter_period_intersect` queries) |
-| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, O(log N) binary-searched interval intersection, single-pass poll interval reuse, and 3-stage rule evaluation |
+| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, O(log N) binary-searched interval intersection, single-pass poll interval reuse across wildcard rules and stats overlays, and 3-stage rule evaluation |
 | `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |
 | `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, priority hierarchy, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
 | `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, and line-level attribute/heading parser |
