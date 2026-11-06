@@ -1332,7 +1332,21 @@ impl Engine {
         let mut min_start_utc = start_of_day_utc;
         if let Some(ref cache) = self.stats_cache {
             if matches!(self.active_overlay_mode, OverlayMode::HudStatus { is_loading: false, .. }) {
-                min_start_utc = min_start_utc.min(cache.current_bin_start.with_timezone(&Utc));
+                let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
+                let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
+                let config_changed = cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins;
+                let new_bin_start = align_stats_bin_start(now, bin_size_mins);
+                let elapsed_bins = if !config_changed && new_bin_start > cache.current_bin_start {
+                    ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0) as usize
+                } else {
+                    0
+                };
+                if config_changed || elapsed_bins > 1 {
+                    let start_time = new_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+                    min_start_utc = min_start_utc.min(start_time.with_timezone(&Utc));
+                } else {
+                    min_start_utc = min_start_utc.min(cache.current_bin_start.with_timezone(&Utc));
+                }
             }
         }
 
@@ -2260,9 +2274,19 @@ impl Engine {
         };
 
         if cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins {
-            cache.bin_seconds.resize(bin_count, 0.0);
+            cache.bin_seconds = vec![0.0f32; bin_count];
             cache.bin_size_mins = bin_size_mins;
             cache.current_bin_start = new_bin_start;
+
+            let start_time = new_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+            for i in 0..bin_count {
+                let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
+                let b_end = b_start + Duration::minutes(bin_size_mins);
+                let b_start_utc = b_start.with_timezone(&Utc);
+                let b_end_utc = b_end.with_timezone(&Utc);
+                cache.bin_seconds[i] =
+                    compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc) as f32;
+            }
         } else if new_bin_start > cache.current_bin_start {
             let elapsed_bins =
                 ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0)
@@ -3351,6 +3375,105 @@ mod tests {
                 assert!((bin_values[21] - (2400.0 / 3600.0)).abs() < 1e-4); // 15:00..16:00 populated (40m)
                 assert!((bin_values[22] - (900.0 / 3600.0)).abs() < 1e-4);  // intermediate 16:00..17:00 populated (15m)
                 assert!((bin_values[23] - (300.0 / 3600.0)).abs() < 1e-4);  // current 17:00..18:00 populated (5m)
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_live_stats_hud_recomputes_bins_on_config_change() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.stats.histogram_bin_count = 24;
+        cfg.stats.histogram_bin_size_minutes = 60;
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local.with_ymd_and_hms(2026, 10, 30, 14, 30, 0).unwrap();
+        let bin_14 = Local.with_ymd_and_hms(2026, 10, 30, 14, 0, 0).unwrap();
+        let bin_13 = Local.with_ymd_and_hms(2026, 10, 30, 13, 0, 0).unwrap();
+        let bin_12 = Local.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
+
+        // 3 hours of activity:
+        // 12:00..12:30 has 1800s (30m)
+        // 13:00..13:40 has 2400s (40m)
+        // 14:00..14:10 has 600s (10m)
+        let ev = vec![
+            make_event(bin_12.with_timezone(&Utc), 1800.0, "code.exe", "VS Code", ""),
+            make_event(bin_13.with_timezone(&Utc), 2400.0, "code.exe", "VS Code", ""),
+            make_event(bin_14.with_timezone(&Utc), 600.0, "code.exe", "VS Code", ""),
+        ];
+        let merged = events_to_merged_intervals(&ev);
+
+        // Initially setup stats_cache for 24 bins of 60 mins
+        let mut initial_bins = vec![0.0f32; 24];
+        initial_bins[21] = 1800.0;
+        initial_bins[22] = 2400.0;
+        initial_bins[23] = 600.0;
+        engine.stats_cache = Some(StatsHudCache {
+            current_bin_start: bin_14,
+            bin_size_mins: 60,
+            bin_seconds: initial_bins,
+            click_through: false,
+        });
+        let initial_mode = engine.build_hud_status_from_cache().unwrap();
+        engine.show_overlay(initial_mode);
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { total_active_minutes, bin_values, .. } => {
+                assert_eq!(*total_active_minutes, 80); // 30m + 40m + 10m
+                assert_eq!(bin_values.len(), 24);
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
+
+        // 1. Change bin_size_minutes to 30 and bin_count to 12
+        engine.config.stats.histogram_bin_size_minutes = 30;
+        engine.config.stats.histogram_bin_count = 12;
+
+        engine.refresh_stats_overlay_from_events(now, &merged);
+
+        let cache = engine.stats_cache.as_ref().unwrap();
+        assert_eq!(cache.bin_size_mins, 30);
+        assert_eq!(cache.bin_seconds.len(), 12);
+        assert_eq!(cache.current_bin_start, Local.with_ymd_and_hms(2026, 10, 30, 14, 30, 0).unwrap());
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { total_active_minutes, bin_values, is_loading, .. } => {
+                assert!(!is_loading);
+                assert_eq!(*total_active_minutes, 80); // recomputed across all 30m bins: 30m + 30m + 10m + 10m
+                assert_eq!(bin_values.len(), 12);
+                // Index 11 (14:30..15:00): 0s
+                assert_eq!(bin_values[11], 0.0);
+                // Index 10 (14:00..14:30): 600s / 1800s
+                assert!((bin_values[10] - (600.0 / 1800.0)).abs() < 1e-4);
+                // Index 9 (13:30..14:00): 600s / 1800s
+                assert!((bin_values[9] - (600.0 / 1800.0)).abs() < 1e-4);
+                // Index 8 (13:00..13:30): 1800s / 1800s
+                assert!((bin_values[8] - 1.0).abs() < 1e-4);
+                // Index 7 (12:30..13:00): 0s
+                assert_eq!(bin_values[7], 0.0);
+                // Index 6 (12:00..12:30): 1800s / 1800s
+                assert!((bin_values[6] - 1.0).abs() < 1e-4);
+            }
+            other => panic!("Expected HudStatus, got {:?}", other),
+        }
+
+        // 2. Change bin_count to 6 (keeping bin_size_minutes = 30)
+        engine.config.stats.histogram_bin_count = 6;
+        engine.refresh_stats_overlay_from_events(now, &merged);
+
+        match &engine.active_overlay_mode {
+            OverlayMode::HudStatus { total_active_minutes, bin_values, .. } => {
+                assert_eq!(*total_active_minutes, 80);
+                assert_eq!(bin_values.len(), 6);
+                // Indices 0..=5 correspond to 12:00..15:00
+                assert!((bin_values[0] - 1.0).abs() < 1e-4); // 12:00..12:30
+                assert_eq!(bin_values[1], 0.0);             // 12:30..13:00
+                assert!((bin_values[2] - 1.0).abs() < 1e-4); // 13:00..13:30
+                assert!((bin_values[3] - (600.0 / 1800.0)).abs() < 1e-4); // 13:30..14:00
+                assert!((bin_values[4] - (600.0 / 1800.0)).abs() < 1e-4); // 14:00..14:30
+                assert_eq!(bin_values[5], 0.0);             // 14:30..15:00
             }
             other => panic!("Expected HudStatus, got {:?}", other),
         }
