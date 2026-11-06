@@ -43,24 +43,434 @@ thread_local! {
     static OVERLAY_ACTION_HANDLER: RefCell<Option<Box<dyn Fn(OverlayAction)>>> = const { RefCell::new(None) };
 }
 
-/// RAII guard keeping the single-instance mutex and named activation event handles alive
-/// for the entire lifetime of the process.
-struct SingleInstanceLock {
-    _mutex: HANDLE,
-    activate_event: HANDLE,
-}
+/// Application entry point: initializes single-instance lock, config, Tokio engine task, system tray icon, and Slint event loop.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize logging
+    tracing_subscriber::fmt::init();
 
-impl Drop for SingleInstanceLock {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.activate_event.is_null() {
-                CloseHandle(self.activate_event);
+    // 2. Parse launch arguments & enforce single-instance lock
+    let args: Vec<String> = std::env::args().collect();
+    let start_minimized = args
+        .iter()
+        .any(|a| a == "--minimized" || a == "--autostart");
+
+    let _instance_lock = match acquire_single_instance(start_minimized) {
+        Some(lock) => lock,
+        None => {
+            tracing::info!("Another instance of AW-Enforcer is already running. Exiting.");
+            return Ok(());
+        }
+    };
+    let activate_event_val = _instance_lock.activate_event as isize;
+
+    // 3. Load application configuration & sync Windows autostart registry key
+    let config = AppConfig::load();
+    if std::env::var("SLINT_BACKEND").is_err() {
+        if config.general.slint_renderer.eq_ignore_ascii_case("software") {
+            unsafe {
+                std::env::set_var("SLINT_BACKEND", "winit-software");
             }
-            if !self._mutex.is_null() {
-                CloseHandle(self._mutex);
+            tracing::info!("Configured Slint renderer: CPU Software (renderer-software)");
+        } else {
+            unsafe {
+                std::env::set_var("SLINT_BACKEND", "winit-femtovg");
             }
+            tracing::info!("Configured Slint renderer: OpenGL (renderer-femtovg)");
         }
     }
+    if let Err(e) = autostart::set_autostart(config.general.autostart) {
+        tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
+    }
+    enforcer::ensure_app_user_model_id_registered();
+    let current_config = Rc::new(RefCell::new(config.clone()));
+
+    // 4. Initialize ActivityWatch REST Client
+    let aw_client = Arc::new(AwClient::new(
+        config.general.aw_port,
+        &config.general.api_key,
+    ));
+    let ui_aw_client = Rc::new(RefCell::new(aw_client.clone()));
+
+    // 5. Establish Tokio communication channels
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+    let (overlay_action_tx, mut overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
+
+    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
+    let tokio_rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed to build Tokio runtime"),
+    );
+    let rt_handle = tokio_rt.handle().clone();
+
+    let worker_config = config.clone();
+    let worker_client = aw_client.clone();
+    let initial_poll_secs = config.general.poll_interval_seconds.max(2);
+    let bg_rt = tokio_rt.clone();
+
+    std::thread::spawn(move || {
+        bg_rt.block_on(async move {
+            let mut engine = Engine::new(worker_config, worker_client, overlay_action_tx);
+            let mut cmd_rx = command_rx;
+
+            let mut ticker_1s = tokio::time::interval(Duration::from_secs(1));
+            let mut ticker_poll =
+                tokio::time::interval(Duration::from_secs(initial_poll_secs));
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        if let DaemonCommand::ReloadConfig(ref new_cfg) = cmd {
+                            let new_secs = new_cfg.general.poll_interval_seconds.max(2);
+                            ticker_poll = tokio::time::interval(Duration::from_secs(new_secs));
+                        }
+                        engine.handle_command(cmd).await;
+                    }
+                    _ = ticker_1s.tick() => {
+                        engine.realtime_tick().await;
+                    }
+                    _ = ticker_poll.tick() => {
+                        engine.poll_tick().await;
+                    }
+                }
+            }
+        });
+    });
+
+    // 7. Initialize OverlayManager with theme configuration
+    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
+        config.overlay.clone(),
+        Some(command_tx.clone()),
+        config.general.destroy_windows_on_hide,
+    )));
+
+    // 8. Shared UI state for lazy SettingsWindow instantiation
+    let settings_slot: Rc<RefCell<Option<SettingsWindow>>> = Rc::new(RefCell::new(None));
+    let live_ui_state: Rc<RefCell<LiveUiState>> = Rc::new(RefCell::new(LiveUiState::default()));
+    let aw_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
+
+    // 9. Build System Tray Menu
+    let item_settings = MenuItem::with_id("open_settings", "Open Settings", true, None);
+    let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
+    let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
+    let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
+    let initial_pause_label = if config.general.pause_all_rules {
+        "Resume All Rules"
+    } else {
+        "Pause All Rules"
+    };
+    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
+    let item_quit = MenuItem::with_id("quit", "Quit", true, None);
+
+    let tray_menu = Menu::new();
+    tray_menu.append(&item_settings)?;
+    tray_menu.append(&item_stats)?;
+    tray_menu.append(&item_dismiss)?;
+    tray_menu.append(&item_snooze)?;
+    tray_menu.append(&item_pause)?;
+    tray_menu.append(&PredefinedMenuItem::separator())?;
+    tray_menu.append(&item_quit)?;
+
+    let _tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("AW-Enforcer")
+        .with_icon(create_default_tray_icon())
+        .build()
+        .ok();
+    let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
+
+    // 10. Event-driven overlay action dispatch
+    {
+        let overlay_mgr = overlay_manager.clone();
+        let settings_slot_ref = settings_slot.clone();
+        let rules_model_ref = rules_model.clone();
+        let live_state_ref = live_ui_state.clone();
+        let tray_icon_ref = tray_icon_cell.clone();
+        let item_dismiss = item_dismiss.clone();
+        let item_snooze = item_snooze.clone();
+        let item_pause = item_pause.clone();
+
+        OVERLAY_ACTION_HANDLER.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
+                let mut mgr = overlay_mgr.borrow_mut();
+                match action {
+                    OverlayAction::Show(mode) => {
+                        mgr.show_mode(mode);
+                        mgr.apply_pending_win32_styles();
+                    }
+                    OverlayAction::UpdateCountdown {
+                        remaining,
+                        total,
+                        is_idle,
+                    } => {
+                        mgr.update_countdown(remaining, total, is_idle);
+                    }
+                    OverlayAction::UpdateTheme(theme_cfg) => {
+                        mgr.update_overlay_config(theme_cfg);
+                    }
+                    OverlayAction::UpdateLiveStatus {
+                        session_duration_text,
+                        screentime_text,
+                        active_app,
+                        strict_lock_active,
+                        rule_statuses,
+                        tray_tooltip,
+                        any_snoozed,
+                    } => {
+                        {
+                            let mut ls = live_state_ref.borrow_mut();
+                            ls.session_duration_text = session_duration_text.clone();
+                            ls.screentime_text = screentime_text.clone();
+                            ls.active_app = active_app.clone();
+                            ls.strict_lock_active = strict_lock_active;
+                            ls.rule_statuses = rule_statuses.clone();
+                            ls.any_snoozed = any_snoozed;
+                        }
+
+                        if let Some(ref win) = *settings_slot_ref.borrow() {
+                            win.set_current_session_duration_text(session_duration_text.as_str().into());
+                            win.set_today_screentime_text(screentime_text.as_str().into());
+                            win.set_current_active_app(active_app.as_str().into());
+                            win.set_strict_lock_active(strict_lock_active);
+                            if !strict_lock_active {
+                                win.set_strict_unlocked(false);
+                                win.set_strict_unlock_countdown(0);
+                            }
+                        }
+
+                        item_dismiss.set_enabled(!strict_lock_active);
+                        item_snooze.set_enabled(!strict_lock_active);
+                        item_snooze.set_text(if any_snoozed {
+                            "Resume Snoozed Rules"
+                        } else {
+                            "Snooze All (15m)"
+                        });
+                        item_pause.set_enabled(!strict_lock_active);
+
+                        if settings_slot_ref
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|w| w.window().is_visible())
+                        {
+                            update_rules_model_statuses(&rules_model_ref, &rule_statuses);
+                        }
+
+                        if let Some(ref ti) = *tray_icon_ref.borrow() {
+                            let _ = ti.set_tooltip(Some(&tray_tooltip));
+                        }
+                    }
+                    OverlayAction::Hide => mgr.hide_all(),
+                }
+            }));
+        });
+    }
+
+    let overlay_forwarder_handle = rt_handle.clone();
+    overlay_forwarder_handle.spawn(async move {
+        while let Some(action) = overlay_action_rx.recv().await {
+            slint::invoke_from_event_loop(move || {
+                OVERLAY_ACTION_HANDLER.with(|cell| {
+                    if let Some(ref handler) = *cell.borrow() {
+                        handler(action);
+                    }
+                });
+            })
+            .ok();
+        }
+    });
+
+    // 11. Main Thread UI Loop Timer (processes tray events, countdowns, and connection health)
+    let main_timer = slint::Timer::default();
+    {
+        let overlay_mgr = overlay_manager.clone();
+        let settings_slot_ref = settings_slot.clone();
+        let rules_model_ref = rules_model.clone();
+        let live_state_ref = live_ui_state.clone();
+        let aw_connected_flag_ref = aw_connected_flag.clone();
+        let cmd_tx = command_tx.clone();
+        let cfg_cell = current_config.clone();
+        let ui_client_cell = ui_aw_client.clone();
+        let handle = rt_handle.clone();
+        let item_pause = item_pause.clone();
+
+        let mut conn_check_counter = 0u32;
+        let mut unlock_counter = 0u32;
+
+        main_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(250),
+            move || {
+                let open_settings = |show: bool| {
+                    open_settings_window(
+                        &settings_slot_ref,
+                        &rules_model_ref,
+                        &cfg_cell,
+                        &ui_client_cell,
+                        &live_state_ref,
+                        &aw_connected_flag_ref,
+                        &cmd_tx,
+                        &handle,
+                        &item_pause,
+                        &overlay_mgr,
+                        show,
+                    )
+                };
+
+                // Strict unlock countdown tick (~1s = 4 ticks at 250ms)
+                unlock_counter += 1;
+                if unlock_counter >= 4 {
+                    unlock_counter = 0;
+                    if let Some(ref win) = *settings_slot_ref.borrow() {
+                        let cd = win.get_strict_unlock_countdown();
+                        if cd > 0 {
+                            let next_cd = cd - 1;
+                            win.set_strict_unlock_countdown(next_cd);
+                            if next_cd == 0 {
+                                win.set_strict_unlocked(true);
+                            }
+                        }
+                    }
+                }
+
+                // Poll named activation event from a second instance
+                if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
+                    if let Err(e) = open_settings(true) {
+                        tracing::error!("Failed to open SettingsWindow on activation event: {e}");
+                    }
+                }
+
+                // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
+                overlay_mgr.borrow_mut().apply_pending_win32_styles();
+
+                // Process System Tray Icon Double-Click Events
+                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                    if let TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        if let Err(e) = open_settings(true) {
+                            tracing::error!("Failed to open SettingsWindow on tray double-click: {e}");
+                        }
+                    }
+                }
+
+                // Process System Tray Menu Events
+                while let Ok(event) = MenuEvent::receiver().try_recv() {
+                    tracing::info!("Received system tray menu event: {}", event.id.0);
+                    match event.id.0.as_str() {
+                        "open_settings" => {
+                            if let Err(e) = open_settings(true) {
+                                tracing::error!("Failed to open SettingsWindow: {e}");
+                            }
+                        }
+                        "show_stats" => {
+                            cmd_tx.send(DaemonCommand::ShowStatsOverlay).ok();
+                        }
+                        "dismiss_break" => {
+                            cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
+                        }
+                        "snooze_15m" => {
+                            let is_locked = live_state_ref.borrow().strict_lock_active;
+                            if is_locked {
+                                continue;
+                            }
+                            let was_snoozed = live_state_ref.borrow().any_snoozed;
+                            if was_snoozed {
+                                cmd_tx.send(DaemonCommand::ClearSnoozeAll).ok();
+                            } else {
+                                cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
+                            }
+                        }
+                        "toggle_pause_all" => {
+                            let is_locked = live_state_ref.borrow().strict_lock_active;
+                            if is_locked {
+                                continue;
+                            }
+                            let new_paused = {
+                                let mut cfg = cfg_cell.borrow_mut();
+                                cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
+                                if let Err(e) = cfg.save() {
+                                    tracing::error!("Failed to save config on pause toggle: {e}");
+                                }
+                                cfg.general.pause_all_rules
+                            };
+                            item_pause.set_text(if new_paused {
+                                "Resume All Rules"
+                            } else {
+                                "Pause All Rules"
+                            });
+                            if let Some(ref win) = *settings_slot_ref.borrow() {
+                                win.set_pause_all_rules(new_paused);
+                            }
+                            cmd_tx
+                                .send(DaemonCommand::SetPauseAll { paused: new_paused })
+                                .ok();
+                        }
+                        "quit" => {
+                            slint::quit_event_loop().ok();
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
+                conn_check_counter += 1;
+                if conn_check_counter >= 12 {
+                    conn_check_counter = 0;
+                    if let Some(win) = settings_slot_ref.borrow().as_ref() {
+                        if win.window().is_visible() {
+                            spawn_aw_connection_check(
+                                win.as_weak(),
+                                aw_connected_flag_ref.clone(),
+                                ui_client_cell.borrow().clone(),
+                                &handle,
+                            );
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    let open_settings = |show: bool| {
+        open_settings_window(
+            &settings_slot,
+            &rules_model,
+            &current_config,
+            &ui_aw_client,
+            &live_ui_state,
+            &aw_connected_flag,
+            &command_tx,
+            &rt_handle,
+            &item_pause,
+            &overlay_manager,
+            show,
+        )
+    };
+
+    // Show Settings Window unless launched with --minimized / --autostart
+    if !start_minimized {
+        if let Err(e) = open_settings(true) {
+            tracing::error!("Failed to open SettingsWindow on startup: {e}");
+        }
+    } else if !config.general.destroy_windows_on_hide {
+        if let Err(e) = open_settings(false) {
+            tracing::error!("Failed to pre-instantiate SettingsWindow on startup: {e}");
+        }
+    }
+
+    if args.iter().any(|a| a == "--test-break") {
+        command_tx.send(DaemonCommand::TriggerTestOverlay { mode: "break".to_string() }).ok();
+    }
+
+    // 11. Run Slint Win32 GUI Event Loop until explicit tray Quit
+    slint::run_event_loop_until_quit()?;
+
+    Ok(())
 }
 
 /// Ensures only a single instance of AW-Enforcer runs at any time.
@@ -101,632 +511,31 @@ fn acquire_single_instance(is_background_launch: bool) -> Option<SingleInstanceL
     }
 }
 
+/// RAII guard keeping the single-instance mutex and named activation event handles alive
+/// for the entire lifetime of the process.
+struct SingleInstanceLock {
+    _mutex: HANDLE,
+    activate_event: HANDLE,
+}
+
+impl Drop for SingleInstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.activate_event.is_null() {
+                CloseHandle(self.activate_event);
+            }
+            if !self._mutex.is_null() {
+                CloseHandle(self._mutex);
+            }
+        }
+    }
+}
+
 /// Loads the official Fluent ClockPause 32x32 RGBA system tray icon.
 fn create_default_tray_icon() -> tray_icon::Icon {
     const TRAY_ICON_RGBA: &[u8] = include_bytes!("../assets/tray_icon_32.rgba");
     tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), 32, 32)
         .expect("Failed to create Fluent ClockPause tray icon")
-}
-
-/// Returns true if an executable name is non-empty and not a wildcard (`*`).
-fn is_specific_executable(s: &str) -> bool {
-    let trimmed = s.trim();
-    !trimmed.is_empty() && trimmed != "*"
-}
-
-/// Constructs a `DurationConfig` from a Slint view integer value and unit string, clamping to `min_val`.
-fn duration_from_view(val: i32, unit: &str, min_val: u32) -> DurationConfig {
-    DurationConfig::new(
-        val.max(min_val as i32) as u32,
-        TimeUnit::from_str_lossy(unit),
-    )
-}
-
-/// Converts a domain `Rule` into a Slint `RuleView` model for the Settings UI.
-fn rule_to_view(rule: &Rule) -> RuleView {
-    let slots_bool = rule.schedule.to_bool_array();
-    let slots_model = ModelRc::from(Rc::new(VecModel::from(slots_bool.to_vec())));
-
-    let targets: Vec<slint::SharedString> = rule
-        .target_executables
-        .iter()
-        .filter(|s| is_specific_executable(s))
-        .map(|s| slint::SharedString::from(s.trim()))
-        .collect();
-    let targets_model = ModelRc::from(Rc::new(VecModel::from(targets)));
-
-    let dur = |d: &DurationConfig| (d.value as i32, slint::SharedString::from(d.unit.as_str()));
-    let (period_val, period_unit) = dur(&rule.period);
-    let (reset_afk_val, reset_afk_unit) = dur(&rule.reset_after_afk);
-    let (limit_val, limit_unit) = dur(&rule.limit);
-    let (warn_before_val, warn_before_unit) = dur(&rule.warn_before);
-    let (grace_val, grace_unit) = dur(&rule.grace_duration);
-    let (break_val, break_unit) = dur(&rule.break_duration);
-    let (notification_duration_val, notification_duration_unit) = dur(&rule.notification_duration);
-
-    RuleView {
-        id: rule.id.as_str().into(),
-        enabled: rule.enabled,
-        name: rule.name.as_str().into(),
-        monitor_selection: rule.monitor_selection.as_str().into(),
-        target_executables: targets_model,
-        title_regex: rule.title_regex.as_str().into(),
-        url_regex: rule.url_regex.as_str().into(),
-        status_text: "".into(),
-        trigger: rule.trigger.as_str().into(),
-        period_val,
-        period_unit,
-        reset_afk_val,
-        reset_afk_unit,
-        limit_val,
-        limit_unit,
-        action: rule.action.as_str().into(),
-        warn_before_val,
-        warn_before_unit,
-        grace_val,
-        grace_unit,
-        break_val,
-        break_unit,
-        click_through: rule.click_through,
-        strict_mode: rule.strict_mode,
-        notification_method: rule.notification_method.as_str().into(),
-        notification_duration_val,
-        notification_duration_unit,
-        show_remaining_time: rule.show_remaining_time,
-        message: rule.message.as_str().into(),
-        schedule_slots: slots_model,
-    }
-}
-
-/// Converts a Slint `RuleView` from the Settings UI back into a sanitized domain `Rule`.
-fn view_to_rule(view: &RuleView) -> Rule {
-    let mut slots = [false; 168];
-    for (i, val) in view.schedule_slots.iter().enumerate() {
-        if i < 168 {
-            slots[i] = val;
-        }
-    }
-
-    let mut targets: Vec<String> = view
-        .target_executables
-        .iter()
-        .filter(|s| is_specific_executable(s.as_str()))
-        .map(|s| s.trim().to_string())
-        .collect();
-    if targets.is_empty() {
-        targets.push("*".to_string());
-    }
-
-    let monitor_selection = MonitorSelection::from_str_lossy(view.monitor_selection.as_str());
-    let trigger = TriggerType::from_str_lossy(view.trigger.as_str());
-    let action = RuleAction::from_str_lossy(view.action.as_str());
-    let notification_method = NotificationMethod::from_str_lossy(view.notification_method.as_str());
-
-    let mut rule = Rule {
-        id: view.id.to_string(),
-        enabled: view.enabled,
-        name: view.name.to_string(),
-        monitor_selection,
-        target_executables: targets,
-        title_regex: view.title_regex.to_string(),
-        url_regex: view.url_regex.to_string(),
-        trigger,
-        period: duration_from_view(view.period_val, view.period_unit.as_str(), 1),
-        reset_after_afk: duration_from_view(view.reset_afk_val, view.reset_afk_unit.as_str(), 1),
-        limit: duration_from_view(view.limit_val, view.limit_unit.as_str(), 0),
-        action,
-        warn_before: duration_from_view(view.warn_before_val, view.warn_before_unit.as_str(), 0),
-        grace_duration: duration_from_view(view.grace_val, view.grace_unit.as_str(), 0),
-        break_duration: duration_from_view(view.break_val, view.break_unit.as_str(), 1),
-        click_through: view.click_through,
-        strict_mode: view.strict_mode,
-        notification_method,
-        notification_duration: duration_from_view(
-            view.notification_duration_val,
-            view.notification_duration_unit.as_str(),
-            1,
-        ),
-        show_remaining_time: view.show_remaining_time,
-        message: view.message.to_string(),
-        schedule: RuleSchedule::from_bool_array(&slots),
-    };
-    rule.sanitize();
-    rule
-}
-
-/// Returns the first non-empty, non-wildcard executable from a rule's target executables model.
-fn first_specific_executable(targets: &slint::ModelRc<slint::SharedString>) -> Option<String> {
-    targets.iter().find_map(|t| {
-        let s = t.trim();
-        is_specific_executable(s).then(|| s.to_string())
-    })
-}
-
-/// Refreshes the message editor UI state (line count, active selection, toggle highlights, color/size dropdowns, and preview).
-fn refresh_message_editor_state(
-    win: &SettingsWindow,
-    message: &str,
-    line_idx: usize,
-    rule: Option<&RuleView>,
-) {
-    let line_count = message.split('\n').count().max(1);
-    let line_indices: Vec<i32> = (1..=(line_count as i32)).collect();
-    win.set_message_lines(ModelRc::from(Rc::new(VecModel::from(line_indices))));
-
-    let active_line = line_idx.min(line_count - 1);
-    win.set_selected_message_line(active_line as i32);
-
-    let status = formatter::detect_line_formatting(message, active_line);
-    win.set_line_is_h1(status.is_h1);
-    win.set_line_is_h2(status.is_h2);
-    win.set_line_is_bold(status.is_bold);
-    win.set_line_is_italic(status.is_italic);
-    win.set_line_is_underline(status.is_underline);
-    win.set_line_color(status.color_code.as_str().into());
-    win.set_line_size(status.size_val as i32);
-
-    win.set_line_color_display(formatter::color_code_to_display(&status.color_code).into());
-    let size_disp = if status.size_val > 0 {
-        format!("Size: {}px", status.size_val)
-    } else {
-        "Size: Default".to_string()
-    };
-    win.set_line_size_display(size_disp.into());
-
-    // Context for live preview interpolation
-    let real_ctx = if let Some(r) = rule {
-        let domain_rule = view_to_rule(r);
-        formatter::build_preview_context(&domain_rule)
-    } else {
-        MessageContext::sample()
-    };
-    let alignment = if rule.map_or(false, |r| r.action.as_str() == "Show Notification") {
-        TextHorizontalAlignment::Left
-    } else {
-        TextHorizontalAlignment::Center
-    };
-    let paras = formatter::parse_formatted_text_with_context_and_alignment(message, &real_ctx, alignment);
-    win.set_preview_paragraphs(ModelRc::from(Rc::new(VecModel::from(paras))));
-
-    if win.get_editor_message_text().as_str() != message {
-        win.set_editor_message_text(message.into());
-    }
-}
-
-/// Validates regex pattern for a given monitor selection mode, rejecting empty patterns for Titles and Urls.
-pub fn validate_rule_pattern(mode: &str, title_re: &str, url_re: &str) -> (bool, String) {
-    match mode {
-        "Titles" => {
-            if title_re.trim().is_empty() {
-                (false, "Title regex pattern cannot be empty".to_string())
-            } else {
-                config::validate_regex_pattern(title_re)
-            }
-        }
-        "Urls" => {
-            if url_re.trim().is_empty() {
-                (false, "URL regex pattern cannot be empty".to_string())
-            } else {
-                config::validate_regex_pattern(url_re)
-            }
-        }
-        _ => (true, String::new()),
-    }
-}
-
-/// Validates regular expressions for the currently selected rule if Title or URL monitoring is selected.
-/// When Executables monitoring is selected, sets `rule-regex-valid = true` and `rule-regex-error = ""`.
-fn refresh_rule_regex_validation(win: &SettingsWindow, _rm: &VecModel<RuleView>) {
-    let cur_idx = win.get_selected_rule_idx();
-    let (valid, err) = if cur_idx >= 0 {
-        let mode = win.get_rule_monitor_selection();
-        match mode.as_str() {
-            "Titles" => validate_rule_pattern("Titles", &win.get_rule_title_regex(), ""),
-            "Urls" => validate_rule_pattern("Urls", "", &win.get_rule_url_regex()),
-            _ => (true, String::new()),
-        }
-    } else {
-        (true, String::new())
-    };
-
-    win.set_rule_regex_valid(valid);
-    win.set_rule_regex_error(if valid { "".into() } else { err.into() });
-}
-
-/// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
-/// Returns `true` if `warn_before` is configured (> 0) and is greater than or equal to the rule's trigger threshold.
-fn check_warn_before_exceeds_threshold(rule_view: &RuleView) -> bool {
-    let domain_rule = view_to_rule(rule_view);
-    domain_rule.warn_before.to_seconds() > 0
-        && domain_rule.warn_before.to_seconds() >= domain_rule.trigger_threshold_seconds()
-}
-
-fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<RuleView>) {
-    win.set_rule_enabled(rule.enabled);
-    win.set_rule_name(rule.name.clone());
-    win.set_rule_monitor_selection(rule.monitor_selection.clone());
-    win.set_rule_title_regex(rule.title_regex.clone());
-    win.set_rule_url_regex(rule.url_regex.clone());
-    win.set_rule_trigger(rule.trigger.clone());
-    win.set_rule_period_val(rule.period_val);
-    win.set_rule_period_unit(rule.period_unit.clone());
-    win.set_rule_reset_afk_val(rule.reset_afk_val);
-    win.set_rule_reset_afk_unit(rule.reset_afk_unit.clone());
-    win.set_rule_limit_val(rule.limit_val);
-    win.set_rule_limit_unit(rule.limit_unit.clone());
-    win.set_rule_action(rule.action.clone());
-    win.set_rule_notification_method(rule.notification_method.clone());
-    win.set_rule_notification_duration_val(rule.notification_duration_val);
-    win.set_rule_notification_duration_unit(rule.notification_duration_unit.clone());
-    win.set_rule_show_remaining_time(rule.show_remaining_time);
-    win.set_rule_warn_before_val(rule.warn_before_val);
-    win.set_rule_warn_before_unit(rule.warn_before_unit.clone());
-    win.set_rule_grace_val(rule.grace_val);
-    win.set_rule_grace_unit(rule.grace_unit.clone());
-    win.set_rule_break_val(rule.break_val);
-    win.set_rule_break_unit(rule.break_unit.clone());
-    win.set_rule_click_through(rule.click_through);
-    win.set_rule_strict_mode(rule.strict_mode);
-    win.set_editor_message_text(rule.message.clone());
-    refresh_message_editor_state(win, &rule.message, 0, Some(rule));
-    win.set_warn_before_exceeds_threshold(check_warn_before_exceeds_threshold(rule));
-    refresh_rule_regex_validation(win, rm);
-}
-
-/// Extracts all editable rule settings from the `SettingsWindow` into the provided `RuleView`.
-fn sync_editor_to_rule_view(win: &SettingsWindow, rule: &mut RuleView) {
-    rule.enabled = win.get_rule_enabled();
-    rule.name = win.get_rule_name();
-    rule.monitor_selection = win.get_rule_monitor_selection();
-    rule.title_regex = win.get_rule_title_regex();
-    rule.url_regex = win.get_rule_url_regex();
-    rule.trigger = win.get_rule_trigger();
-    rule.period_val = win.get_rule_period_val();
-    rule.period_unit = win.get_rule_period_unit();
-    rule.reset_afk_val = win.get_rule_reset_afk_val();
-    rule.reset_afk_unit = win.get_rule_reset_afk_unit();
-    rule.limit_val = win.get_rule_limit_val();
-    rule.limit_unit = win.get_rule_limit_unit();
-    rule.action = win.get_rule_action();
-    rule.notification_method = win.get_rule_notification_method();
-    rule.notification_duration_val = win.get_rule_notification_duration_val();
-    rule.notification_duration_unit = win.get_rule_notification_duration_unit();
-    rule.show_remaining_time = win.get_rule_show_remaining_time();
-    rule.warn_before_val = win.get_rule_warn_before_val();
-    rule.warn_before_unit = win.get_rule_warn_before_unit();
-    rule.grace_val = win.get_rule_grace_val();
-    rule.grace_unit = win.get_rule_grace_unit();
-    rule.break_val = win.get_rule_break_val();
-    rule.break_unit = win.get_rule_break_unit();
-    rule.click_through = win.get_rule_click_through();
-    rule.strict_mode = win.get_rule_strict_mode();
-}
-
-/// Finds the next available non-conflicting `rule-{n}` identifier.
-fn next_available_rule_id(rm: &VecModel<RuleView>) -> String {
-    let mut n = rm.row_count() + 1;
-    while (0..rm.row_count()).any(|i| {
-        rm.row_data(i)
-            .map(|r| r.id.as_str() == format!("rule-{n}"))
-            .unwrap_or(false)
-    }) {
-        n += 1;
-    }
-    format!("rule-{n}")
-}
-
-/// Extracts the current configuration from `SettingsWindow` and `rules_model`, applying safety sanitization.
-fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
-    let mut updated_config = base_cfg.clone();
-
-    updated_config.general.aw_port = win.get_aw_port().clamp(1, 65535) as u16;
-    updated_config.general.poll_interval_seconds =
-        win.get_poll_interval_seconds().max(2) as u64;
-    updated_config.general.autostart = win.get_autostart();
-    updated_config.general.api_key = win.get_api_key().to_string();
-    updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
-    updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
-    updated_config.general.pause_all_rules = win.get_pause_all_rules();
-    updated_config.general.destroy_windows_on_hide = win.get_destroy_windows_on_hide();
-    updated_config.general.slint_renderer = win.get_slint_renderer().to_string();
-
-    updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
-    updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
-    updated_config.overlay.background_color = win.get_background_color_hex().to_string();
-    updated_config.overlay.text_color = win.get_text_color_hex().to_string();
-
-    updated_config.stats.daily_screentime_target_minutes =
-        win.get_daily_target_minutes().max(1) as u32;
-    let raw_excessive = win.get_threshold_excessive_minutes().max(1) as u32;
-    let clamped_excessive =
-        raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
-    updated_config.stats.threshold_excessive_minutes = clamped_excessive;
-    updated_config.stats.histogram_bin_size_minutes =
-        win.get_histogram_bin_size_minutes().clamp(1, 1440) as u32;
-    updated_config.stats.histogram_bin_count =
-        win.get_histogram_bin_count().clamp(1, 96) as u32;
-    updated_config.stats.histogram_time_format =
-        win.get_time_format_code().to_string();
-
-    // Convert rules
-    let r_model = win.get_rules();
-    let mut rules = Vec::new();
-    for i in 0..r_model.row_count() {
-        if let Some(v) = r_model.row_data(i) {
-            rules.push(view_to_rule(&v));
-        }
-    }
-    updated_config.rules = rules;
-    updated_config.sanitize();
-
-    updated_config
-}
-
-/// Updates the preview color box for accent, background, or text colors if valid hex.
-fn set_color_preview(win: &SettingsWindow, kind: &str, hex: &str) {
-    if let Some(c) = formatter::parse_hex_color(hex) {
-        match kind {
-            "accent" => win.set_accent_color_preview(c),
-            "background" => win.set_background_color_preview(c),
-            "text" => win.set_text_color_preview(c),
-            _ => {}
-        }
-    }
-}
-
-/// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
-fn apply_config_to_ui(
-    win: &SettingsWindow,
-    cfg: &AppConfig,
-    rules_model: &VecModel<RuleView>,
-) {
-    win.set_aw_port(cfg.general.aw_port as i32);
-    win.set_poll_interval_seconds(cfg.general.poll_interval_seconds as i32);
-    win.set_autostart(cfg.general.autostart);
-    win.set_api_key(cfg.general.api_key.as_str().into());
-    win.set_day_start_hour(cfg.general.day_start_hour as i32);
-    win.set_suppress_fullscreen_d3d(cfg.general.suppress_fullscreen_d3d);
-    win.set_pause_all_rules(cfg.general.pause_all_rules);
-    win.set_destroy_windows_on_hide(cfg.general.destroy_windows_on_hide);
-    win.set_slint_renderer(cfg.general.slint_renderer.as_str().into());
-    let renderer_display = if cfg.general.slint_renderer.eq_ignore_ascii_case("software") {
-        "CPU Software (renderer-software)"
-    } else {
-        "OpenGL (renderer-femtovg)"
-    };
-    win.set_slint_renderer_display(renderer_display.into());
-    win.set_overlay_opacity(cfg.overlay.opacity);
-    win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
-    win.set_background_color_hex(cfg.overlay.background_color.as_str().into());
-    win.set_text_color_hex(cfg.overlay.text_color.as_str().into());
-    set_color_preview(win, "accent", &cfg.overlay.accent_color);
-    set_color_preview(win, "background", &cfg.overlay.background_color);
-    set_color_preview(win, "text", &cfg.overlay.text_color);
-    win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
-    win.set_threshold_excessive_minutes(cfg.stats.threshold_excessive_minutes as i32);
-    win.set_histogram_bin_size_minutes(cfg.stats.histogram_bin_size_minutes as i32);
-    win.set_histogram_bin_count(cfg.stats.histogram_bin_count as i32);
-    win.set_time_format_code(cfg.stats.histogram_time_format.as_str().into());
-
-    let (valid, preview) = config::validate_strftime_format(&cfg.stats.histogram_time_format);
-    win.set_time_format_valid(valid);
-    win.set_time_format_preview(preview.as_str().into());
-
-    let rules_vec: Vec<RuleView> = cfg.rules.iter().map(rule_to_view).collect();
-    rules_model.set_vec(rules_vec);
-
-    let cur_idx = win.get_selected_rule_idx();
-    let safe_idx = if cur_idx >= 0 && (cur_idx as usize) < cfg.rules.len() {
-        cur_idx as usize
-    } else if !cfg.rules.is_empty() {
-        if cur_idx >= 0 {
-            win.set_selected_rule_idx(0);
-        }
-        0
-    } else {
-        win.set_selected_rule_idx(-1);
-        0
-    };
-
-    if let Some(r) = cfg.rules.get(safe_idx) {
-        let rv = rule_to_view(r);
-        load_rule_into_editor(win, &rv, rules_model);
-    } else {
-        refresh_rule_regex_validation(win, rules_model);
-    }
-    win.set_has_unsaved_changes(false);
-}
-
-/// Mutates the `RuleView` at `rule_idx` inside `rm` if `mutator` returns `true`, marking the UI as having unsaved changes.
-fn update_rule_at(
-    rm: &VecModel<RuleView>,
-    sw: &slint::Weak<SettingsWindow>,
-    rule_idx: i32,
-    mutator: impl FnOnce(&mut RuleView, &SettingsWindow, &VecModel<RuleView>) -> bool,
-) {
-    let idx = rule_idx as usize;
-    if let (Some(win), Some(mut rule)) = (
-        sw.upgrade(),
-        (idx < rm.row_count()).then(|| rm.row_data(idx)).flatten(),
-    ) {
-        if mutator(&mut rule, &win, rm) {
-            rm.set_row_data(idx, rule);
-            win.set_has_unsaved_changes(true);
-        }
-    }
-}
-
-/// Normalizes an executable name by trimming whitespace, appending `.exe` if missing,
-/// cleanly handling internal or trailing `.exe` with surrounding spaces,
-/// and returning `None` if the input is empty or wildcard `*`.
-pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
-    let trimmed = exe_name.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        return None;
-    }
-    if trimmed.to_ascii_lowercase().ends_with(".exe") {
-        let mut stem = trimmed[..trimmed.len() - 4].trim();
-        while stem.to_ascii_lowercase().ends_with(".exe") {
-            stem = stem[..stem.len() - 4].trim();
-        }
-        if stem.is_empty() || stem == "*" {
-            return None;
-        }
-        let ext = &trimmed[trimmed.len() - 4..];
-        Some(format!("{}{}", stem, ext))
-    } else {
-        Some(format!("{}.exe", trimmed))
-    }
-}
-
-/// Appends a case-insensitively deduplicated executable name to the rule at `rule_idx`,
-/// normalizing executable names without `.exe` (e.g. `"steam"` -> `"steam.exe"`).
-fn add_executable_to_rule(
-    rm: &VecModel<RuleView>,
-    sw: &slint::Weak<SettingsWindow>,
-    rule_idx: i32,
-    exe_name: &str,
-) {
-    let Some(normalized) = normalize_executable_name(exe_name) else {
-        return;
-    };
-    update_rule_at(rm, sw, rule_idx, |rule_view, win, rm| {
-        let mut targets: Vec<slint::SharedString> = rule_view
-            .target_executables
-            .iter()
-            .filter(|t| is_specific_executable(t.as_str()))
-            .collect();
-        if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(&normalized)) {
-            targets.push(normalized.as_str().into());
-            rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
-            load_rule_into_editor(win, rule_view, rm);
-            return true;
-        }
-        false
-    });
-}
-
-/// Returns true if UI controls should be locked due to active strict break enforcement without an unlock countdown.
-fn is_ui_locked_by_strict(win: &SettingsWindow) -> bool {
-    win.get_strict_lock_active() && !win.get_strict_unlocked()
-}
-
-/// Applies a mutation closure `f` to the 168-slot weekly schedule array of the rule at `rule_idx`.
-fn update_rule_schedule(
-    rm: &VecModel<RuleView>,
-    sw: &slint::Weak<SettingsWindow>,
-    rule_idx: i32,
-    f: impl FnOnce(&mut [bool]),
-) {
-    update_rule_at(rm, sw, rule_idx, |rule, _, _| {
-        let mut slots: Vec<bool> = rule.schedule_slots.iter().collect();
-        if slots.len() == 168 {
-            f(&mut slots);
-            rule.schedule_slots = ModelRc::from(Rc::new(VecModel::from(slots)));
-            return true;
-        }
-        false
-    });
-}
-
-/// Asynchronously scans local running processes (<15ms) and updates known apps with only actively running executables.
-fn scan_and_update_known_apps(
-    sw: slint::Weak<SettingsWindow>,
-    handle: tokio::runtime::Handle,
-) {
-    handle.spawn(async move {
-        let mut app_set = std::collections::BTreeSet::new();
-
-        enforcer::for_each_process(|_pid, name| {
-            if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
-                app_set.insert(name.to_string());
-            }
-        });
-
-        let app_vec: Vec<slint::SharedString> =
-            app_set.into_iter().map(|s| s.as_str().into()).collect();
-        slint::invoke_from_event_loop(move || {
-            if let Some(win) = sw.upgrade() {
-                win.set_known_apps(ModelRc::from(Rc::new(VecModel::from(app_vec))));
-            }
-        })
-        .ok();
-    });
-}
-
-/// Cached live telemetry state so a newly created `SettingsWindow` immediately displays current daemon status.
-struct LiveUiState {
-    session_duration_text: String,
-    screentime_text: String,
-    active_app: String,
-    strict_lock_active: bool,
-    rule_statuses: Vec<(String, String)>,
-    any_snoozed: bool,
-}
-
-impl Default for LiveUiState {
-    fn default() -> Self {
-        Self {
-            session_duration_text: "0m".to_string(),
-            screentime_text: "0h 0m".to_string(),
-            active_app: "None".to_string(),
-            strict_lock_active: false,
-            rule_statuses: Vec::new(),
-            any_snoozed: false,
-        }
-    }
-}
-
-/// Updates the status text of matching rules in `rules_model` if their text changed.
-fn update_rules_model_statuses(rules_model: &VecModel<RuleView>, statuses: &[(String, String)]) {
-    for (rule_id, status_text) in statuses {
-        for idx in 0..rules_model.row_count() {
-            if let Some(mut r) = rules_model.row_data(idx) {
-                if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
-                    r.status_text = status_text.as_str().into();
-                    rules_model.set_row_data(idx, r);
-                }
-            }
-        }
-    }
-}
-
-/// Restores and brings a Slint window to the foreground via native Win32 APIs.
-fn restore_and_focus_window(window: &slint::Window) {
-    if let Some(hwnd) = OverlayManager::extract_window_hwnd(window) {
-        unsafe {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
-        }
-    }
-}
-
-/// Asynchronously checks the ActivityWatch connection and updates the UI property and atomic flag.
-fn spawn_aw_connection_check(
-    sw: slint::Weak<SettingsWindow>,
-    conn_flag: Arc<std::sync::atomic::AtomicBool>,
-    client: Arc<AwClient>,
-    handle: &tokio::runtime::Handle,
-) {
-    handle.spawn(async move {
-        let connected = client.check_connection().await;
-        conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
-        slint::invoke_from_event_loop(move || {
-            if let Some(win) = sw.upgrade() {
-                win.set_aw_connected(connected);
-            }
-        })
-        .ok();
-    });
-}
-
-/// Synchronizes cached live daemon telemetry and rule statuses to the `SettingsWindow` and its rules model.
-fn sync_live_state_to_ui(win: &SettingsWindow, rules_model: &VecModel<RuleView>, ls: &LiveUiState) {
-    win.set_current_session_duration_text(ls.session_duration_text.as_str().into());
-    win.set_today_screentime_text(ls.screentime_text.as_str().into());
-    win.set_current_active_app(ls.active_app.as_str().into());
-    win.set_strict_lock_active(ls.strict_lock_active);
-    update_rules_model_statuses(rules_model, &ls.rule_statuses);
 }
 
 /// Lazily instantiates, populates, wires, and displays the `SettingsWindow` (or focuses it if already open).
@@ -1526,434 +1335,625 @@ fn open_settings_window(
     Ok(())
 }
 
-/// Application entry point: initializes single-instance lock, config, Tokio engine task, system tray icon, and Slint event loop.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize logging
-    tracing_subscriber::fmt::init();
-
-    // 2. Parse launch arguments & enforce single-instance lock
-    let args: Vec<String> = std::env::args().collect();
-    let start_minimized = args
-        .iter()
-        .any(|a| a == "--minimized" || a == "--autostart");
-
-    let _instance_lock = match acquire_single_instance(start_minimized) {
-        Some(lock) => lock,
-        None => {
-            tracing::info!("Another instance of AW-Enforcer is already running. Exiting.");
-            return Ok(());
-        }
-    };
-    let activate_event_val = _instance_lock.activate_event as isize;
-
-    // 3. Load application configuration & sync Windows autostart registry key
-    let config = AppConfig::load();
-    if std::env::var("SLINT_BACKEND").is_err() {
-        if config.general.slint_renderer.eq_ignore_ascii_case("software") {
-            unsafe {
-                std::env::set_var("SLINT_BACKEND", "winit-software");
-            }
-            tracing::info!("Configured Slint renderer: CPU Software (renderer-software)");
-        } else {
-            unsafe {
-                std::env::set_var("SLINT_BACKEND", "winit-femtovg");
-            }
-            tracing::info!("Configured Slint renderer: OpenGL (renderer-femtovg)");
+/// Restores and brings a Slint window to the foreground via native Win32 APIs.
+fn restore_and_focus_window(window: &slint::Window) {
+    if let Some(hwnd) = OverlayManager::extract_window_hwnd(window) {
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
         }
     }
-    if let Err(e) = autostart::set_autostart(config.general.autostart) {
-        tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
-    }
-    enforcer::ensure_app_user_model_id_registered();
-    let current_config = Rc::new(RefCell::new(config.clone()));
+}
 
-    // 4. Initialize ActivityWatch REST Client
-    let aw_client = Arc::new(AwClient::new(
-        config.general.aw_port,
-        &config.general.api_key,
-    ));
-    let ui_aw_client = Rc::new(RefCell::new(aw_client.clone()));
-
-    // 5. Establish Tokio communication channels
-    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
-    let (overlay_action_tx, mut overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
-
-    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
-    let tokio_rt = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("Failed to build Tokio runtime"),
-    );
-    let rt_handle = tokio_rt.handle().clone();
-
-    let worker_config = config.clone();
-    let worker_client = aw_client.clone();
-    let initial_poll_secs = config.general.poll_interval_seconds.max(2);
-    let bg_rt = tokio_rt.clone();
-
-    std::thread::spawn(move || {
-        bg_rt.block_on(async move {
-            let mut engine = Engine::new(worker_config, worker_client, overlay_action_tx);
-            let mut cmd_rx = command_rx;
-
-            let mut ticker_1s = tokio::time::interval(Duration::from_secs(1));
-            let mut ticker_poll =
-                tokio::time::interval(Duration::from_secs(initial_poll_secs));
-
-            loop {
-                tokio::select! {
-                    Some(cmd) = cmd_rx.recv() => {
-                        if let DaemonCommand::ReloadConfig(ref new_cfg) = cmd {
-                            let new_secs = new_cfg.general.poll_interval_seconds.max(2);
-                            ticker_poll = tokio::time::interval(Duration::from_secs(new_secs));
-                        }
-                        engine.handle_command(cmd).await;
-                    }
-                    _ = ticker_1s.tick() => {
-                        engine.realtime_tick().await;
-                    }
-                    _ = ticker_poll.tick() => {
-                        engine.poll_tick().await;
-                    }
-                }
+/// Asynchronously checks the ActivityWatch connection and updates the UI property and atomic flag.
+fn spawn_aw_connection_check(
+    sw: slint::Weak<SettingsWindow>,
+    conn_flag: Arc<std::sync::atomic::AtomicBool>,
+    client: Arc<AwClient>,
+    handle: &tokio::runtime::Handle,
+) {
+    handle.spawn(async move {
+        let connected = client.check_connection().await;
+        conn_flag.store(connected, std::sync::atomic::Ordering::Relaxed);
+        slint::invoke_from_event_loop(move || {
+            if let Some(win) = sw.upgrade() {
+                win.set_aw_connected(connected);
             }
-        });
-    });
-
-    // 7. Initialize OverlayManager with theme configuration
-    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
-        config.overlay.clone(),
-        Some(command_tx.clone()),
-        config.general.destroy_windows_on_hide,
-    )));
-
-    // 8. Shared UI state for lazy SettingsWindow instantiation
-    let settings_slot: Rc<RefCell<Option<SettingsWindow>>> = Rc::new(RefCell::new(None));
-    let live_ui_state: Rc<RefCell<LiveUiState>> = Rc::new(RefCell::new(LiveUiState::default()));
-    let aw_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
-
-    // 9. Build System Tray Menu
-    let item_settings = MenuItem::with_id("open_settings", "Open Settings", true, None);
-    let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
-    let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
-    let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
-    let initial_pause_label = if config.general.pause_all_rules {
-        "Resume All Rules"
-    } else {
-        "Pause All Rules"
-    };
-    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
-    let item_quit = MenuItem::with_id("quit", "Quit", true, None);
-
-    let tray_menu = Menu::new();
-    tray_menu.append(&item_settings)?;
-    tray_menu.append(&item_stats)?;
-    tray_menu.append(&item_dismiss)?;
-    tray_menu.append(&item_snooze)?;
-    tray_menu.append(&item_pause)?;
-    tray_menu.append(&PredefinedMenuItem::separator())?;
-    tray_menu.append(&item_quit)?;
-
-    let _tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("AW-Enforcer")
-        .with_icon(create_default_tray_icon())
-        .build()
+        })
         .ok();
-    let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
-
-    // 10. Event-driven overlay action dispatch
-    {
-        let overlay_mgr = overlay_manager.clone();
-        let settings_slot_ref = settings_slot.clone();
-        let rules_model_ref = rules_model.clone();
-        let live_state_ref = live_ui_state.clone();
-        let tray_icon_ref = tray_icon_cell.clone();
-        let item_dismiss = item_dismiss.clone();
-        let item_snooze = item_snooze.clone();
-        let item_pause = item_pause.clone();
-
-        OVERLAY_ACTION_HANDLER.with(|cell| {
-            *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
-                let mut mgr = overlay_mgr.borrow_mut();
-                match action {
-                    OverlayAction::Show(mode) => {
-                        mgr.show_mode(mode);
-                        mgr.apply_pending_win32_styles();
-                    }
-                    OverlayAction::UpdateCountdown {
-                        remaining,
-                        total,
-                        is_idle,
-                    } => {
-                        mgr.update_countdown(remaining, total, is_idle);
-                    }
-                    OverlayAction::UpdateTheme(theme_cfg) => {
-                        mgr.update_overlay_config(theme_cfg);
-                    }
-                    OverlayAction::UpdateLiveStatus {
-                        session_duration_text,
-                        screentime_text,
-                        active_app,
-                        strict_lock_active,
-                        rule_statuses,
-                        tray_tooltip,
-                        any_snoozed,
-                    } => {
-                        {
-                            let mut ls = live_state_ref.borrow_mut();
-                            ls.session_duration_text = session_duration_text.clone();
-                            ls.screentime_text = screentime_text.clone();
-                            ls.active_app = active_app.clone();
-                            ls.strict_lock_active = strict_lock_active;
-                            ls.rule_statuses = rule_statuses.clone();
-                            ls.any_snoozed = any_snoozed;
-                        }
-
-                        if let Some(ref win) = *settings_slot_ref.borrow() {
-                            win.set_current_session_duration_text(session_duration_text.as_str().into());
-                            win.set_today_screentime_text(screentime_text.as_str().into());
-                            win.set_current_active_app(active_app.as_str().into());
-                            win.set_strict_lock_active(strict_lock_active);
-                            if !strict_lock_active {
-                                win.set_strict_unlocked(false);
-                                win.set_strict_unlock_countdown(0);
-                            }
-                        }
-
-                        item_dismiss.set_enabled(!strict_lock_active);
-                        item_snooze.set_enabled(!strict_lock_active);
-                        item_snooze.set_text(if any_snoozed {
-                            "Resume Snoozed Rules"
-                        } else {
-                            "Snooze All (15m)"
-                        });
-                        item_pause.set_enabled(!strict_lock_active);
-
-                        if settings_slot_ref
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|w| w.window().is_visible())
-                        {
-                            update_rules_model_statuses(&rules_model_ref, &rule_statuses);
-                        }
-
-                        if let Some(ref ti) = *tray_icon_ref.borrow() {
-                            let _ = ti.set_tooltip(Some(&tray_tooltip));
-                        }
-                    }
-                    OverlayAction::Hide => mgr.hide_all(),
-                }
-            }));
-        });
-    }
-
-    let overlay_forwarder_handle = rt_handle.clone();
-    overlay_forwarder_handle.spawn(async move {
-        while let Some(action) = overlay_action_rx.recv().await {
-            slint::invoke_from_event_loop(move || {
-                OVERLAY_ACTION_HANDLER.with(|cell| {
-                    if let Some(ref handler) = *cell.borrow() {
-                        handler(action);
-                    }
-                });
-            })
-            .ok();
-        }
     });
+}
 
-    // 11. Main Thread UI Loop Timer (processes tray events, countdowns, and connection health)
-    let main_timer = slint::Timer::default();
-    {
-        let overlay_mgr = overlay_manager.clone();
-        let settings_slot_ref = settings_slot.clone();
-        let rules_model_ref = rules_model.clone();
-        let live_state_ref = live_ui_state.clone();
-        let aw_connected_flag_ref = aw_connected_flag.clone();
-        let cmd_tx = command_tx.clone();
-        let cfg_cell = current_config.clone();
-        let ui_client_cell = ui_aw_client.clone();
-        let handle = rt_handle.clone();
-        let item_pause = item_pause.clone();
+/// Asynchronously scans local running processes (<15ms) and updates known apps with only actively running executables.
+fn scan_and_update_known_apps(
+    sw: slint::Weak<SettingsWindow>,
+    handle: tokio::runtime::Handle,
+) {
+    handle.spawn(async move {
+        let mut app_set = std::collections::BTreeSet::new();
 
-        let mut conn_check_counter = 0u32;
-        let mut unlock_counter = 0u32;
+        enforcer::for_each_process(|_pid, name| {
+            if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+                app_set.insert(name.to_string());
+            }
+        });
 
-        main_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(250),
-            move || {
-                let open_settings = |show: bool| {
-                    open_settings_window(
-                        &settings_slot_ref,
-                        &rules_model_ref,
-                        &cfg_cell,
-                        &ui_client_cell,
-                        &live_state_ref,
-                        &aw_connected_flag_ref,
-                        &cmd_tx,
-                        &handle,
-                        &item_pause,
-                        &overlay_mgr,
-                        show,
-                    )
-                };
+        let app_vec: Vec<slint::SharedString> =
+            app_set.into_iter().map(|s| s.as_str().into()).collect();
+        slint::invoke_from_event_loop(move || {
+            if let Some(win) = sw.upgrade() {
+                win.set_known_apps(ModelRc::from(Rc::new(VecModel::from(app_vec))));
+            }
+        })
+        .ok();
+    });
+}
 
-                // Strict unlock countdown tick (~1s = 4 ticks at 250ms)
-                unlock_counter += 1;
-                if unlock_counter >= 4 {
-                    unlock_counter = 0;
-                    if let Some(ref win) = *settings_slot_ref.borrow() {
-                        let cd = win.get_strict_unlock_countdown();
-                        if cd > 0 {
-                            let next_cd = cd - 1;
-                            win.set_strict_unlock_countdown(next_cd);
-                            if next_cd == 0 {
-                                win.set_strict_unlocked(true);
-                            }
-                        }
-                    }
+/// Synchronizes cached live daemon telemetry and rule statuses to the `SettingsWindow` and its rules model.
+fn sync_live_state_to_ui(win: &SettingsWindow, rules_model: &VecModel<RuleView>, ls: &LiveUiState) {
+    win.set_current_session_duration_text(ls.session_duration_text.as_str().into());
+    win.set_today_screentime_text(ls.screentime_text.as_str().into());
+    win.set_current_active_app(ls.active_app.as_str().into());
+    win.set_strict_lock_active(ls.strict_lock_active);
+    update_rules_model_statuses(rules_model, &ls.rule_statuses);
+}
+
+/// Updates the status text of matching rules in `rules_model` if their text changed.
+fn update_rules_model_statuses(rules_model: &VecModel<RuleView>, statuses: &[(String, String)]) {
+    for (rule_id, status_text) in statuses {
+        for idx in 0..rules_model.row_count() {
+            if let Some(mut r) = rules_model.row_data(idx) {
+                if r.id == rule_id && r.status_text.as_str() != status_text.as_str() {
+                    r.status_text = status_text.as_str().into();
+                    rules_model.set_row_data(idx, r);
                 }
-
-                // Poll named activation event from a second instance
-                if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
-                    if let Err(e) = open_settings(true) {
-                        tracing::error!("Failed to open SettingsWindow on activation event: {e}");
-                    }
-                }
-
-                // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
-                overlay_mgr.borrow_mut().apply_pending_win32_styles();
-
-                // Process System Tray Icon Double-Click Events
-                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    if let TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    } = event
-                    {
-                        if let Err(e) = open_settings(true) {
-                            tracing::error!("Failed to open SettingsWindow on tray double-click: {e}");
-                        }
-                    }
-                }
-
-                // Process System Tray Menu Events
-                while let Ok(event) = MenuEvent::receiver().try_recv() {
-                    tracing::info!("Received system tray menu event: {}", event.id.0);
-                    match event.id.0.as_str() {
-                        "open_settings" => {
-                            if let Err(e) = open_settings(true) {
-                                tracing::error!("Failed to open SettingsWindow: {e}");
-                            }
-                        }
-                        "show_stats" => {
-                            cmd_tx.send(DaemonCommand::ShowStatsOverlay).ok();
-                        }
-                        "dismiss_break" => {
-                            cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
-                        }
-                        "snooze_15m" => {
-                            let is_locked = live_state_ref.borrow().strict_lock_active;
-                            if is_locked {
-                                continue;
-                            }
-                            let was_snoozed = live_state_ref.borrow().any_snoozed;
-                            if was_snoozed {
-                                cmd_tx.send(DaemonCommand::ClearSnoozeAll).ok();
-                            } else {
-                                cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
-                            }
-                        }
-                        "toggle_pause_all" => {
-                            let is_locked = live_state_ref.borrow().strict_lock_active;
-                            if is_locked {
-                                continue;
-                            }
-                            let new_paused = {
-                                let mut cfg = cfg_cell.borrow_mut();
-                                cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
-                                if let Err(e) = cfg.save() {
-                                    tracing::error!("Failed to save config on pause toggle: {e}");
-                                }
-                                cfg.general.pause_all_rules
-                            };
-                            item_pause.set_text(if new_paused {
-                                "Resume All Rules"
-                            } else {
-                                "Pause All Rules"
-                            });
-                            if let Some(ref win) = *settings_slot_ref.borrow() {
-                                win.set_pause_all_rules(new_paused);
-                            }
-                            cmd_tx
-                                .send(DaemonCommand::SetPauseAll { paused: new_paused })
-                                .ok();
-                        }
-                        "quit" => {
-                            slint::quit_event_loop().ok();
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
-                conn_check_counter += 1;
-                if conn_check_counter >= 12 {
-                    conn_check_counter = 0;
-                    if let Some(win) = settings_slot_ref.borrow().as_ref() {
-                        if win.window().is_visible() {
-                            spawn_aw_connection_check(
-                                win.as_weak(),
-                                aw_connected_flag_ref.clone(),
-                                ui_client_cell.borrow().clone(),
-                                &handle,
-                            );
-                        }
-                    }
-                }
-            },
-        );
+            }
+        }
     }
+}
 
-    let open_settings = |show: bool| {
-        open_settings_window(
-            &settings_slot,
-            &rules_model,
-            &current_config,
-            &ui_aw_client,
-            &live_ui_state,
-            &aw_connected_flag,
-            &command_tx,
-            &rt_handle,
-            &item_pause,
-            &overlay_manager,
-            show,
-        )
+/// Cached live telemetry state so a newly created `SettingsWindow` immediately displays current daemon status.
+struct LiveUiState {
+    session_duration_text: String,
+    screentime_text: String,
+    active_app: String,
+    strict_lock_active: bool,
+    rule_statuses: Vec<(String, String)>,
+    any_snoozed: bool,
+}
+
+impl Default for LiveUiState {
+    fn default() -> Self {
+        Self {
+            session_duration_text: "0m".to_string(),
+            screentime_text: "0h 0m".to_string(),
+            active_app: "None".to_string(),
+            strict_lock_active: false,
+            rule_statuses: Vec::new(),
+            any_snoozed: false,
+        }
+    }
+}
+
+/// Synchronizes all `SettingsWindow` properties and the `rules_model` with the given `AppConfig`.
+fn apply_config_to_ui(
+    win: &SettingsWindow,
+    cfg: &AppConfig,
+    rules_model: &VecModel<RuleView>,
+) {
+    win.set_aw_port(cfg.general.aw_port as i32);
+    win.set_poll_interval_seconds(cfg.general.poll_interval_seconds as i32);
+    win.set_autostart(cfg.general.autostart);
+    win.set_api_key(cfg.general.api_key.as_str().into());
+    win.set_day_start_hour(cfg.general.day_start_hour as i32);
+    win.set_suppress_fullscreen_d3d(cfg.general.suppress_fullscreen_d3d);
+    win.set_pause_all_rules(cfg.general.pause_all_rules);
+    win.set_destroy_windows_on_hide(cfg.general.destroy_windows_on_hide);
+    win.set_slint_renderer(cfg.general.slint_renderer.as_str().into());
+    let renderer_display = if cfg.general.slint_renderer.eq_ignore_ascii_case("software") {
+        "CPU Software (renderer-software)"
+    } else {
+        "OpenGL (renderer-femtovg)"
+    };
+    win.set_slint_renderer_display(renderer_display.into());
+    win.set_overlay_opacity(cfg.overlay.opacity);
+    win.set_accent_color_hex(cfg.overlay.accent_color.as_str().into());
+    win.set_background_color_hex(cfg.overlay.background_color.as_str().into());
+    win.set_text_color_hex(cfg.overlay.text_color.as_str().into());
+    set_color_preview(win, "accent", &cfg.overlay.accent_color);
+    set_color_preview(win, "background", &cfg.overlay.background_color);
+    set_color_preview(win, "text", &cfg.overlay.text_color);
+    win.set_daily_target_minutes(cfg.stats.daily_screentime_target_minutes as i32);
+    win.set_threshold_excessive_minutes(cfg.stats.threshold_excessive_minutes as i32);
+    win.set_histogram_bin_size_minutes(cfg.stats.histogram_bin_size_minutes as i32);
+    win.set_histogram_bin_count(cfg.stats.histogram_bin_count as i32);
+    win.set_time_format_code(cfg.stats.histogram_time_format.as_str().into());
+
+    let (valid, preview) = config::validate_strftime_format(&cfg.stats.histogram_time_format);
+    win.set_time_format_valid(valid);
+    win.set_time_format_preview(preview.as_str().into());
+
+    let rules_vec: Vec<RuleView> = cfg.rules.iter().map(rule_to_view).collect();
+    rules_model.set_vec(rules_vec);
+
+    let cur_idx = win.get_selected_rule_idx();
+    let safe_idx = if cur_idx >= 0 && (cur_idx as usize) < cfg.rules.len() {
+        cur_idx as usize
+    } else if !cfg.rules.is_empty() {
+        if cur_idx >= 0 {
+            win.set_selected_rule_idx(0);
+        }
+        0
+    } else {
+        win.set_selected_rule_idx(-1);
+        0
     };
 
-    // Show Settings Window unless launched with --minimized / --autostart
-    if !start_minimized {
-        if let Err(e) = open_settings(true) {
-            tracing::error!("Failed to open SettingsWindow on startup: {e}");
+    if let Some(r) = cfg.rules.get(safe_idx) {
+        let rv = rule_to_view(r);
+        load_rule_into_editor(win, &rv, rules_model);
+    } else {
+        refresh_rule_regex_validation(win, rules_model);
+    }
+    win.set_has_unsaved_changes(false);
+}
+
+/// Extracts the current configuration from `SettingsWindow` and `rules_model`, applying safety sanitization.
+fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
+    let mut updated_config = base_cfg.clone();
+
+    updated_config.general.aw_port = win.get_aw_port().clamp(1, 65535) as u16;
+    updated_config.general.poll_interval_seconds =
+        win.get_poll_interval_seconds().max(2) as u64;
+    updated_config.general.autostart = win.get_autostart();
+    updated_config.general.api_key = win.get_api_key().to_string();
+    updated_config.general.day_start_hour = win.get_day_start_hour().clamp(0, 23) as u32;
+    updated_config.general.suppress_fullscreen_d3d = win.get_suppress_fullscreen_d3d();
+    updated_config.general.pause_all_rules = win.get_pause_all_rules();
+    updated_config.general.destroy_windows_on_hide = win.get_destroy_windows_on_hide();
+    updated_config.general.slint_renderer = win.get_slint_renderer().to_string();
+
+    updated_config.overlay.opacity = win.get_overlay_opacity().clamp(0.1, 1.0);
+    updated_config.overlay.accent_color = win.get_accent_color_hex().to_string();
+    updated_config.overlay.background_color = win.get_background_color_hex().to_string();
+    updated_config.overlay.text_color = win.get_text_color_hex().to_string();
+
+    updated_config.stats.daily_screentime_target_minutes =
+        win.get_daily_target_minutes().max(1) as u32;
+    let raw_excessive = win.get_threshold_excessive_minutes().max(1) as u32;
+    let clamped_excessive =
+        raw_excessive.max(updated_config.stats.daily_screentime_target_minutes);
+    updated_config.stats.threshold_excessive_minutes = clamped_excessive;
+    updated_config.stats.histogram_bin_size_minutes =
+        win.get_histogram_bin_size_minutes().clamp(1, 1440) as u32;
+    updated_config.stats.histogram_bin_count =
+        win.get_histogram_bin_count().clamp(1, 96) as u32;
+    updated_config.stats.histogram_time_format =
+        win.get_time_format_code().to_string();
+
+    // Convert rules
+    let r_model = win.get_rules();
+    let mut rules = Vec::new();
+    for i in 0..r_model.row_count() {
+        if let Some(v) = r_model.row_data(i) {
+            rules.push(view_to_rule(&v));
         }
-    } else if !config.general.destroy_windows_on_hide {
-        if let Err(e) = open_settings(false) {
-            tracing::error!("Failed to pre-instantiate SettingsWindow on startup: {e}");
+    }
+    updated_config.rules = rules;
+    updated_config.sanitize();
+
+    updated_config
+}
+
+fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<RuleView>) {
+    win.set_rule_enabled(rule.enabled);
+    win.set_rule_name(rule.name.clone());
+    win.set_rule_monitor_selection(rule.monitor_selection.clone());
+    win.set_rule_title_regex(rule.title_regex.clone());
+    win.set_rule_url_regex(rule.url_regex.clone());
+    win.set_rule_trigger(rule.trigger.clone());
+    win.set_rule_period_val(rule.period_val);
+    win.set_rule_period_unit(rule.period_unit.clone());
+    win.set_rule_reset_afk_val(rule.reset_afk_val);
+    win.set_rule_reset_afk_unit(rule.reset_afk_unit.clone());
+    win.set_rule_limit_val(rule.limit_val);
+    win.set_rule_limit_unit(rule.limit_unit.clone());
+    win.set_rule_action(rule.action.clone());
+    win.set_rule_notification_method(rule.notification_method.clone());
+    win.set_rule_notification_duration_val(rule.notification_duration_val);
+    win.set_rule_notification_duration_unit(rule.notification_duration_unit.clone());
+    win.set_rule_show_remaining_time(rule.show_remaining_time);
+    win.set_rule_warn_before_val(rule.warn_before_val);
+    win.set_rule_warn_before_unit(rule.warn_before_unit.clone());
+    win.set_rule_grace_val(rule.grace_val);
+    win.set_rule_grace_unit(rule.grace_unit.clone());
+    win.set_rule_break_val(rule.break_val);
+    win.set_rule_break_unit(rule.break_unit.clone());
+    win.set_rule_click_through(rule.click_through);
+    win.set_rule_strict_mode(rule.strict_mode);
+    win.set_editor_message_text(rule.message.clone());
+    refresh_message_editor_state(win, &rule.message, 0, Some(rule));
+    win.set_warn_before_exceeds_threshold(check_warn_before_exceeds_threshold(rule));
+    refresh_rule_regex_validation(win, rm);
+}
+
+/// Extracts all editable rule settings from the `SettingsWindow` into the provided `RuleView`.
+fn sync_editor_to_rule_view(win: &SettingsWindow, rule: &mut RuleView) {
+    rule.enabled = win.get_rule_enabled();
+    rule.name = win.get_rule_name();
+    rule.monitor_selection = win.get_rule_monitor_selection();
+    rule.title_regex = win.get_rule_title_regex();
+    rule.url_regex = win.get_rule_url_regex();
+    rule.trigger = win.get_rule_trigger();
+    rule.period_val = win.get_rule_period_val();
+    rule.period_unit = win.get_rule_period_unit();
+    rule.reset_afk_val = win.get_rule_reset_afk_val();
+    rule.reset_afk_unit = win.get_rule_reset_afk_unit();
+    rule.limit_val = win.get_rule_limit_val();
+    rule.limit_unit = win.get_rule_limit_unit();
+    rule.action = win.get_rule_action();
+    rule.notification_method = win.get_rule_notification_method();
+    rule.notification_duration_val = win.get_rule_notification_duration_val();
+    rule.notification_duration_unit = win.get_rule_notification_duration_unit();
+    rule.show_remaining_time = win.get_rule_show_remaining_time();
+    rule.warn_before_val = win.get_rule_warn_before_val();
+    rule.warn_before_unit = win.get_rule_warn_before_unit();
+    rule.grace_val = win.get_rule_grace_val();
+    rule.grace_unit = win.get_rule_grace_unit();
+    rule.break_val = win.get_rule_break_val();
+    rule.break_unit = win.get_rule_break_unit();
+    rule.click_through = win.get_rule_click_through();
+    rule.strict_mode = win.get_rule_strict_mode();
+}
+
+/// Refreshes the message editor UI state (line count, active selection, toggle highlights, color/size dropdowns, and preview).
+fn refresh_message_editor_state(
+    win: &SettingsWindow,
+    message: &str,
+    line_idx: usize,
+    rule: Option<&RuleView>,
+) {
+    let line_count = message.split('\n').count().max(1);
+    let line_indices: Vec<i32> = (1..=(line_count as i32)).collect();
+    win.set_message_lines(ModelRc::from(Rc::new(VecModel::from(line_indices))));
+
+    let active_line = line_idx.min(line_count - 1);
+    win.set_selected_message_line(active_line as i32);
+
+    let status = formatter::detect_line_formatting(message, active_line);
+    win.set_line_is_h1(status.is_h1);
+    win.set_line_is_h2(status.is_h2);
+    win.set_line_is_bold(status.is_bold);
+    win.set_line_is_italic(status.is_italic);
+    win.set_line_is_underline(status.is_underline);
+    win.set_line_color(status.color_code.as_str().into());
+    win.set_line_size(status.size_val as i32);
+
+    win.set_line_color_display(formatter::color_code_to_display(&status.color_code).into());
+    let size_disp = if status.size_val > 0 {
+        format!("Size: {}px", status.size_val)
+    } else {
+        "Size: Default".to_string()
+    };
+    win.set_line_size_display(size_disp.into());
+
+    // Context for live preview interpolation
+    let real_ctx = if let Some(r) = rule {
+        let domain_rule = view_to_rule(r);
+        formatter::build_preview_context(&domain_rule)
+    } else {
+        MessageContext::sample()
+    };
+    let alignment = if rule.map_or(false, |r| r.action.as_str() == "Show Notification") {
+        TextHorizontalAlignment::Left
+    } else {
+        TextHorizontalAlignment::Center
+    };
+    let paras = formatter::parse_formatted_text_with_context_and_alignment(message, &real_ctx, alignment);
+    win.set_preview_paragraphs(ModelRc::from(Rc::new(VecModel::from(paras))));
+
+    if win.get_editor_message_text().as_str() != message {
+        win.set_editor_message_text(message.into());
+    }
+}
+
+/// Updates the preview color box for accent, background, or text colors if valid hex.
+fn set_color_preview(win: &SettingsWindow, kind: &str, hex: &str) {
+    if let Some(c) = formatter::parse_hex_color(hex) {
+        match kind {
+            "accent" => win.set_accent_color_preview(c),
+            "background" => win.set_background_color_preview(c),
+            "text" => win.set_text_color_preview(c),
+            _ => {}
+        }
+    }
+}
+
+/// Validates regular expressions for the currently selected rule if Title or URL monitoring is selected.
+/// When Executables monitoring is selected, sets `rule-regex-valid = true` and `rule-regex-error = ""`.
+fn refresh_rule_regex_validation(win: &SettingsWindow, _rm: &VecModel<RuleView>) {
+    let cur_idx = win.get_selected_rule_idx();
+    let (valid, err) = if cur_idx >= 0 {
+        let mode = win.get_rule_monitor_selection();
+        match mode.as_str() {
+            "Titles" => validate_rule_pattern("Titles", &win.get_rule_title_regex(), ""),
+            "Urls" => validate_rule_pattern("Urls", "", &win.get_rule_url_regex()),
+            _ => (true, String::new()),
+        }
+    } else {
+        (true, String::new())
+    };
+
+    win.set_rule_regex_valid(valid);
+    win.set_rule_regex_error(if valid { "".into() } else { err.into() });
+}
+
+/// Validates regex pattern for a given monitor selection mode, rejecting empty patterns for Titles and Urls.
+pub fn validate_rule_pattern(mode: &str, title_re: &str, url_re: &str) -> (bool, String) {
+    match mode {
+        "Titles" => {
+            if title_re.trim().is_empty() {
+                (false, "Title regex pattern cannot be empty".to_string())
+            } else {
+                config::validate_regex_pattern(title_re)
+            }
+        }
+        "Urls" => {
+            if url_re.trim().is_empty() {
+                (false, "URL regex pattern cannot be empty".to_string())
+            } else {
+                config::validate_regex_pattern(url_re)
+            }
+        }
+        _ => (true, String::new()),
+    }
+}
+
+/// Loads all editable fields of `rule` into the top-level two-way bound properties of `SettingsWindow`.
+/// Returns `true` if `warn_before` is configured (> 0) and is greater than or equal to the rule's trigger threshold.
+fn check_warn_before_exceeds_threshold(rule_view: &RuleView) -> bool {
+    let domain_rule = view_to_rule(rule_view);
+    domain_rule.warn_before.to_seconds() > 0
+        && domain_rule.warn_before.to_seconds() >= domain_rule.trigger_threshold_seconds()
+}
+
+/// Returns true if UI controls should be locked due to active strict break enforcement without an unlock countdown.
+fn is_ui_locked_by_strict(win: &SettingsWindow) -> bool {
+    win.get_strict_lock_active() && !win.get_strict_unlocked()
+}
+
+/// Finds the next available non-conflicting `rule-{n}` identifier.
+fn next_available_rule_id(rm: &VecModel<RuleView>) -> String {
+    let mut n = rm.row_count() + 1;
+    while (0..rm.row_count()).any(|i| {
+        rm.row_data(i)
+            .map(|r| r.id.as_str() == format!("rule-{n}"))
+            .unwrap_or(false)
+    }) {
+        n += 1;
+    }
+    format!("rule-{n}")
+}
+
+/// Mutates the `RuleView` at `rule_idx` inside `rm` if `mutator` returns `true`, marking the UI as having unsaved changes.
+fn update_rule_at(
+    rm: &VecModel<RuleView>,
+    sw: &slint::Weak<SettingsWindow>,
+    rule_idx: i32,
+    mutator: impl FnOnce(&mut RuleView, &SettingsWindow, &VecModel<RuleView>) -> bool,
+) {
+    let idx = rule_idx as usize;
+    if let (Some(win), Some(mut rule)) = (
+        sw.upgrade(),
+        (idx < rm.row_count()).then(|| rm.row_data(idx)).flatten(),
+    ) {
+        if mutator(&mut rule, &win, rm) {
+            rm.set_row_data(idx, rule);
+            win.set_has_unsaved_changes(true);
+        }
+    }
+}
+
+/// Appends a case-insensitively deduplicated executable name to the rule at `rule_idx`,
+/// normalizing executable names without `.exe` (e.g. `"steam"` -> `"steam.exe"`).
+fn add_executable_to_rule(
+    rm: &VecModel<RuleView>,
+    sw: &slint::Weak<SettingsWindow>,
+    rule_idx: i32,
+    exe_name: &str,
+) {
+    let Some(normalized) = normalize_executable_name(exe_name) else {
+        return;
+    };
+    update_rule_at(rm, sw, rule_idx, |rule_view, win, rm| {
+        let mut targets: Vec<slint::SharedString> = rule_view
+            .target_executables
+            .iter()
+            .filter(|t| is_specific_executable(t.as_str()))
+            .collect();
+        if !targets.iter().any(|t| t.as_str().eq_ignore_ascii_case(&normalized)) {
+            targets.push(normalized.as_str().into());
+            rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
+            load_rule_into_editor(win, rule_view, rm);
+            return true;
+        }
+        false
+    });
+}
+
+/// Applies a mutation closure `f` to the 168-slot weekly schedule array of the rule at `rule_idx`.
+fn update_rule_schedule(
+    rm: &VecModel<RuleView>,
+    sw: &slint::Weak<SettingsWindow>,
+    rule_idx: i32,
+    f: impl FnOnce(&mut [bool]),
+) {
+    update_rule_at(rm, sw, rule_idx, |rule, _, _| {
+        let mut slots: Vec<bool> = rule.schedule_slots.iter().collect();
+        if slots.len() == 168 {
+            f(&mut slots);
+            rule.schedule_slots = ModelRc::from(Rc::new(VecModel::from(slots)));
+            return true;
+        }
+        false
+    });
+}
+
+/// Converts a domain `Rule` into a Slint `RuleView` model for the Settings UI.
+fn rule_to_view(rule: &Rule) -> RuleView {
+    let slots_bool = rule.schedule.to_bool_array();
+    let slots_model = ModelRc::from(Rc::new(VecModel::from(slots_bool.to_vec())));
+
+    let targets: Vec<slint::SharedString> = rule
+        .target_executables
+        .iter()
+        .filter(|s| is_specific_executable(s))
+        .map(|s| slint::SharedString::from(s.trim()))
+        .collect();
+    let targets_model = ModelRc::from(Rc::new(VecModel::from(targets)));
+
+    let dur = |d: &DurationConfig| (d.value as i32, slint::SharedString::from(d.unit.as_str()));
+    let (period_val, period_unit) = dur(&rule.period);
+    let (reset_afk_val, reset_afk_unit) = dur(&rule.reset_after_afk);
+    let (limit_val, limit_unit) = dur(&rule.limit);
+    let (warn_before_val, warn_before_unit) = dur(&rule.warn_before);
+    let (grace_val, grace_unit) = dur(&rule.grace_duration);
+    let (break_val, break_unit) = dur(&rule.break_duration);
+    let (notification_duration_val, notification_duration_unit) = dur(&rule.notification_duration);
+
+    RuleView {
+        id: rule.id.as_str().into(),
+        enabled: rule.enabled,
+        name: rule.name.as_str().into(),
+        monitor_selection: rule.monitor_selection.as_str().into(),
+        target_executables: targets_model,
+        title_regex: rule.title_regex.as_str().into(),
+        url_regex: rule.url_regex.as_str().into(),
+        status_text: "".into(),
+        trigger: rule.trigger.as_str().into(),
+        period_val,
+        period_unit,
+        reset_afk_val,
+        reset_afk_unit,
+        limit_val,
+        limit_unit,
+        action: rule.action.as_str().into(),
+        warn_before_val,
+        warn_before_unit,
+        grace_val,
+        grace_unit,
+        break_val,
+        break_unit,
+        click_through: rule.click_through,
+        strict_mode: rule.strict_mode,
+        notification_method: rule.notification_method.as_str().into(),
+        notification_duration_val,
+        notification_duration_unit,
+        show_remaining_time: rule.show_remaining_time,
+        message: rule.message.as_str().into(),
+        schedule_slots: slots_model,
+    }
+}
+
+/// Converts a Slint `RuleView` from the Settings UI back into a sanitized domain `Rule`.
+fn view_to_rule(view: &RuleView) -> Rule {
+    let mut slots = [false; 168];
+    for (i, val) in view.schedule_slots.iter().enumerate() {
+        if i < 168 {
+            slots[i] = val;
         }
     }
 
-    if args.iter().any(|a| a == "--test-break") {
-        command_tx.send(DaemonCommand::TriggerTestOverlay { mode: "break".to_string() }).ok();
+    let mut targets: Vec<String> = view
+        .target_executables
+        .iter()
+        .filter(|s| is_specific_executable(s.as_str()))
+        .map(|s| s.trim().to_string())
+        .collect();
+    if targets.is_empty() {
+        targets.push("*".to_string());
     }
 
-    // 11. Run Slint Win32 GUI Event Loop until explicit tray Quit
-    slint::run_event_loop_until_quit()?;
+    let monitor_selection = MonitorSelection::from_str_lossy(view.monitor_selection.as_str());
+    let trigger = TriggerType::from_str_lossy(view.trigger.as_str());
+    let action = RuleAction::from_str_lossy(view.action.as_str());
+    let notification_method = NotificationMethod::from_str_lossy(view.notification_method.as_str());
 
-    Ok(())
+    let mut rule = Rule {
+        id: view.id.to_string(),
+        enabled: view.enabled,
+        name: view.name.to_string(),
+        monitor_selection,
+        target_executables: targets,
+        title_regex: view.title_regex.to_string(),
+        url_regex: view.url_regex.to_string(),
+        trigger,
+        period: duration_from_view(view.period_val, view.period_unit.as_str(), 1),
+        reset_after_afk: duration_from_view(view.reset_afk_val, view.reset_afk_unit.as_str(), 1),
+        limit: duration_from_view(view.limit_val, view.limit_unit.as_str(), 0),
+        action,
+        warn_before: duration_from_view(view.warn_before_val, view.warn_before_unit.as_str(), 0),
+        grace_duration: duration_from_view(view.grace_val, view.grace_unit.as_str(), 0),
+        break_duration: duration_from_view(view.break_val, view.break_unit.as_str(), 1),
+        click_through: view.click_through,
+        strict_mode: view.strict_mode,
+        notification_method,
+        notification_duration: duration_from_view(
+            view.notification_duration_val,
+            view.notification_duration_unit.as_str(),
+            1,
+        ),
+        show_remaining_time: view.show_remaining_time,
+        message: view.message.to_string(),
+        schedule: RuleSchedule::from_bool_array(&slots),
+    };
+    rule.sanitize();
+    rule
+}
+
+/// Returns the first non-empty, non-wildcard executable from a rule's target executables model.
+fn first_specific_executable(targets: &slint::ModelRc<slint::SharedString>) -> Option<String> {
+    targets.iter().find_map(|t| {
+        let s = t.trim();
+        is_specific_executable(s).then(|| s.to_string())
+    })
+}
+
+/// Normalizes an executable name by trimming whitespace, appending `.exe` if missing,
+/// cleanly handling internal or trailing `.exe` with surrounding spaces,
+/// and returning `None` if the input is empty or wildcard `*`.
+pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
+    let trimmed = exe_name.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+    if trimmed.to_ascii_lowercase().ends_with(".exe") {
+        let mut stem = trimmed[..trimmed.len() - 4].trim();
+        while stem.to_ascii_lowercase().ends_with(".exe") {
+            stem = stem[..stem.len() - 4].trim();
+        }
+        if stem.is_empty() || stem == "*" {
+            return None;
+        }
+        let ext = &trimmed[trimmed.len() - 4..];
+        Some(format!("{}{}", stem, ext))
+    } else {
+        Some(format!("{}.exe", trimmed))
+    }
+}
+
+/// Returns true if an executable name is non-empty and not a wildcard (`*`).
+fn is_specific_executable(s: &str) -> bool {
+    let trimmed = s.trim();
+    !trimmed.is_empty() && trimmed != "*"
+}
+
+/// Constructs a `DurationConfig` from a Slint view integer value and unit string, clamping to `min_val`.
+fn duration_from_view(val: i32, unit: &str, min_val: u32) -> DurationConfig {
+    DurationConfig::new(
+        val.max(min_val as i32) as u32,
+        TimeUnit::from_str_lossy(unit),
+    )
 }
 
 #[cfg(test)]
