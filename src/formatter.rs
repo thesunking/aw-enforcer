@@ -11,18 +11,13 @@ pub use crate::TextAlignment as TextHorizontalAlignment;
 /// Parses a 6-digit (`#RRGGBB`) or 8-digit (`#RRGGBBAA`) hexadecimal color string into a Slint `Color`.
 pub fn parse_hex_color(hex: &str) -> Option<Color> {
     let s = hex.trim().strip_prefix('#')?;
+    let r = u8::from_str_radix(s.get(0..2)?, 16).ok()?;
+    let g = u8::from_str_radix(s.get(2..4)?, 16).ok()?;
+    let b = u8::from_str_radix(s.get(4..6)?, 16).ok()?;
     match s.len() {
-        6 => {
-            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-            Some(Color::from_rgb_u8(r, g, b))
-        }
+        6 => Some(Color::from_rgb_u8(r, g, b)),
         8 => {
-            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-            let a = u8::from_str_radix(&s[6..8], 16).ok()?;
+            let a = u8::from_str_radix(s.get(6..8)?, 16).ok()?;
             Some(Color::from_argb_u8(a, r, g, b))
         }
         _ => None,
@@ -64,27 +59,20 @@ pub fn format_snooze_badge(until: DateTime<Local>, now: DateTime<Local>) -> Stri
 /// Validates whether the contents of a leading `[...]` bracket block consist exclusively of
 /// recognized inline style tokens (`bold`, `italic`, `underline`, `size=8..72`, `color=#hex`).
 pub fn is_valid_attr_block(inner: &str) -> bool {
-    let tokens: Vec<&str> = inner.split_whitespace().collect();
-    if tokens.is_empty() {
-        return false;
-    }
-    for token in tokens {
-        match token {
-            "bold" | "italic" | "underline" => {}
-            s if s.starts_with("size=") => {
-                if !s[5..].parse::<u16>().is_ok_and(|sz| (8..=72).contains(&sz)) {
-                    return false;
-                }
-            }
-            s if s.starts_with("color=") => {
-                if parse_hex_color(&s[6..]).is_none() {
-                    return false;
-                }
-            }
-            _ => return false,
+    let mut has_token = false;
+    for token in inner.split_whitespace() {
+        has_token = true;
+        let valid = match token {
+            "bold" | "italic" | "underline" => true,
+            s if s.starts_with("size=") => s[5..].parse::<u16>().is_ok_and(|sz| (8..=72).contains(&sz)),
+            s if s.starts_with("color=") => parse_hex_color(&s[6..]).is_some(),
+            _ => false,
+        };
+        if !valid {
+            return false;
         }
     }
-    true
+    has_token
 }
 
 /// Dynamic runtime values used to interpolate `{...}` placeholders in rule messages.
@@ -112,14 +100,15 @@ pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
         300.min(threshold_secs)
     };
     let used_secs = threshold_secs.saturating_sub(rem_secs);
+    let trimmed_name = rule.name.trim();
 
     let app = match rule.monitor_selection {
         crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
         crate::config::MonitorSelection::Titles => {
-            if !rule.name.trim().is_empty() {
-                rule.name.trim().to_string()
-            } else {
+            if trimmed_name.is_empty() {
                 "Active Window".to_string()
+            } else {
+                trimmed_name.to_string()
             }
         }
         crate::config::MonitorSelection::Executables => rule
@@ -133,10 +122,10 @@ pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
             .unwrap_or_else(|| "code.exe".to_string()),
     };
 
-    let rule_name = if rule.name.trim().is_empty() {
+    let rule_name = if trimmed_name.is_empty() {
         "Break Reminder".to_string()
     } else {
-        rule.name.trim().to_string()
+        trimmed_name.to_string()
     };
 
     let (session_duration, limit) = match rule.trigger {
@@ -197,6 +186,20 @@ impl MessageContext {
         }
     }
 
+    /// Resolves a placeholder tag name to its corresponding context value if recognized.
+    fn get_placeholder(&self, tag: &str) -> Option<&str> {
+        match tag {
+            "rule_name" => Some(&self.rule_name),
+            "session_duration" => Some(&self.session_duration),
+            "break_time" => Some(&self.break_time),
+            "app" | "app_name" => Some(&self.app),
+            "used" => Some(&self.used),
+            "limit" => Some(&self.limit),
+            "remaining" => Some(&self.remaining),
+            _ => None,
+        }
+    }
+
     /// Replaces all supported `{...}` placeholders in `template` with their corresponding context values
     /// in a single pass without re-scanning substituted values, leaving unknown `{...}` or unclosed `{` intact.
     pub fn interpolate(&self, template: &str) -> String {
@@ -214,19 +217,12 @@ impl MessageContext {
                     continue;
                 }
                 let tag = &after_open[..close_idx];
-                match tag {
-                    "rule_name" => result.push_str(&self.rule_name),
-                    "session_duration" => result.push_str(&self.session_duration),
-                    "break_time" => result.push_str(&self.break_time),
-                    "app" | "app_name" => result.push_str(&self.app),
-                    "used" => result.push_str(&self.used),
-                    "limit" => result.push_str(&self.limit),
-                    "remaining" => result.push_str(&self.remaining),
-                    _ => {
-                        result.push('{');
-                        result.push_str(tag);
-                        result.push('}');
-                    }
+                if let Some(val) = self.get_placeholder(tag) {
+                    result.push_str(val);
+                } else {
+                    result.push('{');
+                    result.push_str(tag);
+                    result.push('}');
                 }
                 rest = &after_open[close_idx + 1..];
             } else {
@@ -251,17 +247,13 @@ impl MessageContext {
 /// to produce clean plain text suitable for native system notifications.
 pub fn format_plain_message(raw_message: &str, ctx: &MessageContext) -> String {
     let interpolated = ctx.interpolate(raw_message);
-    let mut cleaned_lines = Vec::new();
-    for line in split_lines(&interpolated) {
-        let (_header_prefix, rest) = split_header_prefix(line);
-        let content = if let Some((_inner, remaining)) = extract_attr_block(rest) {
-            remaining
-        } else {
-            rest
-        };
-        cleaned_lines.push(content);
-    }
-    cleaned_lines.join("\n")
+    split_lines(&interpolated)
+        .map(|line| {
+            let (_, rest) = split_header_prefix(line);
+            extract_attr_block(rest).map_or(rest, |(_, remaining)| remaining)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Preset color palette mapping hex color codes to their UI combo-box labels.
@@ -298,6 +290,63 @@ fn modify_line_at(raw_text: &str, line_idx: usize, f: impl FnOnce(&str) -> Strin
     let idx = line_idx.min(lines.len() - 1);
     lines[idx] = f(&lines[idx]);
     lines.join("\n")
+}
+
+/// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
+fn split_header_prefix(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start().trim_end_matches('\r');
+    if let Some(r) = trimmed.strip_prefix("## ") {
+        ("## ", r.trim_start())
+    } else if trimmed == "##" {
+        ("## ", "")
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("# ", r.trim_start())
+    } else if trimmed == "#" {
+        ("# ", "")
+    } else {
+        ("", trimmed.trim_end())
+    }
+}
+
+/// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
+fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
+            if is_valid_attr_block(inner) {
+                let content = rest[close_idx + 1..].trim_start();
+                return Some((inner, content));
+            }
+        }
+    }
+    None
+}
+
+/// Internal helper representing parsed inline attributes from a `[...]` block.
+#[derive(Debug, Default)]
+struct ParsedAttributes<'a> {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    color_hex: Option<&'a str>,
+    size: Option<u16>,
+}
+
+impl<'a> ParsedAttributes<'a> {
+    fn from_inner(inner: &'a str) -> Self {
+        let mut attrs = Self::default();
+        for token in inner.split_whitespace() {
+            match token {
+                "bold" => attrs.bold = true,
+                "italic" => attrs.italic = true,
+                "underline" => attrs.underline = true,
+                s if s.starts_with("color=") => attrs.color_hex = Some(&s[6..]),
+                s if s.starts_with("size=") => attrs.size = s[5..].parse().ok(),
+                _ => {}
+            }
+        }
+        attrs
+    }
 }
 
 /// Interpolates placeholders and parses line-level headings (`#`, `##`) and `[attr ...]` style blocks
@@ -339,40 +388,21 @@ pub fn parse_message(
         let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
 
         // Check for attribute prefix: [attr1 attr2 ...]
-        if rest.starts_with('[') {
-            if let Some(close_idx) = rest.find(']') {
-                let inner = &rest[1..close_idx];
-                if is_valid_attr_block(inner) {
-                    let tokens: Vec<&str> = inner.split_whitespace().collect();
-                    let mut font_size: f32 = default_size;
-                    let mut font_weight: i32 = default_weight;
-                    let mut italic = false;
-                    let mut underline = false;
-                    let mut text_color = default_color;
+        if let Some((inner, content)) = extract_attr_block(rest) {
+            let attrs = ParsedAttributes::from_inner(inner);
+            let font_size = attrs.size.map_or(default_size, |sz| sz as f32);
+            let font_weight = if attrs.bold { 700 } else { default_weight };
+            let text_color = attrs.color_hex.and_then(parse_hex_color).unwrap_or(default_color);
 
-                    for token in &tokens {
-                        if *token == "bold" {
-                            font_weight = 700;
-                        } else if *token == "italic" {
-                            italic = true;
-                        } else if *token == "underline" {
-                            underline = true;
-                        } else if let Some(size_str) = token.strip_prefix("size=") {
-                            if let Ok(sz) = size_str.parse::<u16>() {
-                                font_size = sz as f32;
-                            }
-                        } else if let Some(color_str) = token.strip_prefix("color=") {
-                            if let Some(c) = parse_hex_color(color_str) {
-                                text_color = c;
-                            }
-                        }
-                    }
-
-                    let content = rest[close_idx + 1..].trim_start();
-                    paragraphs.push(make_para(content, font_size, font_weight, italic, underline, text_color));
-                    continue;
-                }
-            }
+            paragraphs.push(make_para(
+                content,
+                font_size,
+                font_weight,
+                attrs.italic,
+                attrs.underline,
+                text_color,
+            ));
+            continue;
         }
 
         // Plain line fallback (or plain heading fallback)
@@ -427,42 +457,13 @@ pub struct LineFormattingStatus {
     pub size_val: u32,      // e.g. 18 or 0 (default)
 }
 
-/// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
-fn split_header_prefix(line: &str) -> (&str, &str) {
-    let trimmed = line.trim_start().trim_end_matches('\r');
-    if let Some(r) = trimmed.strip_prefix("## ") {
-        ("## ", r.trim_start())
-    } else if trimmed == "##" {
-        ("## ", "")
-    } else if let Some(r) = trimmed.strip_prefix("# ") {
-        ("# ", r.trim_start())
-    } else if trimmed == "#" {
-        ("# ", "")
-    } else {
-        ("", trimmed.trim_end())
-    }
-}
-
-/// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
-fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
-    if rest.starts_with('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let inner = &rest[1..close_idx];
-            if is_valid_attr_block(inner) {
-                let content = rest[close_idx + 1..].trim_start();
-                return Some((inner, content));
-            }
-        }
-    }
-    None
-}
-
 /// Formats a line by attaching header prefix and attribute block if tokens are non-empty.
-fn format_line_with_attrs(header_prefix: &str, tokens: &[String], content: &str) -> String {
+fn format_line_with_attrs<T: AsRef<str>>(header_prefix: &str, tokens: &[T], content: &str) -> String {
     if tokens.is_empty() {
-        format!("{}{}", header_prefix, content)
+        format!("{header_prefix}{content}")
     } else {
-        format!("{}[{}] {}", header_prefix, tokens.join(" "), content)
+        let joined = tokens.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+        format!("{header_prefix}[{joined}] {content}")
     }
 }
 
@@ -480,21 +481,15 @@ pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormatting
     status.is_h2 = header == "## ";
 
     if let Some((inner, _)) = extract_attr_block(rest) {
-        for token in inner.split_whitespace() {
-            match token {
-                "bold" => status.is_bold = true,
-                "italic" => status.is_italic = true,
-                "underline" => status.is_underline = true,
-                s if s.starts_with("color=") => {
-                    status.color_code = s.strip_prefix("color=").unwrap_or("").to_string();
-                }
-                s if s.starts_with("size=") => {
-                    if let Ok(val) = s.strip_prefix("size=").unwrap_or("").parse::<u32>() {
-                        status.size_val = val;
-                    }
-                }
-                _ => {}
-            }
+        let attrs = ParsedAttributes::from_inner(inner);
+        status.is_bold = attrs.bold;
+        status.is_italic = attrs.italic;
+        status.is_underline = attrs.underline;
+        if let Some(hex) = attrs.color_hex {
+            status.color_code = hex.to_string();
+        }
+        if let Some(sz) = attrs.size {
+            status.size_val = sz as u32;
         }
     }
 
@@ -513,29 +508,18 @@ pub fn apply_line_style(raw_text: &str, line_idx: usize, style: &str) -> String 
         }
 
         match style {
-            "h1" => {
+            "h1" | "h2" => {
+                let target_prefix = if style == "h1" { "# " } else { "## " };
                 let (header, rest) = split_header_prefix(target_line);
-                if header == "# " {
+                if header == target_prefix {
                     rest.to_string()
                 } else {
-                    format!("# {rest}")
-                }
-            }
-            "h2" => {
-                let (header, rest) = split_header_prefix(target_line);
-                if header == "## " {
-                    rest.to_string()
-                } else {
-                    format!("## {rest}")
+                    format!("{target_prefix}{rest}")
                 }
             }
             "bold" | "italic" | "underline" => toggle_attr(target_line, style),
-            "Color: Default" => {
-                strip_attr_prefix(target_line, "color=")
-            }
-            "Size: Default" => {
-                strip_attr_prefix(target_line, "size=")
-            }
+            "Color: Default" => strip_attr_prefix(target_line, "color="),
+            "Size: Default" => strip_attr_prefix(target_line, "size="),
             s if s.starts_with("color=") || s.starts_with("size=") => toggle_attr(target_line, s),
             _ => target_line.to_string(),
         }
@@ -554,21 +538,14 @@ pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) ->
     })
 }
 
-/// Strips any existing `# ` or `## ` prefix from `line` and returns the inner content.
-#[allow(dead_code)]
-fn strip_existing_prefix(line: &str) -> &str {
-    split_header_prefix(line).1
-}
-
 /// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block,
 /// preserving any leading `# ` or `## ` heading prefix.
 fn strip_attr_prefix(line: &str, prefix: &str) -> String {
     let (header_prefix, rest) = split_header_prefix(line);
     if let Some((inner, content)) = extract_attr_block(rest) {
-        let tokens: Vec<String> = inner
+        let tokens: Vec<&str> = inner
             .split_whitespace()
             .filter(|t| !t.starts_with(prefix))
-            .map(|s| s.to_string())
             .collect();
         return format_line_with_attrs(header_prefix, &tokens, content);
     }
@@ -586,9 +563,10 @@ fn toggle_attr(line: &str, attr: &str) -> String {
         if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case(attr)) {
             tokens.remove(pos);
         } else {
-            if attr.to_ascii_lowercase().starts_with("color=") {
+            let lower = attr.to_ascii_lowercase();
+            if lower.starts_with("color=") {
                 tokens.retain(|t| !t.to_ascii_lowercase().starts_with("color="));
-            } else if attr.to_ascii_lowercase().starts_with("size=") {
+            } else if lower.starts_with("size=") {
                 tokens.retain(|t| !t.to_ascii_lowercase().starts_with("size="));
             }
             tokens.push(attr.to_string());
@@ -597,12 +575,13 @@ fn toggle_attr(line: &str, attr: &str) -> String {
         return format_line_with_attrs(header_prefix, &tokens, content);
     }
 
-    format_line_with_attrs(header_prefix, &[attr.to_string()], rest)
+    format_line_with_attrs(header_prefix, &[attr], rest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     /// Verifies human-readable formatting of seconds across sub-minute, minute, and multi-hour ranges.
     #[test]
