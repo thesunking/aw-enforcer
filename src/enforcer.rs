@@ -93,34 +93,91 @@ pub fn is_foreground_browser() -> bool {
     }
 }
 
-/// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`).
+/// Trims whitespace, strips any leading directory path, and returns `(basename, stem_without_exe)`
+/// handling case-insensitive `.exe` suffixes.
+pub fn normalize_exe_stem(name: &str) -> (&str, &str) {
+    let trimmed = name.trim();
+    let basename = match trimmed.rsplit_once(['\\', '/']) {
+        Some((_, base)) => base.trim(),
+        None => trimmed,
+    };
+    let stem = basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".EXE"))
+        .unwrap_or_else(|| {
+            if basename.len() > 4
+                && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe")
+            {
+                &basename[..basename.len() - 4]
+            } else {
+                basename
+            }
+        });
+    (basename, stem)
+}
+
+/// Returns true if `exe_name` matches any `!`-prefixed exclusion entry in `target_executables`.
+pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &[S]) -> bool {
+    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
+    if exe_base.is_empty() {
+        return false;
+    }
+    for target in target_executables {
+        let t = target.as_ref().trim();
+        if let Some(rest) = t.strip_prefix('!') {
+            let (target_base, target_stem) = normalize_exe_stem(rest);
+            if target_base.is_empty() {
+                continue;
+            }
+            if exe_base.eq_ignore_ascii_case(target_base)
+                || exe_base.eq_ignore_ascii_case(target_stem)
+                || exe_stem.eq_ignore_ascii_case(target_base)
+                || exe_stem.eq_ignore_ascii_case(target_stem)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`),
+/// respecting `!`-prefixed exclusion entries.
 pub fn exe_name_matches_targets<S: AsRef<str>>(
     exe_name: &str,
     target_executables: &[S],
 ) -> bool {
-    let exe_trimmed = exe_name.trim();
-    if exe_trimmed.is_empty() || target_executables.is_empty() {
+    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
+    if exe_base.is_empty() || target_executables.is_empty() {
         return false;
     }
-    let exe_stem = exe_trimmed
-        .strip_suffix(".exe")
-        .or_else(|| exe_trimmed.strip_suffix(".EXE"))
-        .unwrap_or_else(|| {
-            if exe_trimmed.len() > 4
-                && exe_trimmed[exe_trimmed.len() - 4..].eq_ignore_ascii_case(".exe")
-            {
-                &exe_trimmed[..exe_trimmed.len() - 4]
-            } else {
-                exe_trimmed
-            }
-        });
+
+    if exe_name_is_excluded(exe_name, target_executables) {
+        return false;
+    }
+
+    let has_exclusions = has_exclusion_targets(target_executables);
+    let has_pos_specific = has_specific_targets(target_executables);
+    let has_wildcard = has_wildcard_target(target_executables);
+
+    if has_exclusions && (has_wildcard || !has_pos_specific) {
+        return true;
+    }
 
     for target in target_executables {
         let t = target.as_ref().trim();
-        if t.is_empty() || t == "*" {
+        if t.is_empty() || t == "*" || t.starts_with('!') {
             continue;
         }
-        if exe_trimmed.eq_ignore_ascii_case(t) || exe_stem.eq_ignore_ascii_case(t) {
+        let (t_base, t_stem) = normalize_exe_stem(t);
+        if t_base.is_empty() {
+            continue;
+        }
+        if exe_base.eq_ignore_ascii_case(t_base)
+            || exe_base.eq_ignore_ascii_case(t_stem)
+            || exe_stem.eq_ignore_ascii_case(t_base)
+            || exe_stem.eq_ignore_ascii_case(t_stem)
+        {
             return true;
         }
     }
@@ -309,6 +366,23 @@ pub fn is_protected_window_class(class_name: &[u16]) -> bool {
         b'V' as u16, b'i' as u16, b'e' as u16, b'w' as u16, b'F' as u16, b'r' as u16,
         b'a' as u16, b'm' as u16, b'e' as u16,
     ];
+    const CORE_WINDOW: &[u16] = &[
+        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16, b's' as u16,
+        b'.' as u16, b'U' as u16, b'I' as u16, b'.' as u16, b'C' as u16, b'o' as u16, b'r' as u16,
+        b'e' as u16, b'.' as u16, b'C' as u16, b'o' as u16, b'r' as u16, b'e' as u16,
+        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
+    ];
+    const XAML_EXPLORER_HOST_ISLAND: &[u16] = &[
+        b'X' as u16, b'a' as u16, b'm' as u16, b'l' as u16,
+        b'E' as u16, b'x' as u16, b'p' as u16, b'l' as u16, b'o' as u16, b'r' as u16, b'e' as u16, b'r' as u16,
+        b'H' as u16, b'o' as u16, b's' as u16, b't' as u16,
+        b'I' as u16, b's' as u16, b'l' as u16, b'a' as u16, b'n' as u16, b'd' as u16,
+        b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16, b'w' as u16,
+    ];
+    const FOREGROUND_STAGING: &[u16] = &[
+        b'F' as u16, b'o' as u16, b'r' as u16, b'e' as u16, b'g' as u16, b'r' as u16, b'o' as u16, b'u' as u16, b'n' as u16, b'd' as u16,
+        b'S' as u16, b't' as u16, b'a' as u16, b'g' as u16, b'i' as u16, b'n' as u16, b'g' as u16,
+    ];
 
     class_name == PROGMAN
         || class_name == WORKERW
@@ -317,6 +391,9 @@ pub fn is_protected_window_class(class_name: &[u16]) -> bool {
         || class_name == NOTIFY_ICON_OVERFLOW
         || class_name == TOP_LEVEL_OVERFLOW_XAML
         || class_name == MULTITASKING_VIEW_FRAME
+        || class_name == CORE_WINDOW
+        || class_name == XAML_EXPLORER_HOST_ISLAND
+        || class_name == FOREGROUND_STAGING
 }
 
 /// Returns true if the window is invalid, invisible, owned by current process, or a Windows shell surface.
@@ -364,6 +441,20 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     }
     let ctx = &mut *(lparam as *mut EnumMatchContext<'_, S>);
 
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    let cached_exe = ctx
+        .pid_cache
+        .entry(pid)
+        .or_insert_with(|| get_process_name_by_pid(pid))
+        .clone();
+
+    if let Some(ref exe_name) = cached_exe {
+        if exe_name_is_excluded(exe_name, ctx.target_executables) {
+            return 1;
+        }
+    }
+
     let mut title = String::new();
     if ctx.compiled_regex.is_some() || ctx.close_matched {
         let mut title_buf = [0u16; 512];
@@ -382,18 +473,11 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
         return 1;
     }
 
-    let mut exe_name_opt: Option<String> = None;
+    let mut exe_name_opt = cached_exe.clone();
     let exe_matches = if ctx.has_exe_targets {
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
-        let cached_exe = ctx
-            .pid_cache
-            .entry(pid)
-            .or_insert_with(|| get_process_name_by_pid(pid))
-            .clone();
-        if let Some(exe_name) = cached_exe {
-            let matched = exe_name_matches_targets(&exe_name, ctx.target_executables);
-            exe_name_opt = Some(exe_name);
+        if let Some(ref exe_name) = cached_exe {
+            let matched = exe_name_matches_targets(exe_name, ctx.target_executables);
+            exe_name_opt = Some(exe_name.clone());
             matched
         } else {
             false
@@ -440,11 +524,19 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     1
 }
 
-/// Returns true if `targets` contains at least one non-empty, non-wildcard executable entry.
+/// Returns true if `targets` contains at least one non-empty, non-wildcard, non-exclusion executable entry.
 pub fn has_specific_targets<S: AsRef<str>>(targets: &[S]) -> bool {
     targets.iter().any(|t| {
         let s = t.as_ref().trim();
-        !s.is_empty() && s != "*"
+        !s.is_empty() && s != "*" && !s.starts_with('!')
+    })
+}
+
+/// Returns true if `targets` contains at least one non-empty `!`-prefixed exclusion entry.
+pub fn has_exclusion_targets<S: AsRef<str>>(targets: &[S]) -> bool {
+    targets.iter().any(|t| {
+        let s = t.as_ref().trim();
+        s.starts_with('!') && !s[1..].trim().is_empty()
     })
 }
 
@@ -491,6 +583,13 @@ pub fn close_target_windows<S: AsRef<str>>(
         unsafe {
             let hwnd = GetForegroundWindow();
             if !is_protected_foreground_window(hwnd) {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if let Some(exe_name) = get_process_name_by_pid(pid) {
+                    if exe_name_is_excluded(&exe_name, target_executables) {
+                        return 0;
+                    }
+                }
                 if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
                     return 1;
                 } else {
@@ -601,6 +700,15 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
             return None;
         }
 
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let fg_exe = get_process_name_by_pid(pid);
+        if let Some(ref exe) = fg_exe {
+            if exe_name_is_excluded(exe, target_executables) {
+                return None;
+            }
+        }
+
         let has_wildcard = has_wildcard_target(target_executables);
         let has_exe_targets = has_specific_targets(target_executables);
 
@@ -622,9 +730,7 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
 
         let mut matched_exe_name = None;
         let exe_matches = if has_exe_targets {
-            let mut pid: u32 = 0;
-            GetWindowThreadProcessId(hwnd, &mut pid);
-            if let Some(exe_name) = get_process_name_by_pid(pid) {
+            if let Some(exe_name) = fg_exe {
                 let matches = exe_name_matches_targets(&exe_name, target_executables);
                 if matches {
                     matched_exe_name = Some(exe_name);
@@ -756,6 +862,20 @@ mod tests {
         assert!(exe_name_matches_targets("code.exe", &["CODE"]));
         assert!(exe_name_matches_targets("discord.exe", &["discord.exe"]));
         assert!(!exe_name_matches_targets("notepad.exe", &["*", ""]));
+
+        // Test symmetric stem and path matching
+        assert!(exe_name_matches_targets("STEAM", &["steam.exe"]));
+        assert!(exe_name_matches_targets(r"C:\Games\steam.exe", &["steam"]));
+        assert!(exe_name_matches_targets("C:/Program Files/App/app.exe", &["app.exe"]));
+
+        // Test !-prefixed exclusions
+        assert!(exe_name_is_excluded("zoom.exe", &["*", "!zoom.exe"]));
+        assert!(exe_name_is_excluded(r"C:\Program Files\Zoom\bin\zoom.exe", &["!zoom"]));
+        assert!(!exe_name_is_excluded("notepad.exe", &["*", "!zoom.exe"]));
+        assert!(!exe_name_matches_targets("zoom.exe", &["*", "!zoom.exe"]));
+        assert!(exe_name_matches_targets("notepad.exe", &["*", "!zoom.exe"]));
+        assert!(!exe_name_matches_targets("zoom.exe", &["!zoom.exe"]));
+        assert!(exe_name_matches_targets("notepad.exe", &["!zoom.exe"]));
     }
 
     #[test]
@@ -770,6 +890,16 @@ mod tests {
         assert!(!has_specific_targets(&["*"]));
         assert!(!has_specific_targets(&["", "   "]));
         assert!(!has_specific_targets::<&str>(&[]));
+        assert!(!has_specific_targets(&["*", "!zoom.exe"]));
+        assert!(!has_specific_targets(&["!zoom.exe"]));
+        assert!(has_specific_targets(&["code.exe", "!zoom.exe"]));
+
+        assert!(has_exclusion_targets(&["!zoom.exe"]));
+        assert!(has_exclusion_targets(&["*", "!zoom.exe"]));
+        assert!(!has_exclusion_targets(&["*"]));
+        assert!(!has_exclusion_targets(&["notepad.exe"]));
+        assert!(!has_exclusion_targets(&["!"]));
+        assert!(!has_exclusion_targets::<&str>(&[]));
     }
 
     #[test]
@@ -783,6 +913,9 @@ mod tests {
         assert!(is_protected_window_class(&to_u16("NotifyIconOverflowWindow")));
         assert!(is_protected_window_class(&to_u16("TopLevelWindowForOverflowXamlIsland")));
         assert!(is_protected_window_class(&to_u16("MultitaskingViewFrame")));
+        assert!(is_protected_window_class(&to_u16("Windows.UI.Core.CoreWindow")));
+        assert!(is_protected_window_class(&to_u16("XamlExplorerHostIslandWindow")));
+        assert!(is_protected_window_class(&to_u16("ForegroundStaging")));
 
         assert!(!is_protected_window_class(&to_u16("Notepad")));
         assert!(!is_protected_window_class(&to_u16("Chrome_WidgetWin_1")));

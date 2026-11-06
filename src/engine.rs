@@ -2598,6 +2598,7 @@ pub fn matched_url_or_app_matches_rule(
 /// Helper predicate returning true when a rule monitors all executables via wildcard or empty target list.
 pub fn is_wildcard_executables_rule(rule: &Rule) -> bool {
     rule.monitor_selection == MonitorSelection::Executables
+        && !enforcer::has_exclusion_targets(&rule.target_executables)
         && (rule.target_executables.is_empty()
             || rule.target_executables.iter().any(|t| t.trim() == "*"))
 }
@@ -2625,7 +2626,12 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
             if is_wildcard_executables_rule(rule) {
                 return true;
             }
+            let is_wildcard = rule.target_executables.is_empty()
+                || rule.target_executables.iter().any(|t| t.trim() == "*");
             if let Some(app) = ev.data.app.as_deref() {
+                if is_wildcard && enforcer::has_exclusion_targets(&rule.target_executables) {
+                    return !enforcer::exe_name_is_excluded(app, &rule.target_executables);
+                }
                 return enforcer::exe_name_matches_targets(app, &rule.target_executables);
             }
             false
@@ -2725,17 +2731,25 @@ pub fn find_matching_window_for_rule(
             if rule.target_executables.is_empty()
                 || rule.target_executables.iter().any(|t| t.trim() == "*")
             {
-                let fg_app = enforcer::get_foreground_app_name();
+                let fg_app = enforcer::get_foreground_app_name()
+                    .filter(|app| !enforcer::exe_name_is_excluded(app, &rule.target_executables));
                 if matches!(rule.action, RuleAction::CloseWindow | RuleAction::CloseTab) {
                     fg_app
                 } else {
                     let latest_app = events
                         .iter()
                         .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-                        .and_then(|ev| ev.data.app.clone());
+                        .and_then(|ev| ev.data.app.clone())
+                        .filter(|app| !enforcer::exe_name_is_excluded(app, &rule.target_executables));
                     fg_app
                         .or(latest_app)
-                        .or_else(|| Some("Active Application".to_string()))
+                        .or_else(|| {
+                            if enforcer::has_exclusion_targets(&rule.target_executables) {
+                                None
+                            } else {
+                                Some("Active Application".to_string())
+                            }
+                        })
                 }
             } else if rule.action == RuleAction::CloseTab {
                 enforcer::find_matching_foreground_window(&rule.target_executables, None)
@@ -3041,6 +3055,18 @@ mod tests {
         let title_re = Regex::new(&title_rule.title_regex).ok();
         let ev_title = make_event(start_utc + Duration::minutes(20), 400.0, "word.exe", "Confidential Report", "");
         assert_eq!(calculate_usage_for_rule(&[ev_title], &title_rule, title_re.as_ref(), start_utc, now_utc), 400);
+
+        // Executable exclusion matching
+        let mut excl_rule = Rule::default_template(3);
+        excl_rule.monitor_selection = MonitorSelection::Executables;
+        excl_rule.target_executables = vec!["*".to_string(), "!zoom.exe".to_string()];
+        let ev_zoom = make_event(start_utc + Duration::minutes(25), 500.0, "zoom.exe", "Meeting", "");
+        let ev_zoom_path = make_event(start_utc + Duration::minutes(25), 500.0, r"C:\Program Files\Zoom\bin\zoom.exe", "Meeting", "");
+        let ev_notepad = make_event(start_utc + Duration::minutes(25), 500.0, "notepad.exe", "Notes", "");
+        assert!(!event_matches_rule(&ev_zoom, &excl_rule, None));
+        assert!(!event_matches_rule(&ev_zoom_path, &excl_rule, None));
+        assert!(event_matches_rule(&ev_notepad, &excl_rule, None));
+        assert_eq!(calculate_usage_for_rule(&[ev_zoom, ev_notepad], &excl_rule, None, start_utc, now_utc), 500);
     }
 
     /// Verifies `OverlayMode::priority` prevents lower-priority overlays from clobbering active breaks, and tests strict-mode lockout.
@@ -6895,10 +6921,15 @@ mod tests {
         rule_url.id = "rule-url".to_string();
         rule_url.monitor_selection = MonitorSelection::Urls;
 
+        let mut rule_excluded = Rule::default_template(4);
+        rule_excluded.id = "rule-excluded".to_string();
+        rule_excluded.target_executables = vec!["*".to_string(), "!zoom.exe".to_string()];
+
         assert!(is_wildcard_executables_rule(&rule_period));
         assert!(is_wildcard_executables_rule(&rule_limit));
         assert!(!is_wildcard_executables_rule(&rule_specific));
         assert!(!is_wildcard_executables_rule(&rule_url));
+        assert!(!is_wildcard_executables_rule(&rule_excluded));
 
         cfg.rules = vec![rule_period.clone(), rule_limit.clone()];
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);

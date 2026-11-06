@@ -434,12 +434,12 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard, non-comment) executable name.
+    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard, non-comment, non-exclusion) executable name.
     pub fn has_specific_executable(&self) -> bool {
         self.monitor_selection == MonitorSelection::Executables
             && self.target_executables.iter().any(|t| {
                 let s = t.trim();
-                !s.is_empty() && s != "*" && s != "#"
+                !s.is_empty() && s != "*" && s != "#" && !s.starts_with('!')
             })
     }
 
@@ -452,28 +452,46 @@ impl Rule {
     }
 
     /// Enforces safety and timing invariants on this rule:
-    /// - Normalizes `target_executables`: trims entries, drops empty/comment strings, removes wildcard if specific targets exist,
-    ///   deduplicates case-insensitively while preserving order, and falls back to `["*"]` if empty.
-    /// - Downgrades `KillProcess` to `CloseWindow` whenever the rule does not target at least one specific executable name.
+    /// - Normalizes `target_executables`: trims entries, drops empty/comment strings, removes wildcard if positive specific targets exist,
+    ///   preserves `!`-prefixed exclusion targets, deduplicates case-insensitively while preserving order, and keeps `["*"]` if only exclusions exist (falling back to `["*"]` if empty).
+    /// - Downgrades `KillProcess` to `CloseWindow` whenever the rule does not target at least one positive specific executable name.
     /// - Clamps duration values to match UI SpinBox ranges (1..=3600 for non-zero durations, 0..=3600 for optional durations).
     /// - Normalizes schedule bitmask strings to canonical 24-character '0'/'1' representations.
     pub fn sanitize(&mut self) {
-        let is_specific = |s: &str| !s.is_empty() && s != "*" && s != "#";
         let mut seen = std::collections::HashSet::new();
         let mut normalized_targets = Vec::new();
+        let mut has_positive_specific = false;
+        let mut has_exclusions = false;
 
         for t in &self.target_executables {
             let trimmed = t.trim();
-            if is_specific(trimmed) {
+            if trimmed.is_empty() || trimmed == "#" || trimmed == "*" {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('!') {
+                let excl_trimmed = rest.trim();
+                if excl_trimmed.is_empty() || excl_trimmed == "#" || excl_trimmed == "*" {
+                    continue;
+                }
+                let lower = format!("!{}", excl_trimmed.to_ascii_lowercase());
+                if seen.insert(lower) {
+                    normalized_targets.push(format!("!{}", excl_trimmed));
+                    has_exclusions = true;
+                }
+            } else {
                 let lower = trimmed.to_ascii_lowercase();
                 if seen.insert(lower) {
                     normalized_targets.push(trimmed.to_string());
+                    has_positive_specific = true;
                 }
             }
         }
 
         if normalized_targets.is_empty() {
             self.target_executables = vec!["*".to_string()];
+        } else if has_exclusions && !has_positive_specific {
+            normalized_targets.insert(0, "*".to_string());
+            self.target_executables = normalized_targets;
         } else {
             self.target_executables = normalized_targets;
         }
@@ -1177,6 +1195,28 @@ mod tests {
         rule.target_executables = vec!["*".to_string(), "#".to_string()];
         rule.sanitize();
         assert_eq!(rule.target_executables, vec!["*"]);
+
+        // Exclusion normalization: ["!zoom.exe"] and ["*", "!zoom.exe"] normalize to ["*", "!zoom.exe"]
+        rule.target_executables = vec!["!zoom.exe".to_string()];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["*", "!zoom.exe"]);
+
+        rule.target_executables = vec![
+            "*".to_string(),
+            "  !zoom.exe  ".to_string(),
+            "!ZOOM.EXE".to_string(),
+        ];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["*", "!zoom.exe"]);
+
+        // When positive specific targets exist alongside exclusions, wildcard is removed
+        rule.target_executables = vec![
+            "*".to_string(),
+            "code.exe".to_string(),
+            "!zoom.exe".to_string(),
+        ];
+        rule.sanitize();
+        assert_eq!(rule.target_executables, vec!["code.exe", "!zoom.exe"]);
     }
 
     /// Verifies `RuleSchedule` normalization from short/corrupted strings to 24-character '0'/'1' strings.
@@ -1435,6 +1475,13 @@ mod tests {
 
         r.monitor_selection = MonitorSelection::Titles;
         assert!(!r.has_specific_executable());
+
+        r.monitor_selection = MonitorSelection::Executables;
+        r.target_executables = vec!["*".to_string(), "!zoom.exe".to_string()];
+        assert!(!r.has_specific_executable());
+        r.action = RuleAction::KillProcess;
+        r.sanitize();
+        assert_eq!(r.action, RuleAction::CloseWindow);
 
         r.trigger = TriggerType::Limit;
         r.limit = DurationConfig::new(2, TimeUnit::Hr);
