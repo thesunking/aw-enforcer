@@ -46,6 +46,25 @@ fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+/// Formats a start/end time range into an ActivityWatch `start/end` timeperiod string.
+fn format_timeperiod(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    format!("{}/{}", start.to_rfc3339(), end.to_rfc3339())
+}
+
+/// Builds an ActivityWatch query body intersecting `target_expr` with `not_afk` status.
+fn build_not_afk_intersect_query(timeperiod: String, target_expr: &str, afk_id: &str) -> Value {
+    serde_json::json!({
+        "timeperiods": [timeperiod],
+        "query": [
+            format!("events = {target_expr};"),
+            format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id)),
+            "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
+            "events = filter_period_intersect(events, not_afk);",
+            "RETURN = events;"
+        ]
+    })
+}
+
 /// Selects the best bucket matching `prefix` among candidate local buckets.
 ///
 /// When multiple local buckets exist (e.g. following a hostname change), metadata is inspected:
@@ -199,25 +218,28 @@ impl AwClient {
         }
     }
 
+    /// URL for the ActivityWatch query endpoint.
+    fn query_url(&self) -> String {
+        format!("{}/api/0/query/", self.base_url)
+    }
+
+    /// Checks whether web buckets need a refresh (unverified or >=60 seconds since last check).
+    fn should_refresh_web_buckets(&self) -> bool {
+        let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
+        last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
+    }
+
     /// Resilient bucket discovery: checks GET /api/0/buckets/ to confirm both
     /// aw-watcher-window_ and aw-watcher-afk_ buckets exist before querying.
     pub async fn has_required_buckets(&self) -> bool {
-        if self.buckets_verified.load(Ordering::Relaxed) {
-            return true;
-        }
-        self.refresh_buckets().await
+        self.prepare_poll_buckets(false).await
     }
 
     /// Prepares buckets before polling, refreshing `/api/0/buckets/` if unverified or if web buckets need a 60s refresh.
     /// Returns `true` if required buckets are ready, avoiding duplicate calls and racing queries during `tokio::join!`.
     pub async fn prepare_poll_buckets(&self, need_web: bool) -> bool {
         let is_verified = self.buckets_verified.load(Ordering::Relaxed);
-        let need_web_refresh = need_web
-            && self
-                .last_web_bucket_check
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+        let need_web_refresh = need_web && self.should_refresh_web_buckets();
 
         if !is_verified || need_web_refresh {
             self.refresh_buckets().await
@@ -265,13 +287,9 @@ impl AwClient {
                     has_afk
                 );
             }
-            if has_window && has_afk {
-                self.buckets_verified.store(true, Ordering::Relaxed);
-                true
-            } else {
-                self.buckets_verified.store(false, Ordering::Relaxed);
-                false
-            }
+            let ready = has_window && has_afk;
+            self.buckets_verified.store(ready, Ordering::Relaxed);
+            ready
         } else {
             self.buckets_verified.store(false, Ordering::Relaxed);
             false
@@ -288,84 +306,37 @@ impl AwClient {
             return Ok(Vec::new());
         }
 
-        let url = format!("{}/api/0/query/", self.base_url);
-        let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
-
-        let window_bucket = self.window_bucket_id.read().await.clone();
-        let afk_bucket = self.afk_bucket_id.read().await.clone();
-
-        let (window_id, afk_id) = match (&window_bucket, &afk_bucket) {
-            (Some(w), Some(a)) => (w, a),
-            _ => return Ok(Vec::new()),
+        let Some(window_id) = self.window_bucket_id.read().await.clone() else {
+            return Ok(Vec::new());
+        };
+        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
+            return Ok(Vec::new());
         };
 
-        let window_line = format!("events = flood(query_bucket(\"{}\"));", escape_bucket_id(window_id));
-        let afk_line = format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id));
+        let target_expr = format!("flood(query_bucket(\"{}\"))", escape_bucket_id(&window_id));
+        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &target_expr, &afk_id);
 
-        let query_body = serde_json::json!({
-            "timeperiods": [timeperiod],
-            "query": [
-                window_line,
-                afk_line,
-                "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
-                "events = filter_period_intersect(events, not_afk);",
-                "RETURN = events;"
-            ]
-        });
-
-        self.execute_query(&url, &query_body).await
+        self.execute_query(&self.query_url(), &query_body).await
     }
 
     /// Queries browser tab events from aw-watcher-web intersected with not-afk status across all discovered web buckets.
     pub async fn query_web_events(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<AwEvent> {
-        let is_verified = self.buckets_verified.load(Ordering::Relaxed);
-        let elapsed_60s = {
-            let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
-            last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
-        };
-
-        if !is_verified || elapsed_60s {
-            *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-            self.refresh_buckets().await;
-        }
-
-        if !self.buckets_verified.load(Ordering::Relaxed) || !self.has_web_bucket.load(Ordering::Relaxed) {
+        if !self.prepare_poll_buckets(true).await || !self.has_web_bucket.load(Ordering::Relaxed) {
             return Vec::new();
         }
 
         let web_buckets = self.web_bucket_ids.read().await.clone();
-        if web_buckets.is_empty() {
+        let Some(web_expr) = build_web_query_expr(&web_buckets) else {
             return Vec::new();
-        }
-
-        let afk_bucket = self.afk_bucket_id.read().await.clone();
-        let afk_id = match afk_bucket {
-            Some(ref id) => id.clone(),
-            None => return Vec::new(),
         };
 
-        let url = format!("{}/api/0/query/", self.base_url);
-        let timeperiod = format!("{}/{}", start.to_rfc3339(), end.to_rfc3339());
-
-        let web_expr = match build_web_query_expr(&web_buckets) {
-            Some(expr) => expr,
-            None => return Vec::new(),
+        let Some(afk_id) = self.afk_bucket_id.read().await.clone() else {
+            return Vec::new();
         };
-        let web_line = format!("web = {web_expr};");
-        let afk_line = format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(&afk_id));
 
-        let query_body = serde_json::json!({
-            "timeperiods": [timeperiod],
-            "query": [
-                web_line,
-                afk_line,
-                "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
-                "events = filter_period_intersect(web, not_afk);",
-                "RETURN = events;"
-            ]
-        });
+        let query_body = build_not_afk_intersect_query(format_timeperiod(start, end), &web_expr, &afk_id);
 
-        self.execute_query(&url, &query_body).await.unwrap_or_default()
+        self.execute_query(&self.query_url(), &query_body).await.unwrap_or_default()
     }
 
     /// Dispatches a query request to ActivityWatch `/api/0/query/`, checking HTTP status and parsing returned events.
