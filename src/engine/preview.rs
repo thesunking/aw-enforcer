@@ -5,59 +5,6 @@ use crate::formatter::{self, MessageContext, TextHorizontalAlignment};
 use crate::overlay::OverlayMode;
 
 impl Engine {
-    /// Triggers a test overlay for UI verification using Option 3 structured paragraph syntax.
-    pub async fn trigger_test_overlay(&mut self, mode: &str) {
-        match mode {
-            "break" => {
-                let text = "# Take a Break\n\n[color=#38bdf8 size=18 bold] Rest your eyes and stretch for {break_time}.";
-                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Center);
-                let mode = OverlayMode::BreakEnforcer {
-                    rule_id: "test_break".into(),
-                    title: "Test Break Enforcer".into(),
-                    paragraphs,
-                    duration_seconds: 300,
-                    remaining_seconds: 300,
-                    allow_snooze: true,
-                    strict_mode: false,
-                    click_through: false,
-                };
-                self.show_overlay(mode);
-            }
-            "hud_toast" => {
-                let text = "## App Quota Warning\n[color=#f59e0b bold] You have {remaining} remaining for {app}.";
-                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
-                let mode = OverlayMode::HudToast {
-                    rule_id: "test_toast".into(),
-                    title: "Quota Warning".into(),
-                    paragraphs,
-                    snooze_options_minutes: vec![5, 10, 15],
-                    duration_seconds: 10,
-                    remaining_seconds: 10,
-                    show_time_remaining: true,
-                };
-                self.show_overlay(mode);
-            }
-            "hud_timer" => {
-                let text = "[color=#f87171 bold] Time limit exceeded. Application closing in 30s.";
-                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
-                let mode = OverlayMode::HudTimer {
-                    rule_id: "test_timer".into(),
-                    title: "Application Closing".into(),
-                    paragraphs,
-                    duration_seconds: 30,
-                    remaining_seconds: 30,
-                    allow_snooze: true,
-                    strict_mode: false,
-                };
-                self.show_overlay(mode);
-            }
-            "hud_status" => {
-                self.display_stats_overlay(false).await;
-            }
-            _ => {}
-        }
-    }
-
     /// Triggers an alert preview for a specific rule configuration.
     pub async fn preview_rule_alert(&mut self, rule: &Rule) {
         let ctx = formatter::build_preview_context(rule);
@@ -112,117 +59,132 @@ impl Engine {
             | RuleAction::LockWorkstation => {
                 let grace_secs = rule.grace_duration.to_seconds();
                 if grace_secs > 0 {
-                    let dur = grace_secs.min(15);
-                    let default_msg = format!(
-                        "[color=#f87171 bold] {} in {}s.",
-                        rule.action.as_str(),
-                        grace_secs
-                    );
-                    let raw_msg = if !rule.message.trim().is_empty() {
-                        &rule.message
-                    } else {
-                        &default_msg
-                    };
-                    let paragraphs =
-                        self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
-                    let mode = OverlayMode::HudTimer {
-                        rule_id: "test_preview".to_string(),
-                        title: format!("{}: {}", rule.action.as_str(), rule.name),
-                        paragraphs,
-                        duration_seconds: dur,
-                        remaining_seconds: dur,
-                        allow_snooze: !rule.strict_mode,
-                        strict_mode: false,
-                    };
-                    self.show_overlay(mode);
+                    self.preview_rule_grace_timer(rule, &ctx, grace_secs);
                 } else {
-                    let default_msg = format!(
-                        "[color=#f59e0b bold] {} in {}.",
-                        rule.action.as_str(),
-                        &ctx.remaining
-                    );
-                    let raw_msg = if !rule.message.trim().is_empty() {
-                        &rule.message
-                    } else {
-                        &default_msg
-                    };
-                    let paragraphs =
-                        self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
-                    let dur = rule.notification_duration.to_seconds().max(1);
-                    let mode = OverlayMode::HudToast {
-                        rule_id: "test_preview".to_string(),
-                        title: format!("Upcoming: {}", rule.name),
-                        paragraphs,
-                        snooze_options_minutes: if rule.strict_mode {
-                            Vec::new()
-                        } else {
-                            vec![5, 10, 15]
-                        },
-                        duration_seconds: dur,
-                        remaining_seconds: dur,
-                        show_time_remaining: rule.show_remaining_time,
-                    };
-                    self.show_overlay(mode);
+                    self.preview_rule_warning_toast(rule, &ctx);
                 }
             }
             RuleAction::ShowStatistics => {
                 let grace_secs = rule.grace_duration.to_seconds();
                 if grace_secs > 0 {
-                    let dur = grace_secs.min(15);
-                    let default_msg = format!(
-                        "[color=#f87171 bold] {} in {}s.",
-                        rule.action.as_str(),
-                        grace_secs
-                    );
-                    let raw_msg = if !rule.message.trim().is_empty() {
-                        &rule.message
-                    } else {
-                        &default_msg
-                    };
-                    let paragraphs =
-                        self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
-                    let mode = OverlayMode::HudTimer {
-                        rule_id: "test_preview".to_string(),
-                        title: format!("{}: {}", rule.action.as_str(), rule.name),
-                        paragraphs,
-                        duration_seconds: dur,
-                        remaining_seconds: dur,
-                        allow_snooze: !rule.strict_mode,
-                        strict_mode: false,
-                    };
-                    self.show_overlay(mode);
+                    self.preview_rule_grace_timer(rule, &ctx, grace_secs);
                 } else if rule.warn_before.to_seconds() > 0 {
-                    let default_msg = format!(
-                        "[color=#f59e0b bold] {} in {}.",
-                        rule.action.as_str(),
-                        &ctx.remaining
-                    );
-                    let raw_msg = if !rule.message.trim().is_empty() {
-                        &rule.message
-                    } else {
-                        &default_msg
-                    };
-                    let paragraphs =
-                        self.parse_rule_message(raw_msg, &ctx, TextHorizontalAlignment::Left);
-                    let dur = rule.notification_duration.to_seconds().max(1);
-                    let mode = OverlayMode::HudToast {
-                        rule_id: "test_preview".to_string(),
-                        title: format!("Upcoming: {}", rule.name),
-                        paragraphs,
-                        snooze_options_minutes: if rule.strict_mode {
-                            Vec::new()
-                        } else {
-                            vec![5, 10, 15]
-                        },
-                        duration_seconds: dur,
-                        remaining_seconds: dur,
-                        show_time_remaining: rule.show_remaining_time,
-                    };
-                    self.show_overlay(mode);
+                    self.preview_rule_warning_toast(rule, &ctx);
                 } else {
                     self.display_stats_overlay(rule.click_through).await;
                 }
             }
+        }
+    }
+
+    /// Prepares and displays a temporary `HudTimer` preview during a previewed grace countdown.
+    fn preview_rule_grace_timer(&mut self, rule: &Rule, ctx: &MessageContext, grace_secs: u32) {
+        let dur = grace_secs.min(15);
+        let default_msg = format!(
+            "[color=#f87171 bold] {} in {}s.",
+            rule.action.as_str(),
+            grace_secs
+        );
+        let raw_msg = if !rule.message.trim().is_empty() {
+            &rule.message
+        } else {
+            &default_msg
+        };
+        let paragraphs =
+            self.parse_rule_message(raw_msg, ctx, TextHorizontalAlignment::Left);
+        let mode = OverlayMode::HudTimer {
+            rule_id: "test_preview".to_string(),
+            title: format!("{}: {}", rule.action.as_str(), rule.name),
+            paragraphs,
+            duration_seconds: dur,
+            remaining_seconds: dur,
+            allow_snooze: !rule.strict_mode,
+            strict_mode: false,
+        };
+        self.show_overlay(mode);
+    }
+
+    /// Prepares and displays an upcoming warning `HudToast` preview when no grace duration is configured.
+    fn preview_rule_warning_toast(&mut self, rule: &Rule, ctx: &MessageContext) {
+        let default_msg = format!(
+            "[color=#f59e0b bold] {} in {}.",
+            rule.action.as_str(),
+            &ctx.remaining
+        );
+        let raw_msg = if !rule.message.trim().is_empty() {
+            &rule.message
+        } else {
+            &default_msg
+        };
+        let paragraphs =
+            self.parse_rule_message(raw_msg, ctx, TextHorizontalAlignment::Left);
+        let dur = rule.notification_duration.to_seconds().max(1);
+        let mode = OverlayMode::HudToast {
+            rule_id: "test_preview".to_string(),
+            title: format!("Upcoming: {}", rule.name),
+            paragraphs,
+            snooze_options_minutes: if rule.strict_mode {
+                Vec::new()
+            } else {
+                vec![5, 10, 15]
+            },
+            duration_seconds: dur,
+            remaining_seconds: dur,
+            show_time_remaining: rule.show_remaining_time,
+        };
+        self.show_overlay(mode);
+    }
+
+    /// Triggers a test overlay for UI verification using Option 3 structured paragraph syntax.
+    pub async fn trigger_test_overlay(&mut self, mode: &str) {
+        match mode {
+            "break" => {
+                let text = "# Take a Break\n\n[color=#38bdf8 size=18 bold] Rest your eyes and stretch for {break_time}.";
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Center);
+                let mode = OverlayMode::BreakEnforcer {
+                    rule_id: "test_break".into(),
+                    title: "Test Break Enforcer".into(),
+                    paragraphs,
+                    duration_seconds: 300,
+                    remaining_seconds: 300,
+                    allow_snooze: true,
+                    strict_mode: false,
+                    click_through: false,
+                };
+                self.show_overlay(mode);
+            }
+            "hud_toast" => {
+                let text = "## App Quota Warning\n[color=#f59e0b bold] You have {remaining} remaining for {app}.";
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
+                let mode = OverlayMode::HudToast {
+                    rule_id: "test_toast".into(),
+                    title: "Quota Warning".into(),
+                    paragraphs,
+                    snooze_options_minutes: vec![5, 10, 15],
+                    duration_seconds: 10,
+                    remaining_seconds: 10,
+                    show_time_remaining: true,
+                };
+                self.show_overlay(mode);
+            }
+            "hud_timer" => {
+                let text = "[color=#f87171 bold] Time limit exceeded. Application closing in 30s.";
+                let paragraphs = self.parse_rule_message(text, &MessageContext::sample(), TextHorizontalAlignment::Left);
+                let mode = OverlayMode::HudTimer {
+                    rule_id: "test_timer".into(),
+                    title: "Application Closing".into(),
+                    paragraphs,
+                    duration_seconds: 30,
+                    remaining_seconds: 30,
+                    allow_snooze: true,
+                    strict_mode: false,
+                };
+                self.show_overlay(mode);
+            }
+            "hud_status" => {
+                self.display_stats_overlay(false).await;
+            }
+            _ => {}
         }
     }
 }
