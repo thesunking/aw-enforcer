@@ -1,28 +1,692 @@
-use chrono::format::{Item, StrftimeItems};
+﻿use chrono::format::{Item, StrftimeItems};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// Serde default helper returning `true`.
-fn default_true() -> bool {
-    true
+
+// ---------------------------------------------------------------------------
+// Top-Level Application Configuration
+// ---------------------------------------------------------------------------
+
+/// Top-level application configuration persisted to `%LOCALAPPDATA%\aw-enforcer\config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub general: GeneralConfig,
+    pub overlay: OverlayConfig,
+    pub stats: StatsConfig,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
 }
 
-/// Serde default helper returning `"femtovg"`.
-fn default_slint_renderer() -> String {
-    "femtovg".to_string()
+pub type AppConfig = Config;
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            general: GeneralConfig::default(),
+            overlay: OverlayConfig::default(),
+            stats: StatsConfig::default(),
+            rules: vec![
+                Rule {
+                    id: "rule-ergo-break".to_string(),
+                    enabled: true,
+                    name: "Workday Ergonomic Break".to_string(),
+                    monitor_selection: MonitorSelection::Executables,
+                    target_executables: vec!["*".to_string()],
+                    title_regex: String::new(),
+                    url_regex: String::new(),
+                    trigger: TriggerType::Period,
+                    period: DurationConfig::new(50, TimeUnit::Min),
+                    reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
+                    limit: DurationConfig::new(8, TimeUnit::Hr),
+                    action: RuleAction::ShowOverlay,
+                    warn_before: DurationConfig::new(5, TimeUnit::Min),
+                    grace_duration: DurationConfig::new(0, TimeUnit::Sec),
+                    break_duration: DurationConfig::new(10, TimeUnit::Min),
+                    click_through: false,
+                    strict_mode: false,
+                    notification_method: NotificationMethod::Hud,
+                    notification_duration: DurationConfig::new(10, TimeUnit::Sec),
+                    show_remaining_time: false,
+                    message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
+                    schedule: RuleSchedule::from_weekday_weekend(
+                        "000000001111111111000000",
+                        "000000000000000000000000",
+                    ),
+                },
+                Rule {
+                    id: "rule-gaming-limit".to_string(),
+                    enabled: true,
+                    name: "Weeknight Gaming Limit".to_string(),
+                    monitor_selection: MonitorSelection::Executables,
+                    target_executables: vec!["steam.exe".to_string(), "discord.exe".to_string()],
+                    title_regex: String::new(),
+                    url_regex: String::new(),
+                    trigger: TriggerType::Limit,
+                    period: DurationConfig::new(50, TimeUnit::Min),
+                    reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
+                    limit: DurationConfig::new(1, TimeUnit::Hr),
+                    action: RuleAction::CloseWindow,
+                    warn_before: DurationConfig::new(5, TimeUnit::Min),
+                    grace_duration: DurationConfig::new(30, TimeUnit::Sec),
+                    break_duration: DurationConfig::new(10, TimeUnit::Min),
+                    click_through: false,
+                    strict_mode: false,
+                    notification_method: NotificationMethod::Hud,
+                    notification_duration: DurationConfig::new(10, TimeUnit::Sec),
+                    show_remaining_time: false,
+                    message: "## Quota Warning: {app}\n[color=#f59e0b bold] {remaining} remaining out of your {limit} daily limit.\nPlease wrap up and save your work.".to_string(),
+                    schedule: RuleSchedule::from_weekday_weekend(
+                        "000000000111111111111100",
+                        "000000000000000000000000",
+                    ),
+                },
+            ],
+        }
+    }
 }
 
-/// Serde default helper for the logical day boundary hour (04:00 AM).
-fn default_day_start_hour() -> u32 {
-    4
+impl Config {
+    /// Loads `config.toml` from disk, falling back to `Config::default()` if reading or parsing fails.
+    pub fn load() -> Self {
+        Self::try_load().unwrap_or_else(|e| {
+            tracing::warn!("Failed to load config.toml ({e}); using defaults.");
+            Self::default()
+        })
+    }
+
+    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
+    /// If loading an existing file fails, backs up the corrupted file to `config.toml.bak`.
+    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = Self::config_path();
+        Self::try_load_from_path(&path)
+    }
+
+    /// Attempts to read, parse, validate, and sanitize `path`, creating a default file if none exists.
+    /// If loading an existing file fails, backs up the corrupted file to `path.with_extension("toml.bak")`.
+    pub fn try_load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        if !path.exists() {
+            let default_cfg = Self::default();
+            default_cfg.save_to_path(path)?;
+            return Ok(default_cfg);
+        }
+
+        Self::load_from_path(path).map_err(|e| {
+            let bak_path = path.with_extension("toml.bak");
+            let _ = fs::copy(path, &bak_path);
+            tracing::warn!(
+                "Failed to load existing config at {:?} ({}); backed up corrupted file to {:?}",
+                path,
+                e,
+                bak_path
+            );
+            e
+        })
+    }
+
+    /// Loads, parses, validates, and sanitizes a configuration from `path`.
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let mut cfg: Config = toml::from_str(&content)?;
+        cfg.sanitize();
+        Ok(cfg)
+    }
+
+    /// Serializes and writes the configuration to `config.toml`, creating parent directories as needed.
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = Self::config_path();
+        self.save_to_path(&path)
+    }
+
+    /// Serializes, validates, sanitizes, and writes the configuration to `path` atomically via a temporary file,
+    /// creating parent directories as needed.
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut to_save = self.clone();
+        to_save.sanitize();
+        let serialized = toml::to_string_pretty(&to_save)?;
+        let tmp_path = path.with_extension("toml.tmp");
+        fs::write(&tmp_path, &serialized)?;
+        if let Err(e) = fs::rename(&tmp_path, path) {
+            tracing::warn!(
+                "Atomic rename from {:?} to {:?} failed ({:?}); falling back to direct write",
+                tmp_path,
+                path,
+                e
+            );
+            let write_res = fs::write(path, &serialized);
+            let _ = fs::remove_file(&tmp_path);
+            write_res?;
+        }
+        Ok(())
+    }
+
+    /// Returns the platform-specific path to `config.toml` inside the local app data directory.
+    pub fn config_path() -> PathBuf {
+        let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+        path.push("aw-enforcer");
+        path.push("config.toml");
+        path
+    }
+
+    /// Enforces full application configuration invariants and sanitization across general, overlay, stats, and rule configs.
+    pub fn sanitize(&mut self) {
+        let (valid, _) = validate_strftime_format(&self.stats.histogram_time_format);
+        if !valid {
+            self.stats.histogram_time_format = "%H:%M".to_string();
+        }
+
+        self.general.aw_port = self.general.aw_port.max(1);
+        self.general.poll_interval_seconds = self.general.poll_interval_seconds.clamp(2, 120);
+        self.general.day_start_hour = self.general.day_start_hour.min(23);
+
+        self.general.slint_renderer = if self.general.slint_renderer.eq_ignore_ascii_case("software") {
+            "software".to_string()
+        } else {
+            "femtovg".to_string()
+        };
+
+        self.overlay.opacity = self.overlay.opacity.clamp(0.1, 1.0);
+        let default_overlay = OverlayConfig::default();
+        let sanitize_hex = |color: &mut String, default: &str| {
+            if crate::formatter::parse_hex_color(color).is_none() {
+                *color = default.to_string();
+            }
+        };
+        sanitize_hex(&mut self.overlay.accent_color, &default_overlay.accent_color);
+        sanitize_hex(&mut self.overlay.background_color, &default_overlay.background_color);
+        sanitize_hex(&mut self.overlay.text_color, &default_overlay.text_color);
+
+        self.stats.daily_screentime_target_minutes =
+            self.stats.daily_screentime_target_minutes.clamp(1, 1440);
+        self.stats.threshold_excessive_minutes = self
+            .stats
+            .threshold_excessive_minutes
+            .clamp(self.stats.daily_screentime_target_minutes, 1440);
+        self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.clamp(1, 1440);
+        self.stats.histogram_bin_count = self.stats.histogram_bin_count.clamp(1, 96);
+
+        self.sanitize_rules();
+    }
+
+    /// Enforces safety invariants on rules:
+    /// - Sanitizes each individual rule (duration bounds, target normalization, schedule bitmask canonicalization).
+    /// - Ensures every rule has a non-empty, unique ID that does not collide with runtime "test_" overlays.
+    pub fn sanitize_rules(&mut self) {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut next_id_num = 1usize;
+
+        for rule in &mut self.rules {
+            rule.sanitize();
+
+            let trimmed_id = rule.id.trim().to_string();
+            let is_invalid = trimmed_id.is_empty()
+                || trimmed_id.starts_with("test_")
+                || seen_ids.contains(&trimmed_id);
+
+            if is_invalid {
+                loop {
+                    let candidate = format!("rule-{}", next_id_num);
+                    next_id_num += 1;
+                    if !seen_ids.contains(&candidate) {
+                        rule.id = candidate.clone();
+                        seen_ids.insert(candidate);
+                        break;
+                    }
+                }
+            } else {
+                rule.id = trimmed_id.clone();
+                seen_ids.insert(trimmed_id);
+            }
+        }
+    }
 }
 
-/// Serde default helper targeting all executables (`["*"]`).
-fn default_wildcard_targets() -> Vec<String> {
-    vec!["*".to_string()]
+// ---------------------------------------------------------------------------
+// Subsystem Configurations (General, Overlay, Stats)
+// ---------------------------------------------------------------------------
+
+
+/// Global daemon and ActivityWatch connection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneralConfig {
+    pub aw_port: u16,
+    pub poll_interval_seconds: u64,
+    pub autostart: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_day_start_hour")]
+    pub day_start_hour: u32,
+    #[serde(default = "default_true")]
+    pub suppress_fullscreen_d3d: bool,
+    #[serde(default)]
+    pub pause_all_rules: bool,
+    #[serde(default = "default_true")]
+    pub destroy_windows_on_hide: bool,
+    #[serde(default = "default_slint_renderer")]
+    pub slint_renderer: String,
 }
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            aw_port: 5600,
+            poll_interval_seconds: 10,
+            autostart: true,
+            api_key: String::new(),
+            day_start_hour: 4,
+            suppress_fullscreen_d3d: true,
+            pause_all_rules: false,
+            destroy_windows_on_hide: true,
+            slint_renderer: "femtovg".to_string(),
+        }
+    }
+}
+
+/// Visual theme and opacity settings for the fullscreen and HUD overlay windows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayConfig {
+    pub opacity: f32,
+    pub theme: String,
+    pub accent_color: String,
+    pub background_color: String,
+    pub text_color: String,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            opacity: 0.90,
+            theme: "dark".to_string(),
+            accent_color: "#3b82f6".to_string(),
+            background_color: "#0f172a".to_string(),
+            text_color: "#f8fafc".to_string(),
+        }
+    }
+}
+
+/// Configuration for the daily usage statistics dashboard and activity histogram.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsConfig {
+    pub daily_screentime_target_minutes: u32,
+    pub threshold_excessive_minutes: u32,
+    pub histogram_bin_size_minutes: u32,
+    pub histogram_bin_count: u32,
+    pub histogram_time_format: String,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            daily_screentime_target_minutes: 480,
+            threshold_excessive_minutes: 600,
+            histogram_bin_size_minutes: 60,
+            histogram_bin_count: 24,
+            histogram_time_format: "%H:%M".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule Configuration & Scheduling
+// ---------------------------------------------------------------------------
+
+
+/// Represents a single user-configured monitoring and enforcement rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    // --- 1. General ---
+    pub id: String,
+    pub enabled: bool,
+    pub name: String,
+
+    // --- 2. Monitor ---
+    #[serde(default)]
+    pub monitor_selection: MonitorSelection, // "Executables" | "Titles" | "Urls"
+    #[serde(default = "default_wildcard_targets")]
+    pub target_executables: Vec<String>,
+    #[serde(default)]
+    pub title_regex: String,
+    #[serde(default)]
+    pub url_regex: String,
+
+    // --- 3. Trigger ---
+    #[serde(default)]
+    pub trigger: TriggerType, // "Period" | "Limit"
+    #[serde(default = "default_period")]
+    pub period: DurationConfig, // Continuous active session duration
+    #[serde(default = "default_reset_after_afk")]
+    pub reset_after_afk: DurationConfig, // AFK duration to reset session
+    #[serde(default = "default_limit")]
+    pub limit: DurationConfig, // Daily cumulative usage limit (0 = immediate)
+
+    // --- 4. Action ---
+    #[serde(default)]
+    pub action: RuleAction, // "Show Overlay" | "Show Notification" | "Show Statistics" | "Lock Workstation" | "Close Tab" | "Close Window" | "Kill Process"
+    #[serde(default = "default_warn_before")]
+    pub warn_before: DurationConfig, // Warn before action (0 = disabled)
+    #[serde(default = "default_grace")]
+    pub grace_duration: DurationConfig, // Grace countdown (0 = disabled)
+    #[serde(default = "default_break_duration")]
+    pub break_duration: DurationConfig, // Break duration (when action == ShowOverlay)
+    #[serde(default)]
+    pub click_through: bool, // Click-through overlay (when action == ShowOverlay)
+    #[serde(default)]
+    pub strict_mode: bool, // Strict mode (when action == ShowOverlay)
+    #[serde(default)]
+    pub notification_method: NotificationMethod, // "HUD" | "Windows" (when action == ShowNotification)
+    #[serde(default = "default_notification_duration")]
+    pub notification_duration: DurationConfig, // Duration HUD notification is visible (when action == ShowNotification && notification_method == HUD)
+    #[serde(default)]
+    pub show_remaining_time: bool, // Show countdown timer on HUD notification
+    #[serde(default)]
+    pub message: String, // Used when action == ShowOverlay or ShowNotification
+
+    // --- 5. Schedule ---
+    #[serde(default)]
+    pub schedule: RuleSchedule,
+}
+
+impl Rule {
+    /// Creates a new rule populated with sensible ergonomic defaults for the UI "+ Add Rule" action.
+    pub fn default_template(index: usize) -> Self {
+        Self {
+            id: format!("rule-{}", index + 1),
+            enabled: true,
+            name: format!("New Rule {}", index + 1),
+            monitor_selection: MonitorSelection::Executables,
+            target_executables: vec!["*".to_string()],
+            title_regex: String::new(),
+            url_regex: String::new(),
+            trigger: TriggerType::Period,
+            period: DurationConfig::new(50, TimeUnit::Min),
+            reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
+            limit: DurationConfig::new(1, TimeUnit::Hr),
+            action: RuleAction::ShowOverlay,
+            warn_before: DurationConfig::new(5, TimeUnit::Min),
+            grace_duration: DurationConfig::new(0, TimeUnit::Sec),
+            break_duration: DurationConfig::new(10, TimeUnit::Min),
+            click_through: false,
+            strict_mode: false,
+            notification_method: NotificationMethod::Hud,
+            notification_duration: DurationConfig::new(10, TimeUnit::Sec),
+            show_remaining_time: false,
+            message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
+            schedule: RuleSchedule::default(),
+        }
+    }
+
+    /// Creates a duplicate copy of `self` with a new unique `id` and a ` (Copy)` name suffix.
+    pub fn duplicate(&self, new_id: String) -> Self {
+        let mut copy = self.clone();
+        copy.id = new_id.clone();
+        if !copy.name.trim().is_empty() {
+            copy.name = format!("{} (Copy)", copy.name.trim());
+        } else {
+            copy.name = format!("Rule {}", new_id.trim_start_matches("rule-"));
+        }
+        copy
+    }
+
+    /// Returns the threshold duration in seconds configured for this rule's trigger (`Period` or `Limit`).
+    pub fn trigger_threshold_seconds(&self) -> u32 {
+        match self.trigger {
+            TriggerType::Period => self.period.to_seconds().max(1),
+            TriggerType::Limit => self.limit.to_seconds(),
+        }
+    }
+
+    /// Enforces safety and timing invariants on this rule:
+    /// - Normalizes `target_executables`: trims entries, drops empty/comment strings, removes wildcard if positive specific targets exist,
+    ///   preserves `!`-prefixed exclusion targets, deduplicates case-insensitively while preserving order, and keeps `["*"]` if only exclusions exist (falling back to `["*"]` if empty).
+    /// - Downgrades `KillProcess` to `CloseWindow` whenever the rule does not target at least one positive specific executable name.
+    /// - Clamps duration values to match UI SpinBox ranges (1..=3600 for non-zero durations, 0..=3600 for optional durations).
+    /// - Normalizes schedule bitmask strings to canonical 24-character '0'/'1' representations.
+    pub fn sanitize(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let mut normalized_targets = Vec::new();
+        let mut has_positive_specific = false;
+        let mut has_exclusions = false;
+
+        for t in &self.target_executables {
+            let trimmed = t.trim();
+            if trimmed.is_empty() || trimmed == "#" || trimmed == "*" {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('!') {
+                let excl_trimmed = rest.trim();
+                if excl_trimmed.is_empty() || excl_trimmed == "#" || excl_trimmed == "*" {
+                    continue;
+                }
+                let lower = format!("!{}", excl_trimmed.to_ascii_lowercase());
+                if seen.insert(lower) {
+                    normalized_targets.push(format!("!{}", excl_trimmed));
+                    has_exclusions = true;
+                }
+            } else {
+                let lower = trimmed.to_ascii_lowercase();
+                if seen.insert(lower) {
+                    normalized_targets.push(trimmed.to_string());
+                    has_positive_specific = true;
+                }
+            }
+        }
+
+        if normalized_targets.is_empty() {
+            normalized_targets.push("*".to_string());
+        } else if has_exclusions && !has_positive_specific {
+            normalized_targets.insert(0, "*".to_string());
+        }
+        self.target_executables = normalized_targets;
+
+        if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
+            self.action = RuleAction::CloseWindow;
+        }
+
+        self.period.value = self.period.value.clamp(1, 3600);
+        self.reset_after_afk.value = self.reset_after_afk.value.clamp(1, 3600);
+        self.limit.value = self.limit.value.min(3600);
+        self.warn_before.value = self.warn_before.value.min(3600);
+        self.grace_duration.value = self.grace_duration.value.min(3600);
+        self.break_duration.value = self.break_duration.value.clamp(1, 3600);
+        self.notification_duration.value = self.notification_duration.value.clamp(1, 3600);
+
+        self.schedule = RuleSchedule::from_bool_array(&self.schedule.to_bool_array());
+    }
+
+    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard, non-comment, non-exclusion) executable name.
+    pub fn has_specific_executable(&self) -> bool {
+        self.monitor_selection == MonitorSelection::Executables
+            && self.target_executables.iter().any(|t| {
+                let s = t.trim();
+                !s.is_empty() && s != "*" && s != "#" && !s.starts_with('!')
+            })
+    }
+}
+
+
+/// Time unit for user-configured durations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimeUnit {
+    Hr,
+    #[default]
+    Min,
+    Sec,
+}
+
+impl TimeUnit {
+    /// Returns the short UI label (`"Hr"`, `"Min"`, or `"Sec"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hr => "Hr",
+            Self::Min => "Min",
+            Self::Sec => "Sec",
+        }
+    }
+
+    /// Parses a `TimeUnit` from a string, falling back to `Min`.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim() {
+            "Hr" => Self::Hr,
+            "Sec" => Self::Sec,
+            _ => Self::Min,
+        }
+    }
+}
+
+/// Pairing of a numeric value and a `TimeUnit` for rule timing parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurationConfig {
+    pub value: u32,
+    pub unit: TimeUnit,
+}
+
+impl DurationConfig {
+    /// Constructs a new `DurationConfig` with the given magnitude and unit.
+    pub fn new(value: u32, unit: TimeUnit) -> Self {
+        Self { value, unit }
+    }
+
+    /// Converts the duration into total seconds using saturating multiplication.
+    pub fn to_seconds(&self) -> u32 {
+        match self.unit {
+            TimeUnit::Hr => self.value.saturating_mul(3600),
+            TimeUnit::Min => self.value.saturating_mul(60),
+            TimeUnit::Sec => self.value,
+        }
+    }
+
+    /// Formats the duration as a compact string such as `"2h"`, `"45m"`, or `"30s"`.
+    pub fn to_short_string(&self) -> String {
+        match self.unit {
+            TimeUnit::Hr => format!("{}h", self.value),
+            TimeUnit::Min => format!("{}m", self.value),
+            TimeUnit::Sec => format!("{}s", self.value),
+        }
+    }
+}
+
+/// Weekly 7x24 hourly activity schedule stored as 24-character `'0'`/`'1'` strings per weekday.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleSchedule {
+    pub mon: String,
+    pub tue: String,
+    pub wed: String,
+    pub thu: String,
+    pub fri: String,
+    pub sat: String,
+    pub sun: String,
+}
+
+impl Default for RuleSchedule {
+    fn default() -> Self {
+        // Default: 09:00 - 17:59 active on weekdays
+        Self::from_weekday_weekend("000000000111111111000000", "000000000000000000000000")
+    }
+}
+
+impl RuleSchedule {
+    /// Returns a pre-configured `RuleSchedule` for known preset names, or `None` if unrecognized.
+    /// - `"select_all"`: All days and hours active.
+    /// - `"clear"`: All days and hours inactive.
+    /// - `"work_hours"`: Monday-Friday 09:00 - 17:59 active, weekends inactive.
+    /// - `"evenings"`: Monday-Friday 18:00 - 23:59 active, weekends 08:00 - 23:59 active.
+    /// - `"weekends"`: Monday-Friday completely inactive, Saturday-Sunday active all 24 hours.
+    pub fn from_preset(preset: &str) -> Option<Self> {
+        match preset {
+            "select_all" => Some(Self::uniform("111111111111111111111111")),
+            "clear" => Some(Self::uniform("000000000000000000000000")),
+            "work_hours" => Some(Self::default()),
+            "evenings" => Some(Self::from_weekday_weekend(
+                "000000000000000000111111",
+                "000000001111111111111111",
+            )),
+            "weekends" => Some(Self::from_weekday_weekend(
+                "000000000000000000000000",
+                "111111111111111111111111",
+            )),
+            _ => None,
+        }
+    }
+
+    /// Creates a schedule with one bitmask for weekdays (Mon-Fri) and another for weekends (Sat-Sun).
+    pub fn from_weekday_weekend(weekday_mask: &str, weekend_mask: &str) -> Self {
+        Self {
+            mon: weekday_mask.to_string(),
+            tue: weekday_mask.to_string(),
+            wed: weekday_mask.to_string(),
+            thu: weekday_mask.to_string(),
+            fri: weekday_mask.to_string(),
+            sat: weekend_mask.to_string(),
+            sun: weekend_mask.to_string(),
+        }
+    }
+
+    /// Creates a schedule with identical 24-hour bitmasks for all 7 days.
+    pub fn uniform(day_mask: &str) -> Self {
+        Self {
+            mon: day_mask.to_string(),
+            tue: day_mask.to_string(),
+            wed: day_mask.to_string(),
+            thu: day_mask.to_string(),
+            fri: day_mask.to_string(),
+            sat: day_mask.to_string(),
+            sun: day_mask.to_string(),
+        }
+    }
+
+    /// Constructs a `RuleSchedule` from an array of 7 24-character day bitmask strings (Mon..Sun).
+    pub fn from_days(days: [String; 7]) -> Self {
+        let [mon, tue, wed, thu, fri, sat, sun] = days;
+        Self { mon, tue, wed, thu, fri, sat, sun }
+    }
+
+    /// Returns `true` if the rule is scheduled to be active on `day` (0 = Monday .. 6 = Sunday) at `hour` (0..23).
+    pub fn is_active(&self, day: usize, hour: usize) -> bool {
+        if hour >= 24 {
+            return false;
+        }
+        let Some(day_str) = self.days().get(day).copied() else {
+            return false;
+        };
+        day_str.chars().nth(hour).map_or(false, |c| c == '1')
+    }
+
+    /// Flattens the 7x24 schedule into a 168-element boolean array for the Slint UI matrix.
+    pub fn to_bool_array(&self) -> [bool; 168] {
+        let mut slots = [false; 168];
+        for (d, day_str) in self.days().into_iter().enumerate() {
+            for (h, c) in day_str.chars().take(24).enumerate() {
+                slots[d * 24 + h] = c == '1';
+            }
+        }
+        slots
+    }
+
+    /// Reconstructs a `RuleSchedule` from a flattened 168-element boolean slice.
+    pub fn from_bool_array(slots: &[bool]) -> Self {
+        let days = std::array::from_fn(|d| {
+            (0..24)
+                .map(|h| if slots.get(d * 24 + h).copied().unwrap_or(false) { '1' } else { '0' })
+                .collect()
+        });
+        Self::from_days(days)
+    }
+
+    /// Returns an array of references to the 7 daily schedule bitmask strings (Mon..Sun).
+    pub fn days(&self) -> [&str; 7] {
+        [
+            &self.mon, &self.tue, &self.wed, &self.thu, &self.fri, &self.sat, &self.sun,
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule Enums (Monitoring, Triggers, Actions, Delivery)
+// ---------------------------------------------------------------------------
 
 /// Specifies which telemetry property a rule inspects to match activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -154,180 +818,65 @@ impl NotificationMethod {
     }
 }
 
-/// Time unit for user-configured durations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum TimeUnit {
-    Hr,
-    #[default]
-    Min,
-    Sec,
-}
+// ---------------------------------------------------------------------------
+// Format & Pattern Validators
+// ---------------------------------------------------------------------------
 
-impl TimeUnit {
-    /// Returns the short UI label (`"Hr"`, `"Min"`, or `"Sec"`).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Hr => "Hr",
-            Self::Min => "Min",
-            Self::Sec => "Sec",
+
+/// Validates a chrono strftime format string and returns `(is_valid, preview_or_error)`.
+pub fn validate_strftime_format(code: &str) -> (bool, String) {
+    if code.trim().is_empty() {
+        return (false, "Format cannot be empty".to_string());
+    }
+    let items = StrftimeItems::new(code);
+    for item in items {
+        if matches!(item, Item::Error) {
+            return (false, "Invalid format specifier".to_string());
         }
     }
-
-    /// Parses a `TimeUnit` from a string, falling back to `Min`.
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s.trim() {
-            "Hr" => Self::Hr,
-            "Sec" => Self::Sec,
-            _ => Self::Min,
-        }
+    let sample = Local::now().format(code).to_string();
+    if sample.is_empty() {
+        (false, "Produces empty output".to_string())
+    } else {
+        (true, sample)
     }
 }
 
-/// Pairing of a numeric value and a `TimeUnit` for rule timing parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DurationConfig {
-    pub value: u32,
-    pub unit: TimeUnit,
-}
-
-impl DurationConfig {
-    /// Constructs a new `DurationConfig` with the given magnitude and unit.
-    pub fn new(value: u32, unit: TimeUnit) -> Self {
-        Self { value, unit }
+/// Validates a regular expression pattern using `regex::Regex::new` and returns `(is_valid, error_message)`.
+pub fn validate_regex_pattern(pattern: &str) -> (bool, String) {
+    if pattern.trim().is_empty() {
+        return (false, "Regular expression cannot be empty".to_string());
     }
-
-    /// Converts the duration into total seconds using saturating multiplication.
-    pub fn to_seconds(&self) -> u32 {
-        match self.unit {
-            TimeUnit::Hr => self.value.saturating_mul(3600),
-            TimeUnit::Min => self.value.saturating_mul(60),
-            TimeUnit::Sec => self.value,
-        }
-    }
-
-    /// Formats the duration as a compact string such as `"2h"`, `"45m"`, or `"30s"`.
-    pub fn to_short_string(&self) -> String {
-        match self.unit {
-            TimeUnit::Hr => format!("{}h", self.value),
-            TimeUnit::Min => format!("{}m", self.value),
-            TimeUnit::Sec => format!("{}s", self.value),
-        }
+    match regex::Regex::new(pattern) {
+        Ok(_) => (true, String::new()),
+        Err(e) => (false, e.to_string()),
     }
 }
 
-/// Weekly 7x24 hourly activity schedule stored as 24-character `'0'`/`'1'` strings per weekday.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuleSchedule {
-    pub mon: String,
-    pub tue: String,
-    pub wed: String,
-    pub thu: String,
-    pub fri: String,
-    pub sat: String,
-    pub sun: String,
+
+
+// ---------------------------------------------------------------------------
+// Serde Default Helpers
+// ---------------------------------------------------------------------------
+
+/// Serde default helper returning `true`.
+fn default_true() -> bool {
+    true
 }
 
-impl Default for RuleSchedule {
-    fn default() -> Self {
-        // Default: 09:00 - 17:59 active on weekdays
-        Self::from_weekday_weekend("000000000111111111000000", "000000000000000000000000")
-    }
+/// Serde default helper returning `"femtovg"`.
+fn default_slint_renderer() -> String {
+    "femtovg".to_string()
 }
 
-impl RuleSchedule {
-    /// Constructs a `RuleSchedule` from an array of 7 24-character day bitmask strings (Mon..Sun).
-    pub fn from_days(days: [String; 7]) -> Self {
-        let [mon, tue, wed, thu, fri, sat, sun] = days;
-        Self { mon, tue, wed, thu, fri, sat, sun }
-    }
+/// Serde default helper for the logical day boundary hour (04:00 AM).
+fn default_day_start_hour() -> u32 {
+    4
+}
 
-    /// Creates a schedule with identical 24-hour bitmasks for all 7 days.
-    pub fn uniform(day_mask: &str) -> Self {
-        Self {
-            mon: day_mask.to_string(),
-            tue: day_mask.to_string(),
-            wed: day_mask.to_string(),
-            thu: day_mask.to_string(),
-            fri: day_mask.to_string(),
-            sat: day_mask.to_string(),
-            sun: day_mask.to_string(),
-        }
-    }
-
-    /// Creates a schedule with one bitmask for weekdays (Mon-Fri) and another for weekends (Sat-Sun).
-    pub fn from_weekday_weekend(weekday_mask: &str, weekend_mask: &str) -> Self {
-        Self {
-            mon: weekday_mask.to_string(),
-            tue: weekday_mask.to_string(),
-            wed: weekday_mask.to_string(),
-            thu: weekday_mask.to_string(),
-            fri: weekday_mask.to_string(),
-            sat: weekend_mask.to_string(),
-            sun: weekend_mask.to_string(),
-        }
-    }
-
-    /// Returns an array of references to the 7 daily schedule bitmask strings (Mon..Sun).
-    pub fn days(&self) -> [&str; 7] {
-        [
-            &self.mon, &self.tue, &self.wed, &self.thu, &self.fri, &self.sat, &self.sun,
-        ]
-    }
-
-    /// Returns `true` if the rule is scheduled to be active on `day` (0 = Monday .. 6 = Sunday) at `hour` (0..23).
-    pub fn is_active(&self, day: usize, hour: usize) -> bool {
-        if hour >= 24 {
-            return false;
-        }
-        let Some(day_str) = self.days().get(day).copied() else {
-            return false;
-        };
-        day_str.chars().nth(hour).map_or(false, |c| c == '1')
-    }
-
-    /// Flattens the 7x24 schedule into a 168-element boolean array for the Slint UI matrix.
-    pub fn to_bool_array(&self) -> [bool; 168] {
-        let mut slots = [false; 168];
-        for (d, day_str) in self.days().into_iter().enumerate() {
-            for (h, c) in day_str.chars().take(24).enumerate() {
-                slots[d * 24 + h] = c == '1';
-            }
-        }
-        slots
-    }
-
-    /// Reconstructs a `RuleSchedule` from a flattened 168-element boolean slice.
-    pub fn from_bool_array(slots: &[bool]) -> Self {
-        let days = std::array::from_fn(|d| {
-            (0..24)
-                .map(|h| if slots.get(d * 24 + h).copied().unwrap_or(false) { '1' } else { '0' })
-                .collect()
-        });
-        Self::from_days(days)
-    }
-
-    /// Returns a pre-configured `RuleSchedule` for known preset names, or `None` if unrecognized.
-    /// - `"select_all"`: All days and hours active.
-    /// - `"clear"`: All days and hours inactive.
-    /// - `"work_hours"`: Monday-Friday 09:00 - 17:59 active, weekends inactive.
-    /// - `"evenings"`: Monday-Friday 18:00 - 23:59 active, weekends 08:00 - 23:59 active.
-    /// - `"weekends"`: Monday-Friday completely inactive, Saturday-Sunday active all 24 hours.
-    pub fn from_preset(preset: &str) -> Option<Self> {
-        match preset {
-            "select_all" => Some(Self::uniform("111111111111111111111111")),
-            "clear" => Some(Self::uniform("000000000000000000000000")),
-            "work_hours" => Some(Self::default()),
-            "evenings" => Some(Self::from_weekday_weekend(
-                "000000000000000000111111",
-                "000000001111111111111111",
-            )),
-            "weekends" => Some(Self::from_weekday_weekend(
-                "000000000000000000000000",
-                "111111111111111111111111",
-            )),
-            _ => None,
-        }
-    }
+/// Serde default helper targeting all executables (`["*"]`).
+fn default_wildcard_targets() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 /// Serde default helper for continuous active period (50 minutes).
@@ -365,523 +914,6 @@ fn default_reset_after_afk() -> DurationConfig {
     DurationConfig::new(5, TimeUnit::Min)
 }
 
-/// Represents a single user-configured monitoring and enforcement rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    // --- 1. General ---
-    pub id: String,
-    pub enabled: bool,
-    pub name: String,
-
-    // --- 2. Monitor ---
-    #[serde(default)]
-    pub monitor_selection: MonitorSelection, // "Executables" | "Titles" | "Urls"
-    #[serde(default = "default_wildcard_targets")]
-    pub target_executables: Vec<String>,
-    #[serde(default)]
-    pub title_regex: String,
-    #[serde(default)]
-    pub url_regex: String,
-
-    // --- 3. Trigger ---
-    #[serde(default)]
-    pub trigger: TriggerType, // "Period" | "Limit"
-    #[serde(default = "default_period")]
-    pub period: DurationConfig, // Continuous active session duration
-    #[serde(default = "default_reset_after_afk")]
-    pub reset_after_afk: DurationConfig, // AFK duration to reset session
-    #[serde(default = "default_limit")]
-    pub limit: DurationConfig, // Daily cumulative usage limit (0 = immediate)
-
-    // --- 4. Action ---
-    #[serde(default)]
-    pub action: RuleAction, // "Show Overlay" | "Show Notification" | "Show Statistics" | "Lock Workstation" | "Close Tab" | "Close Window" | "Kill Process"
-    #[serde(default = "default_warn_before")]
-    pub warn_before: DurationConfig, // Warn before action (0 = disabled)
-    #[serde(default = "default_grace")]
-    pub grace_duration: DurationConfig, // Grace countdown (0 = disabled)
-    #[serde(default = "default_break_duration")]
-    pub break_duration: DurationConfig, // Break duration (when action == ShowOverlay)
-    #[serde(default)]
-    pub click_through: bool, // Click-through overlay (when action == ShowOverlay)
-    #[serde(default)]
-    pub strict_mode: bool, // Strict mode (when action == ShowOverlay)
-    #[serde(default)]
-    pub notification_method: NotificationMethod, // "HUD" | "Windows" (when action == ShowNotification)
-    #[serde(default = "default_notification_duration")]
-    pub notification_duration: DurationConfig, // Duration HUD notification is visible (when action == ShowNotification && notification_method == HUD)
-    #[serde(default)]
-    pub show_remaining_time: bool, // Show countdown timer on HUD notification
-    #[serde(default)]
-    pub message: String, // Used when action == ShowOverlay or ShowNotification
-
-    // --- 5. Schedule ---
-    #[serde(default)]
-    pub schedule: RuleSchedule,
-}
-
-impl Rule {
-    /// Returns true if this rule targets executables and includes at least one specific (non-empty, non-wildcard, non-comment, non-exclusion) executable name.
-    pub fn has_specific_executable(&self) -> bool {
-        self.monitor_selection == MonitorSelection::Executables
-            && self.target_executables.iter().any(|t| {
-                let s = t.trim();
-                !s.is_empty() && s != "*" && s != "#" && !s.starts_with('!')
-            })
-    }
-
-    /// Returns the threshold duration in seconds configured for this rule's trigger (`Period` or `Limit`).
-    pub fn trigger_threshold_seconds(&self) -> u32 {
-        match self.trigger {
-            TriggerType::Period => self.period.to_seconds().max(1),
-            TriggerType::Limit => self.limit.to_seconds(),
-        }
-    }
-
-    /// Enforces safety and timing invariants on this rule:
-    /// - Normalizes `target_executables`: trims entries, drops empty/comment strings, removes wildcard if positive specific targets exist,
-    ///   preserves `!`-prefixed exclusion targets, deduplicates case-insensitively while preserving order, and keeps `["*"]` if only exclusions exist (falling back to `["*"]` if empty).
-    /// - Downgrades `KillProcess` to `CloseWindow` whenever the rule does not target at least one positive specific executable name.
-    /// - Clamps duration values to match UI SpinBox ranges (1..=3600 for non-zero durations, 0..=3600 for optional durations).
-    /// - Normalizes schedule bitmask strings to canonical 24-character '0'/'1' representations.
-    pub fn sanitize(&mut self) {
-        let mut seen = std::collections::HashSet::new();
-        let mut normalized_targets = Vec::new();
-        let mut has_positive_specific = false;
-        let mut has_exclusions = false;
-
-        for t in &self.target_executables {
-            let trimmed = t.trim();
-            if trimmed.is_empty() || trimmed == "#" || trimmed == "*" {
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix('!') {
-                let excl_trimmed = rest.trim();
-                if excl_trimmed.is_empty() || excl_trimmed == "#" || excl_trimmed == "*" {
-                    continue;
-                }
-                let lower = format!("!{}", excl_trimmed.to_ascii_lowercase());
-                if seen.insert(lower) {
-                    normalized_targets.push(format!("!{}", excl_trimmed));
-                    has_exclusions = true;
-                }
-            } else {
-                let lower = trimmed.to_ascii_lowercase();
-                if seen.insert(lower) {
-                    normalized_targets.push(trimmed.to_string());
-                    has_positive_specific = true;
-                }
-            }
-        }
-
-        if normalized_targets.is_empty() {
-            normalized_targets.push("*".to_string());
-        } else if has_exclusions && !has_positive_specific {
-            normalized_targets.insert(0, "*".to_string());
-        }
-        self.target_executables = normalized_targets;
-
-        if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
-            self.action = RuleAction::CloseWindow;
-        }
-
-        self.period.value = self.period.value.clamp(1, 3600);
-        self.reset_after_afk.value = self.reset_after_afk.value.clamp(1, 3600);
-        self.limit.value = self.limit.value.min(3600);
-        self.warn_before.value = self.warn_before.value.min(3600);
-        self.grace_duration.value = self.grace_duration.value.min(3600);
-        self.break_duration.value = self.break_duration.value.clamp(1, 3600);
-        self.notification_duration.value = self.notification_duration.value.clamp(1, 3600);
-
-        self.schedule = RuleSchedule::from_bool_array(&self.schedule.to_bool_array());
-    }
-
-    /// Creates a new rule populated with sensible ergonomic defaults for the UI "+ Add Rule" action.
-    pub fn default_template(index: usize) -> Self {
-        Self {
-            id: format!("rule-{}", index + 1),
-            enabled: true,
-            name: format!("New Rule {}", index + 1),
-            monitor_selection: MonitorSelection::Executables,
-            target_executables: vec!["*".to_string()],
-            title_regex: String::new(),
-            url_regex: String::new(),
-            trigger: TriggerType::Period,
-            period: DurationConfig::new(50, TimeUnit::Min),
-            reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
-            limit: DurationConfig::new(1, TimeUnit::Hr),
-            action: RuleAction::ShowOverlay,
-            warn_before: DurationConfig::new(5, TimeUnit::Min),
-            grace_duration: DurationConfig::new(0, TimeUnit::Sec),
-            break_duration: DurationConfig::new(10, TimeUnit::Min),
-            click_through: false,
-            strict_mode: false,
-            notification_method: NotificationMethod::Hud,
-            notification_duration: DurationConfig::new(10, TimeUnit::Sec),
-            show_remaining_time: false,
-            message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
-            schedule: RuleSchedule::default(),
-        }
-    }
-
-    /// Creates a duplicate copy of `self` with a new unique `id` and a ` (Copy)` name suffix.
-    pub fn duplicate(&self, new_id: String) -> Self {
-        let mut copy = self.clone();
-        copy.id = new_id.clone();
-        if !copy.name.trim().is_empty() {
-            copy.name = format!("{} (Copy)", copy.name.trim());
-        } else {
-            copy.name = format!("Rule {}", new_id.trim_start_matches("rule-"));
-        }
-        copy
-    }
-}
-
-/// Global daemon and ActivityWatch connection settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeneralConfig {
-    pub aw_port: u16,
-    pub poll_interval_seconds: u64,
-    pub autostart: bool,
-    #[serde(default)]
-    pub api_key: String,
-    #[serde(default = "default_day_start_hour")]
-    pub day_start_hour: u32,
-    #[serde(default = "default_true")]
-    pub suppress_fullscreen_d3d: bool,
-    #[serde(default)]
-    pub pause_all_rules: bool,
-    #[serde(default = "default_true")]
-    pub destroy_windows_on_hide: bool,
-    #[serde(default = "default_slint_renderer")]
-    pub slint_renderer: String,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self {
-            aw_port: 5600,
-            poll_interval_seconds: 10,
-            autostart: true,
-            api_key: String::new(),
-            day_start_hour: 4,
-            suppress_fullscreen_d3d: true,
-            pause_all_rules: false,
-            destroy_windows_on_hide: true,
-            slint_renderer: "femtovg".to_string(),
-        }
-    }
-}
-
-/// Visual theme and opacity settings for the fullscreen and HUD overlay windows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OverlayConfig {
-    pub opacity: f32,
-    pub theme: String,
-    pub accent_color: String,
-    pub background_color: String,
-    pub text_color: String,
-}
-
-impl Default for OverlayConfig {
-    fn default() -> Self {
-        Self {
-            opacity: 0.90,
-            theme: "dark".to_string(),
-            accent_color: "#3b82f6".to_string(),
-            background_color: "#0f172a".to_string(),
-            text_color: "#f8fafc".to_string(),
-        }
-    }
-}
-
-/// Configuration for the daily usage statistics dashboard and activity histogram.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatsConfig {
-    pub daily_screentime_target_minutes: u32,
-    pub threshold_excessive_minutes: u32,
-    pub histogram_bin_size_minutes: u32,
-    pub histogram_bin_count: u32,
-    pub histogram_time_format: String,
-}
-
-impl Default for StatsConfig {
-    fn default() -> Self {
-        Self {
-            daily_screentime_target_minutes: 480,
-            threshold_excessive_minutes: 600,
-            histogram_bin_size_minutes: 60,
-            histogram_bin_count: 24,
-            histogram_time_format: "%H:%M".to_string(),
-        }
-    }
-}
-
-/// Validates a chrono strftime format string and returns `(is_valid, preview_or_error)`.
-pub fn validate_strftime_format(code: &str) -> (bool, String) {
-    if code.trim().is_empty() {
-        return (false, "Format cannot be empty".to_string());
-    }
-    let items = StrftimeItems::new(code);
-    for item in items {
-        if matches!(item, Item::Error) {
-            return (false, "Invalid format specifier".to_string());
-        }
-    }
-    let sample = Local::now().format(code).to_string();
-    if sample.is_empty() {
-        (false, "Produces empty output".to_string())
-    } else {
-        (true, sample)
-    }
-}
-
-/// Validates a regular expression pattern using `regex::Regex::new` and returns `(is_valid, error_message)`.
-pub fn validate_regex_pattern(pattern: &str) -> (bool, String) {
-    if pattern.trim().is_empty() {
-        return (false, "Regular expression cannot be empty".to_string());
-    }
-    match regex::Regex::new(pattern) {
-        Ok(_) => (true, String::new()),
-        Err(e) => (false, e.to_string()),
-    }
-}
-
-/// Top-level application configuration persisted to `%LOCALAPPDATA%\aw-enforcer\config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    pub general: GeneralConfig,
-    pub overlay: OverlayConfig,
-    pub stats: StatsConfig,
-    #[serde(default)]
-    pub rules: Vec<Rule>,
-}
-
-pub type AppConfig = Config;
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            overlay: OverlayConfig::default(),
-            stats: StatsConfig::default(),
-            rules: vec![
-                Rule {
-                    id: "rule-ergo-break".to_string(),
-                    enabled: true,
-                    name: "Workday Ergonomic Break".to_string(),
-                    monitor_selection: MonitorSelection::Executables,
-                    target_executables: vec!["*".to_string()],
-                    title_regex: String::new(),
-                    url_regex: String::new(),
-                    trigger: TriggerType::Period,
-                    period: DurationConfig::new(50, TimeUnit::Min),
-                    reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
-                    limit: DurationConfig::new(8, TimeUnit::Hr),
-                    action: RuleAction::ShowOverlay,
-                    warn_before: DurationConfig::new(5, TimeUnit::Min),
-                    grace_duration: DurationConfig::new(0, TimeUnit::Sec),
-                    break_duration: DurationConfig::new(10, TimeUnit::Min),
-                    click_through: false,
-                    strict_mode: false,
-                    notification_method: NotificationMethod::Hud,
-                    notification_duration: DurationConfig::new(10, TimeUnit::Sec),
-                    show_remaining_time: false,
-                    message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
-                    schedule: RuleSchedule::from_weekday_weekend(
-                        "000000001111111111000000",
-                        "000000000000000000000000",
-                    ),
-                },
-                Rule {
-                    id: "rule-gaming-limit".to_string(),
-                    enabled: true,
-                    name: "Weeknight Gaming Limit".to_string(),
-                    monitor_selection: MonitorSelection::Executables,
-                    target_executables: vec!["steam.exe".to_string(), "discord.exe".to_string()],
-                    title_regex: String::new(),
-                    url_regex: String::new(),
-                    trigger: TriggerType::Limit,
-                    period: DurationConfig::new(50, TimeUnit::Min),
-                    reset_after_afk: DurationConfig::new(5, TimeUnit::Min),
-                    limit: DurationConfig::new(1, TimeUnit::Hr),
-                    action: RuleAction::CloseWindow,
-                    warn_before: DurationConfig::new(5, TimeUnit::Min),
-                    grace_duration: DurationConfig::new(30, TimeUnit::Sec),
-                    break_duration: DurationConfig::new(10, TimeUnit::Min),
-                    click_through: false,
-                    strict_mode: false,
-                    notification_method: NotificationMethod::Hud,
-                    notification_duration: DurationConfig::new(10, TimeUnit::Sec),
-                    show_remaining_time: false,
-                    message: "## Quota Warning: {app}\n[color=#f59e0b bold] {remaining} remaining out of your {limit} daily limit.\nPlease wrap up and save your work.".to_string(),
-                    schedule: RuleSchedule::from_weekday_weekend(
-                        "000000000111111111111100",
-                        "000000000000000000000000",
-                    ),
-                },
-            ],
-        }
-    }
-}
-
-impl Config {
-    /// Returns the platform-specific path to `config.toml` inside the local app data directory.
-    pub fn config_path() -> PathBuf {
-        let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("aw-enforcer");
-        path.push("config.toml");
-        path
-    }
-
-    /// Loads `config.toml` from disk, falling back to `Config::default()` if reading or parsing fails.
-    pub fn load() -> Self {
-        Self::try_load().unwrap_or_else(|e| {
-            tracing::warn!("Failed to load config.toml ({e}); using defaults.");
-            Self::default()
-        })
-    }
-
-    /// Enforces full application configuration invariants and sanitization across general, overlay, stats, and rule configs.
-    pub fn sanitize(&mut self) {
-        let (valid, _) = validate_strftime_format(&self.stats.histogram_time_format);
-        if !valid {
-            self.stats.histogram_time_format = "%H:%M".to_string();
-        }
-
-        self.general.aw_port = self.general.aw_port.max(1);
-        self.general.poll_interval_seconds = self.general.poll_interval_seconds.clamp(2, 120);
-        self.general.day_start_hour = self.general.day_start_hour.min(23);
-
-        self.general.slint_renderer = if self.general.slint_renderer.eq_ignore_ascii_case("software") {
-            "software".to_string()
-        } else {
-            "femtovg".to_string()
-        };
-
-        self.overlay.opacity = self.overlay.opacity.clamp(0.1, 1.0);
-        let default_overlay = OverlayConfig::default();
-        let sanitize_hex = |color: &mut String, default: &str| {
-            if crate::formatter::parse_hex_color(color).is_none() {
-                *color = default.to_string();
-            }
-        };
-        sanitize_hex(&mut self.overlay.accent_color, &default_overlay.accent_color);
-        sanitize_hex(&mut self.overlay.background_color, &default_overlay.background_color);
-        sanitize_hex(&mut self.overlay.text_color, &default_overlay.text_color);
-
-        self.stats.daily_screentime_target_minutes =
-            self.stats.daily_screentime_target_minutes.clamp(1, 1440);
-        self.stats.threshold_excessive_minutes = self
-            .stats
-            .threshold_excessive_minutes
-            .clamp(self.stats.daily_screentime_target_minutes, 1440);
-        self.stats.histogram_bin_size_minutes = self.stats.histogram_bin_size_minutes.clamp(1, 1440);
-        self.stats.histogram_bin_count = self.stats.histogram_bin_count.clamp(1, 96);
-
-        self.sanitize_rules();
-    }
-
-    /// Loads, parses, validates, and sanitizes a configuration from `path`.
-    pub fn load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = fs::read_to_string(path)?;
-        let mut cfg: Config = toml::from_str(&content)?;
-        cfg.sanitize();
-        Ok(cfg)
-    }
-
-    /// Attempts to read, parse, validate, and sanitize `path`, creating a default file if none exists.
-    /// If loading an existing file fails, backs up the corrupted file to `path.with_extension("toml.bak")`.
-    pub fn try_load_from_path(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
-        if !path.exists() {
-            let default_cfg = Self::default();
-            default_cfg.save_to_path(path)?;
-            return Ok(default_cfg);
-        }
-
-        Self::load_from_path(path).map_err(|e| {
-            let bak_path = path.with_extension("toml.bak");
-            let _ = fs::copy(path, &bak_path);
-            tracing::warn!(
-                "Failed to load existing config at {:?} ({}); backed up corrupted file to {:?}",
-                path,
-                e,
-                bak_path
-            );
-            e
-        })
-    }
-
-    /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
-    /// If loading an existing file fails, backs up the corrupted file to `config.toml.bak`.
-    pub fn try_load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = Self::config_path();
-        Self::try_load_from_path(&path)
-    }
-
-    /// Enforces safety invariants on rules:
-    /// - Sanitizes each individual rule (duration bounds, target normalization, schedule bitmask canonicalization).
-    /// - Ensures every rule has a non-empty, unique ID that does not collide with runtime "test_" overlays.
-    pub fn sanitize_rules(&mut self) {
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut next_id_num = 1usize;
-
-        for rule in &mut self.rules {
-            rule.sanitize();
-
-            let trimmed_id = rule.id.trim().to_string();
-            let is_invalid = trimmed_id.is_empty()
-                || trimmed_id.starts_with("test_")
-                || seen_ids.contains(&trimmed_id);
-
-            if is_invalid {
-                loop {
-                    let candidate = format!("rule-{}", next_id_num);
-                    next_id_num += 1;
-                    if !seen_ids.contains(&candidate) {
-                        rule.id = candidate.clone();
-                        seen_ids.insert(candidate);
-                        break;
-                    }
-                }
-            } else {
-                rule.id = trimmed_id.clone();
-                seen_ids.insert(trimmed_id);
-            }
-        }
-    }
-
-    /// Serializes, validates, sanitizes, and writes the configuration to `path` atomically via a temporary file,
-    /// creating parent directories as needed.
-    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut to_save = self.clone();
-        to_save.sanitize();
-        let serialized = toml::to_string_pretty(&to_save)?;
-        let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, &serialized)?;
-        if let Err(e) = fs::rename(&tmp_path, path) {
-            tracing::warn!(
-                "Atomic rename from {:?} to {:?} failed ({:?}); falling back to direct write",
-                tmp_path,
-                path,
-                e
-            );
-            let write_res = fs::write(path, &serialized);
-            let _ = fs::remove_file(&tmp_path);
-            write_res?;
-        }
-        Ok(())
-    }
-
-    /// Serializes and writes the configuration to `config.toml`, creating parent directories as needed.
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::config_path();
-        self.save_to_path(&path)
-    }
-}
 
 #[cfg(test)]
 mod tests {

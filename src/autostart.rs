@@ -19,6 +19,7 @@ fn current_exe_autostart_command() -> Result<String, Box<dyn std::error::Error>>
 
 /// Checks whether the application is registered to autostart in Windows `HKCU\...\Run`
 /// matching the current executable command.
+#[allow(dead_code)]
 pub fn is_autostart_enabled() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let Ok(key) = hkcu.open_subkey(RUN_KEY_PATH) else {
