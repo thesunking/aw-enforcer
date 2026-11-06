@@ -1347,7 +1347,10 @@ impl Engine {
 
         let mut has_url_rules = false;
 
-        if !self.config.general.pause_all_rules && !is_globally_snoozed {
+        if !self.config.general.pause_all_rules {
+            let default_session_lookback = (now - Duration::seconds(3600 + 300)).with_timezone(&Utc);
+            min_start_utc = min_start_utc.min(default_session_lookback);
+
             for rule in &self.config.rules {
                 if rule.enabled && rule.schedule.is_active(day_index, hour_index) {
                     if rule.monitor_selection == MonitorSelection::Urls {
@@ -1463,9 +1466,16 @@ impl Engine {
         }
 
         // 5. Telemetry push for Tab 2 Live Status & Per-rule status badges
-        let max_session_secs = self.runtimes.values().map(|rt| rt.current_session_seconds).max().unwrap_or(0);
+        let max_rule_session_secs = self.runtimes.values().map(|rt| rt.current_session_seconds).max().unwrap_or(0);
 
         let merged_all_intervals = events_to_merged_intervals(&all_events);
+        let global_session_secs = if self.config.general.pause_all_rules {
+            0
+        } else {
+            calculate_continuous_session_from_merged(&merged_all_intervals, now_utc, 300)
+        };
+        let max_session_secs = global_session_secs.max(max_rule_session_secs);
+
         let total_today_secs = compute_overlap_from_merged_intervals(&merged_all_intervals, start_of_day_utc, now_utc);
         let total_today_mins = (total_today_secs / 60.0).round() as u32;
 
@@ -1771,6 +1781,22 @@ impl Engine {
             }
             if let Some(until) = rt.snoozed_until {
                 if now < until {
+                    if rule.trigger == TriggerType::Period {
+                        let last_completed = rt.last_completed_at;
+                        let reset_gap = rule.reset_after_afk.to_seconds().max(1);
+                        let session_duration = calculate_continuous_session_for_rule(
+                            events,
+                            now,
+                            last_completed,
+                            reset_gap,
+                            rule,
+                            compiled_re,
+                        );
+                        if session_duration == 0 {
+                            rt.warned_current_cycle = false;
+                        }
+                        rt.current_session_seconds = session_duration;
+                    }
                     return false;
                 } else {
                     rt.snoozed_until = None;
@@ -2755,6 +2781,39 @@ pub fn find_matching_window_for_rule(
     }
 }
 
+/// Computes continuous active session seconds walking backward from `now_utc` across a pre-merged interval slice with a given `reset_gap_secs`.
+pub fn calculate_continuous_session_from_merged(
+    merged: &[(DateTime<Utc>, DateTime<Utc>)],
+    now_utc: DateTime<Utc>,
+    reset_gap_secs: u32,
+) -> u32 {
+    if merged.is_empty() {
+        return 0;
+    }
+
+    let reset_gap_sec = reset_gap_secs as i64;
+    let last_end = merged.last().unwrap().1;
+    if (now_utc - last_end).num_seconds() >= reset_gap_sec {
+        return 0;
+    }
+
+    let mut session_millis = 0i64;
+    let mut prev_start: Option<DateTime<Utc>> = None;
+
+    for (start, end) in merged.iter().rev() {
+        if let Some(p_start) = prev_start {
+            let gap = (p_start - *end).num_seconds();
+            if gap >= reset_gap_sec {
+                break;
+            }
+        }
+        session_millis += (*end - *start).num_milliseconds();
+        prev_start = Some(*start);
+    }
+
+    ((session_millis.max(0) as f64) / 1000.0).round() as u32
+}
+
 /// Computes continuous active session duration by walking backward from now.
 pub fn calculate_continuous_session_for_rule(
     events: &[AwEvent],
@@ -2765,7 +2824,6 @@ pub fn calculate_continuous_session_for_rule(
     compiled_re: Option<&Regex>,
 ) -> u32 {
     let now_utc = now.with_timezone(&Utc);
-    let reset_gap_sec = reset_gap_secs as i64;
     let min_allowed_utc = last_break_completed_at.map(|dt| dt.with_timezone(&Utc));
 
     let intervals: Vec<(DateTime<Utc>, DateTime<Utc>)> = events
@@ -2787,30 +2845,7 @@ pub fn calculate_continuous_session_for_rule(
         .collect();
 
     let merged = merge_overlapping_intervals(intervals);
-    if merged.is_empty() {
-        return 0;
-    }
-
-    let last_end = merged.last().unwrap().1;
-    if (now_utc - last_end).num_seconds() >= reset_gap_sec {
-        return 0;
-    }
-
-    let mut session_millis = 0i64;
-    let mut prev_start: Option<DateTime<Utc>> = None;
-
-    for (start, end) in merged.iter().rev() {
-        if let Some(p_start) = prev_start {
-            let gap = (p_start - *end).num_seconds();
-            if gap >= reset_gap_sec {
-                break;
-            }
-        }
-        session_millis += (*end - *start).num_milliseconds();
-        prev_start = Some(*start);
-    }
-
-    ((session_millis.max(0) as f64) / 1000.0).round() as u32
+    calculate_continuous_session_from_merged(&merged, now_utc, reset_gap_secs)
 }
 
 /// Calculates total active usage seconds for a rule from a list of events.
@@ -6691,5 +6726,52 @@ mod tests {
             other => panic!("Expected HudTimer to remain active, got {:?}", other),
         }
         assert!(overlay_rx.try_recv().is_err(), "No overlay action should be sent");
+    }
+
+    #[tokio::test]
+    async fn test_continuous_session_from_merged_and_snoozed_period_telemetry() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-period-snoozed".to_string();
+        rule.trigger = TriggerType::Period;
+        rule.period = DurationConfig::new(50, TimeUnit::Min);
+        rule.reset_after_afk = DurationConfig::new(5, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // 30 minutes of continuous activity ending at now_utc
+        let ev1 = make_event(now_utc - Duration::minutes(30), 600.0, "work.exe", "Work 1", "");
+        let ev2 = make_event(now_utc - Duration::minutes(20), 600.0, "work.exe", "Work 2", "");
+        let ev3 = make_event(now_utc - Duration::minutes(10), 600.0, "work.exe", "Work 3", "");
+        let events = vec![ev1, ev2, ev3];
+
+        // 1. Verify calculate_continuous_session_from_merged matches calculate_continuous_session_for_rule
+        let merged = events_to_merged_intervals(&events);
+        let session_from_merged = calculate_continuous_session_from_merged(&merged, now_utc, 300);
+        let session_from_rule = calculate_continuous_session_for_rule(&events, now, None, 300, &rule, None);
+        assert_eq!(session_from_merged, 1800);
+        assert_eq!(session_from_rule, 1800);
+        assert_eq!(session_from_merged, session_from_rule);
+
+        // 2. Snooze the period rule
+        let rt = engine.runtimes.get_mut("rule-period-snoozed").unwrap();
+        rt.snoozed_until = Some(now + Duration::minutes(15));
+        assert_eq!(rt.current_session_seconds, 0);
+
+        // Evaluate rule: returns false because rule is snoozed, but updates current_session_seconds
+        let triggered = engine.evaluate_rule(&rule, None, now, &events, start_of_day_utc, now_utc).await;
+        assert!(!triggered);
+
+        let rt = engine.runtimes.get("rule-period-snoozed").unwrap();
+        assert_eq!(rt.current_session_seconds, 1800, "Snoozed Period rule must still update current_session_seconds");
     }
 }

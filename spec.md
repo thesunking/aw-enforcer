@@ -405,6 +405,7 @@ graph LR
 - **Always-Accessible Rule Preview & Real-Time Countdowns:** The `"Preview This Rule's Alert"` action button is elevated to the root of the Action section card (`SectionCard`), allowing one-click preview verification for all actions (including `Show Statistics` and immediate-action rules without warnings or grace periods). Preview countdown timers (`test_preview`) tick down every second in real time and automatically hide at 0s, while keeping immediate dismissal accessible on the preview card.
 - **Click-Through Support on Overlays & Statistics:** The `"Click-through Overlay:"` setting is exposed in Section 4 for both `Show Overlay` and `Show Statistics`, forwarding `rule.click_through` to Slint overlays and Win32 extended window styles (`WS_EX_TRANSPARENT`).
 - **Exposed Overlay & Histogram Properties:** General settings expose Hex color pickers (`accent_color`, `background_color`, `text_color`) and histogram discretization controls (`histogram_bin_size_minutes` [1–1440], `histogram_bin_count` [1–96]), clamped safely in `Config::sanitize()`.
+- **Global Session Telemetry & Limit Rules:** Live Status (Tab 2) and system tray tooltip session telemetry track the user's overall continuous active screen time via `calculate_continuous_session_from_merged` across all merged ActivityWatch intervals (`merged_all_intervals`), ensuring session duration is reported accurately even when the user only has daily `Limit` rules or app-specific rules configured, and snoozed `Period` rules continue updating `current_session_seconds` for telemetry.
 
 ---
 
@@ -433,6 +434,7 @@ graph LR
 | **Histogram Binning Overhead** | $O(N \log N + B)$ | Single-pass interval coalescing merges $N$ telemetry events once via `events_to_merged_intervals` before bin assignment, reducing per-bin computation from $O(B \cdot N \log N)$ to $O(N \log N + B)$. |
 | **Interval Intersection** | $O(\log N)$ | `compute_overlap_from_merged_intervals` and `filter_web_events_by_active_browser_windows` use binary search (`partition_point`) on pre-merged sorted interval slices to skip non-overlapping historical spans and break immediately upon exceeding range bounds. |
 | **Poll Cycle Interval Reuse** | Single-pass merge | Step 5 of `poll_tick` merges `all_events` into `merged_all_intervals` once, reusing the pre-merged slice for both `total_today_secs` telemetry and `refresh_stats_overlay_from_events` without duplicate sorting or allocation. |
+| **Global Session Telemetry** | $O(N)$ interval scan | `calculate_continuous_session_from_merged` walks backward from `now_utc` across pre-merged intervals, calculating continuous active screen time for Live Status and tray tooltip telemetry regardless of whether wildcard `Period` rules are active. |
 
 ---
 

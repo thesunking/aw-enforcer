@@ -94,6 +94,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 - **Schedule Bitmask Normalization:** Weekday active schedules are canonicalized to standard 24-character `'0'`/`'1'` strings.
 - **Rule ID Uniqueness:** Non-empty, unique rule IDs are strictly enforced; duplicate, empty, or `"test_*"` prefixed IDs are automatically assigned the next available `rule-{n}` identifier.
 - **Pattern Validation for Titles & URLs:** Rules with `Titles` or `Urls` monitoring require a non-empty, valid regular expression pattern. Empty or whitespace-only patterns are rejected with an inline error in the editor and prevent saving until a valid regex is provided.
+- **Global Session & Telemetry Accuracy:** Live status and system tray tooltip session telemetry track continuous active screen time walking backward across merged activity intervals with a 5-minute AFK reset gap, providing continuous session metrics even when only `Limit` rules are configured or `Period` rules are snoozed.
 
 ---
 
