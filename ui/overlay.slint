@@ -165,7 +165,8 @@ export component OverlayWindow inherits Window {
         border-color: root.accent-color.with-alpha(0.5);
 
         card_drag_toast := TouchArea {
-            mouse-cursor: move;
+            enabled: !root.click-through;
+            mouse-cursor: root.click-through ? default : move;
             pointer-event(pe) => {
                 if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
                     root.drag-status-window();
@@ -199,9 +200,11 @@ export component OverlayWindow inherits Window {
                 }
             }
 
-            // Scrollable message body so content never pushes buttons off
-            ScrollView {
+            Rectangle {
+                clip: true;
+                vertical-stretch: 1;
                 FormattedText {
+                    width: 100%;
                     paragraphs: root.message-paragraphs;
                 }
             }
@@ -257,7 +260,8 @@ export component OverlayWindow inherits Window {
         border-color: #f59e0b;
 
         card_drag_timer := TouchArea {
-            mouse-cursor: move;
+            enabled: !root.click-through;
+            mouse-cursor: root.click-through ? default : move;
             pointer-event(pe) => {
                 if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
                     root.drag-status-window();
@@ -289,8 +293,11 @@ export component OverlayWindow inherits Window {
                 }
             }
 
-            ScrollView {
+            Rectangle {
+                clip: true;
+                vertical-stretch: 1;
                 FormattedText {
+                    width: 100%;
                     paragraphs: root.message-paragraphs;
                 }
             }
@@ -349,7 +356,8 @@ export component OverlayWindow inherits Window {
         border-color: root.accent-color.with-alpha(0.5);
 
         card_drag := TouchArea {
-            mouse-cursor: move;
+            enabled: !root.click-through;
+            mouse-cursor: root.click-through ? default : move;
             pointer-event(pe) => {
                 if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
                     root.drag-status-window();
