@@ -13,7 +13,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_LCONTROL,
-    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
@@ -368,15 +368,22 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
                 exe_name_opt
             };
         }
-        ctx.matched_count += 1;
         if ctx.close_matched {
             tracing::info!(
                 "Posting WM_CLOSE to matching window (HWND: {:?}, Title: '{}')",
                 hwnd,
                 title
             );
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+                ctx.matched_count += 1;
+            } else {
+                tracing::warn!(
+                    "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
+                    hwnd
+                );
+            }
         } else {
+            ctx.matched_count += 1;
             return 0; // Stop enumeration early on first match
         }
     }
@@ -435,8 +442,14 @@ pub fn close_target_windows<S: AsRef<str>>(
         unsafe {
             let hwnd = GetForegroundWindow();
             if !is_protected_foreground_window(hwnd) {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                return 1;
+                if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+                    return 1;
+                } else {
+                    tracing::warn!(
+                        "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
+                        hwnd
+                    );
+                }
             }
         }
         return 0;
@@ -626,6 +639,8 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
                 make_key(VK_MENU, KEYEVENTF_KEYUP),
                 make_key(VK_LMENU, KEYEVENTF_KEYUP),
                 make_key(VK_RMENU, KEYEVENTF_KEYUP),
+                make_key(VK_LWIN, KEYEVENTF_KEYUP),
+                make_key(VK_RWIN, KEYEVENTF_KEYUP),
                 make_key(VK_CONTROL, 0),
                 make_key(b'W' as u16, 0),
                 make_key(b'W' as u16, KEYEVENTF_KEYUP),
@@ -633,11 +648,18 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
                 make_key(VK_LCONTROL, KEYEVENTF_KEYUP),
                 make_key(VK_RCONTROL, KEYEVENTF_KEYUP),
             ];
-            SendInput(
+            let sent = SendInput(
                 inputs.len() as u32,
                 inputs.as_ptr(),
                 std::mem::size_of::<INPUT>() as i32,
             );
+            if sent == 0 {
+                tracing::warn!(
+                    "SendInput(Ctrl+W) failed or was blocked by UIPI on HWND {:?}",
+                    hwnd
+                );
+                return false;
+            }
             tracing::info!("Sent Ctrl+W to close active tab on HWND {:?}", hwnd);
             return true;
         }

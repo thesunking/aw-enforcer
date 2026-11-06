@@ -20,8 +20,8 @@
     - **`Show Notification`:** Sends either an interactive top-right `HUD` toast card or a native `Windows` Action Center toast.
     - **`Show Statistics`:** Opens a 24-Hour Screen Time Summary HUD with an hourly activity histogram. Supports optional click-through mode (`click_through`) to interact with underlying windows while monitoring stats.
     - **`Lock Workstation`:** Immediately locks the Windows session. Repeat triggers for `Limit` rules enforce a minimum 15-second grace period so users can save work or snooze after unlocking.
-    - **`Close Tab`:** Closes the active tab of the matching foreground window via synthesized `Ctrl+W`. Active tab closure strictly requires a matching foreground window to ensure background windows or unrelated applications are never sent keystrokes.
-    - **`Close Window`:** Closes matching visible top-level windows (including minimized taskbar windows).
+    - **`Close Tab`:** Closes the active tab of the matching foreground window via synthesized `Ctrl+W` after explicitly releasing modifier and Windows keys (`VK_SHIFT`, `VK_MENU`, `VK_LWIN`, `VK_RWIN`), validating `SendInput` return status for UIPI diagnostics. Active tab closure strictly requires a matching foreground window to ensure background windows or unrelated applications are never sent keystrokes.
+    - **`Close Window`:** Closes matching visible top-level windows (including minimized taskbar windows), verifying `PostMessageW(WM_CLOSE)` success to log UIPI permission blocks.
     - **`Kill Process`:** Terminates matching processes via ToolHelp snapshots, verifying running processes even when minimized or resident in the system tray.
 
 - **Three-Stage Enforcement Pipeline:**
@@ -97,6 +97,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 - **Global Session & Telemetry Accuracy:** Live status and system tray tooltip session telemetry track continuous active screen time walking backward across merged activity intervals with a 5-minute AFK reset gap, providing continuous session metrics even when only `Limit` rules are configured or `Period` rules are snoozed.
 - **Sub-Minute Snooze Badge Precision:** Live telemetry and rule overview status badges report remaining snooze durations with second-level precision (`Snoozed (Xs)`) when under 1 minute, and ceiling-rounded minute precision (`Snoozed (Xm)`) when 1 minute or greater.
 - **Schedule Matrix Presets & Alignment:** Interactive 7×24 weekly schedule grid with pixel-exact hour row alignment and one-click presets via `RuleSchedule::from_preset`: "Work Hours (M-F 9-5)", "Evenings", "Weekends", "Select All", and "Clear All".
+- **Deduplicated Tab-Closing & UIPI Diagnostics:** Explicit release of modifier and Windows keys (`VK_LWIN`, `VK_RWIN`, `VK_SHIFT`, `VK_MENU`) before synthesizing `Ctrl+W`, with return status verification on `SendInput` and `PostMessageW(WM_CLOSE)` to detect and log UIPI elevation blocks.
 
 ---
 
@@ -108,7 +109,7 @@ Whenever the configuration is loaded or saved, comprehensive sanitization invari
 | `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, duration/quota bounds clamping, target/schedule normalization, unique rule ID enforcement, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery, thread-safe hostname ranking, and `filter_period_intersect` queries) |
 | `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, O(log N) binary-searched interval intersection, single-pass poll interval reuse across wildcard rules and stats overlays, and 3-stage rule evaluation |
-| `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch, `Ctrl+W` keystroke synthesis, shared ToolHelp process iteration, and workstation lock |
+| `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch with UIPI checks, `Ctrl+W` keystroke synthesis with Win/modifier release, shared ToolHelp process iteration, and workstation lock |
 | `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, priority hierarchy, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
 | `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, and line-level attribute/heading parser |
 | `src/autostart.rs` | Windows Registry (`HKCU\...\Run`) startup registration |
