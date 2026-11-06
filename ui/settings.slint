@@ -200,6 +200,120 @@ component SidebarNavItem inherits Rectangle {
     touch := TouchArea {}
 }
 
+component StatusBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> badge-color: #38bdf8;
+
+    visible: root.text != "";
+    background: root.badge-color.with-alpha(0.2);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: root.badge-color.with-alpha(0.4);
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.text;
+            font-size: 11px;
+            font-weight: 600;
+            color: root.badge-color;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ColorSettingRow inherits FormRow {
+    in property <string> hex-placeholder;
+    in-out property <string> hex-value;
+    in property <color> preview-color;
+    in property <bool> enabled: true;
+    callback edited(string /* hex */);
+
+    label-width: 220px;
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        LineEdit {
+            width: 160px;
+            text <=> root.hex-value;
+            placeholder-text: root.hex-placeholder;
+            enabled: root.enabled;
+            edited(val) => { root.edited(val); }
+        }
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            background: root.preview-color;
+            border-width: 1px;
+            border-color: #475569;
+        }
+    }
+}
+
+component RegexValidationStatus inherits Text {
+    in property <bool> is-valid;
+    in property <string> error-text;
+
+    text: root.is-valid ? "✓ Valid regular expression" : root.error-text;
+    color: root.is-valid ? #10b981 : #ef4444;
+    font-size: 12px;
+    font-weight: 500;
+    wrap: word-wrap;
+}
+
+component SubTabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-active: false;
+    in property <bool> show-indicator: false;
+    in property <color> indicator-color: #10b981;
+    callback clicked();
+
+    height: 38px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    background: root.is-active ? #1e293b : (tab_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
+    border-width: 1px;
+    border-color: root.is-active ? #3b82f6 : #334155;
+
+    if root.is-active : Rectangle {
+        y: 0px;
+        height: 3px;
+        background: #3b82f6;
+        border-top-left-radius: 5px;
+        border-top-right-radius: 5px;
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 8px;
+
+        if root.show-indicator : Rectangle {
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: root.indicator-color;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.text;
+            color: root.is-active ? #ffffff : #94a3b8;
+            font-weight: root.is-active ? 700 : 500;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+
+    tab_touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
 export component SettingsWindow inherits Window {
     title: "AW-Enforcer Settings";
     icon: @image-url("../assets/app_icon_256.png");
@@ -774,84 +888,39 @@ export component SettingsWindow inherits Window {
                             }
                         }
 
-                        FormRow {
+                        ColorSettingRow {
                             label: "Accent Color (Hex):";
-                            label-width: 220px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                LineEdit {
-                                    width: 160px;
-                                    text <=> root.accent-color-hex;
-                                    placeholder-text: "#3b82f6";
-                                    enabled: !root.ui-locked-by-strict;
-                                    edited(val) => {
-                                        root.has-unsaved-changes = true;
-                                        root.color-hex-edited("accent", val);
-                                    }
-                                }
-                                Rectangle {
-                                    width: 24px;
-                                    height: 24px;
-                                    border-radius: 4px;
-                                    background: root.accent-color-preview;
-                                    border-width: 1px;
-                                    border-color: #475569;
-                                }
+                            hex-value <=> root.accent-color-hex;
+                            hex-placeholder: "#3b82f6";
+                            preview-color: root.accent-color-preview;
+                            enabled: !root.ui-locked-by-strict;
+                            edited(val) => {
+                                root.has-unsaved-changes = true;
+                                root.color-hex-edited("accent", val);
                             }
                         }
 
-                        FormRow {
+                        ColorSettingRow {
                             label: "Background Color (Hex):";
-                            label-width: 220px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                LineEdit {
-                                    width: 160px;
-                                    text <=> root.background-color-hex;
-                                    placeholder-text: "#0f172a";
-                                    enabled: !root.ui-locked-by-strict;
-                                    edited(val) => {
-                                        root.has-unsaved-changes = true;
-                                        root.color-hex-edited("background", val);
-                                    }
-                                }
-                                Rectangle {
-                                    width: 24px;
-                                    height: 24px;
-                                    border-radius: 4px;
-                                    background: root.background-color-preview;
-                                    border-width: 1px;
-                                    border-color: #475569;
-                                }
+                            hex-value <=> root.background-color-hex;
+                            hex-placeholder: "#0f172a";
+                            preview-color: root.background-color-preview;
+                            enabled: !root.ui-locked-by-strict;
+                            edited(val) => {
+                                root.has-unsaved-changes = true;
+                                root.color-hex-edited("background", val);
                             }
                         }
 
-                        FormRow {
+                        ColorSettingRow {
                             label: "Text Color (Hex):";
-                            label-width: 220px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                LineEdit {
-                                    width: 160px;
-                                    text <=> root.text-color-hex;
-                                    placeholder-text: "#f8fafc";
-                                    enabled: !root.ui-locked-by-strict;
-                                    edited(val) => {
-                                        root.has-unsaved-changes = true;
-                                        root.color-hex-edited("text", val);
-                                    }
-                                }
-                                Rectangle {
-                                    width: 24px;
-                                    height: 24px;
-                                    border-radius: 4px;
-                                    background: root.text-color-preview;
-                                    border-width: 1px;
-                                    border-color: #475569;
-                                }
+                            hex-value <=> root.text-color-hex;
+                            hex-placeholder: "#f8fafc";
+                            preview-color: root.text-color-preview;
+                            enabled: !root.ui-locked-by-strict;
+                            edited(val) => {
+                                root.has-unsaved-changes = true;
+                                root.color-hex-edited("text", val);
                             }
                         }
 
@@ -1022,85 +1091,23 @@ export component SettingsWindow inherits Window {
                                 alignment: start;
 
                                 // Overview Tab
-                                Rectangle {
-                                    height: 38px;
-                                    border-top-left-radius: 6px;
-                                    border-top-right-radius: 6px;
-                                    background: root.selected-rule-idx == -1 ? #1e293b : (ov_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
-                                    border-width: 1px;
-                                    border-color: root.selected-rule-idx == -1 ? #3b82f6 : #334155;
-
-                                    if root.selected-rule-idx == -1 : Rectangle {
-                                        y: 0px;
-                                        height: 3px;
-                                        background: #3b82f6;
-                                        border-top-left-radius: 5px;
-                                        border-top-right-radius: 5px;
-                                    }
-
-                                    HorizontalLayout {
-                                        padding-left: 16px;
-                                        padding-right: 16px;
-                                        Text {
-                                            text: "All Rules (Overview)";
-                                            color: root.selected-rule-idx == -1 ? #ffffff : #94a3b8;
-                                            font-weight: root.selected-rule-idx == -1 ? 700 : 500;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-
-                                    ov_touch := TouchArea {
-                                        clicked => {
-                                            root.selected-rule-idx = -1;
-                                            root.select-rule(-1);
-                                        }
+                                SubTabButton {
+                                    text: "All Rules (Overview)";
+                                    is-active: root.selected-rule-idx == -1;
+                                    clicked => {
+                                        root.selected-rule-idx = -1;
+                                        root.select-rule(-1);
                                     }
                                 }
 
                                 // Individual Rule Tabs
-                                for r[i] in root.rules : Rectangle {
-                                    height: 38px;
-                                    border-top-left-radius: 6px;
-                                    border-top-right-radius: 6px;
-                                    background: root.selected-rule-idx == i ? #1e293b : (rule_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
-                                    border-width: 1px;
-                                    border-color: root.selected-rule-idx == i ? #3b82f6 : #334155;
-
-                                    if root.selected-rule-idx == i : Rectangle {
-                                        y: 0px;
-                                        height: 3px;
-                                        background: #3b82f6;
-                                        border-top-left-radius: 5px;
-                                        border-top-right-radius: 5px;
-                                    }
-
-                                    HorizontalLayout {
-                                        padding-left: 14px;
-                                        padding-right: 14px;
-                                        spacing: 8px;
-
-                                        Rectangle {
-                                            width: 6px;
-                                            height: 6px;
-                                            border-radius: 3px;
-                                            background: r.enabled ? #10b981 : #64748b;
-                                            y: (parent.height - self.height) / 2;
-                                        }
-
-                                        Text {
-                                            text: r.name != "" ? r.name : ("Rule " + (i + 1));
-                                            color: root.selected-rule-idx == i ? #ffffff : #94a3b8;
-                                            font-weight: root.selected-rule-idx == i ? 700 : 500;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-
-                                    rule_touch := TouchArea {
-                                        clicked => {
-                                            root.select-rule(i);
-                                        }
+                                for r[i] in root.rules : SubTabButton {
+                                    text: r.name != "" ? r.name : ("Rule " + (i + 1));
+                                    is-active: root.selected-rule-idx == i;
+                                    show-indicator: true;
+                                    indicator-color: r.enabled ? #10b981 : #64748b;
+                                    clicked => {
+                                        root.select-rule(i);
                                     }
                                 }
 
@@ -1212,25 +1219,8 @@ export component SettingsWindow inherits Window {
                                                 vertical-alignment: center;
                                             }
 
-                                            if r.status-text != "" : Rectangle {
-                                                background: #0284c7.with-alpha(0.2);
-                                                border-radius: 4px;
-                                                border-width: 1px;
-                                                border-color: #38bdf8.with-alpha(0.4);
-
-                                                HorizontalLayout {
-                                                    padding-left: 6px;
-                                                    padding-right: 6px;
-                                                    padding-top: 2px;
-                                                    padding-bottom: 2px;
-                                                    Text {
-                                                        text: r.status-text;
-                                                        font-size: 11px;
-                                                        font-weight: 600;
-                                                        color: #38bdf8;
-                                                        vertical-alignment: center;
-                                                    }
-                                                }
+                                            StatusBadge {
+                                                text: r.status-text;
                                             }
                                         }
 
@@ -1334,25 +1324,8 @@ export component SettingsWindow inherits Window {
                                     vertical-alignment: center;
                                 }
 
-                                if root.rules[root.selected-rule-idx].status-text != "" : Rectangle {
-                                    background: #0284c7.with-alpha(0.2);
-                                    border-radius: 4px;
-                                    border-width: 1px;
-                                    border-color: #38bdf8.with-alpha(0.4);
-
-                                    HorizontalLayout {
-                                        padding-left: 6px;
-                                        padding-right: 6px;
-                                        padding-top: 2px;
-                                        padding-bottom: 2px;
-                                        Text {
-                                            text: root.rules[root.selected-rule-idx].status-text;
-                                            font-size: 11px;
-                                            font-weight: 600;
-                                            color: #38bdf8;
-                                            vertical-alignment: center;
-                                        }
-                                    }
+                                StatusBadge {
+                                    text: root.rules[root.selected-rule-idx].status-text;
                                 }
                             }
 
@@ -1455,12 +1428,9 @@ export component SettingsWindow inherits Window {
                                             root.active-rule-edited();
                                         }
                                     }
-                                    Text {
-                                        text: root.rule-regex-valid ? "✓ Valid regular expression" : root.rule-regex-error;
-                                        color: root.rule-regex-valid ? #10b981 : #ef4444;
-                                        font-size: 12px;
-                                        font-weight: 500;
-                                        wrap: word-wrap;
+                                    RegexValidationStatus {
+                                        is-valid: root.rule-regex-valid;
+                                        error-text: root.rule-regex-error;
                                     }
                                 }
                             }
@@ -1477,12 +1447,9 @@ export component SettingsWindow inherits Window {
                                             root.active-rule-edited();
                                         }
                                     }
-                                    Text {
-                                        text: root.rule-regex-valid ? "✓ Valid regular expression" : root.rule-regex-error;
-                                        color: root.rule-regex-valid ? #10b981 : #ef4444;
-                                        font-size: 12px;
-                                        font-weight: 500;
-                                        wrap: word-wrap;
+                                    RegexValidationStatus {
+                                        is-valid: root.rule-regex-valid;
+                                        error-text: root.rule-regex-error;
                                     }
                                 }
                             }

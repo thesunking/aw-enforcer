@@ -1,6 +1,37 @@
 import { Button, ComboBox, ScrollView } from "std-widgets.slint";
 import { FormattedText, FormattedParagraph } from "formatted_text.slint";
 
+component WindowDragArea inherits TouchArea {
+    in property <bool> click-through: false;
+    callback drag();
+
+    enabled: !root.click-through;
+    mouse-cursor: root.click-through ? default : move;
+    pointer-event(pe) => {
+        if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+            root.drag();
+        }
+    }
+}
+
+component ProgressBar inherits Rectangle {
+    in property <float> progress: 1.0;
+    in property <color> fill-color: #3b82f6;
+    in property <length> bar-height: 6px;
+
+    height: root.bar-height;
+    background: #334155;
+    border-radius: root.bar-height / 2;
+
+    Rectangle {
+        x: 0;
+        width: parent.width * Math.min(Math.max(root.progress, 0.0), 1.0);
+        height: parent.height;
+        background: root.fill-color;
+        border-radius: root.bar-height / 2;
+    }
+}
+
 export component OverlayWindow inherits Window {
     no-frame: true;
     always-on-top: true;
@@ -99,18 +130,10 @@ export component OverlayWindow inherits Window {
                         }
 
                         // Progress Bar
-                        Rectangle {
-                            height: 6px;
-                            background: #334155;
-                            border-radius: 3px;
-
-                            Rectangle {
-                                x: 0;
-                                width: parent.width * Math.min(Math.max(root.progress-ratio, 0.0), 1.0);
-                                height: parent.height;
-                                background: root.accent-color;
-                                border-radius: 3px;
-                            }
+                        ProgressBar {
+                            progress: root.progress-ratio;
+                            fill-color: root.accent-color;
+                            bar-height: 6px;
                         }
 
                         if !root.is-user-idle : Text {
@@ -164,14 +187,9 @@ export component OverlayWindow inherits Window {
         border-width: 1px;
         border-color: root.accent-color.with-alpha(0.5);
 
-        card_drag_toast := TouchArea {
-            enabled: !root.click-through;
-            mouse-cursor: root.click-through ? default : move;
-            pointer-event(pe) => {
-                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
-                    root.drag-status-window();
-                }
-            }
+        WindowDragArea {
+            click-through: root.click-through;
+            drag => { root.drag-status-window(); }
         }
 
         VerticalLayout {
@@ -259,14 +277,9 @@ export component OverlayWindow inherits Window {
         border-width: 1px;
         border-color: #f59e0b;
 
-        card_drag_timer := TouchArea {
-            enabled: !root.click-through;
-            mouse-cursor: root.click-through ? default : move;
-            pointer-event(pe) => {
-                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
-                    root.drag-status-window();
-                }
-            }
+        WindowDragArea {
+            click-through: root.click-through;
+            drag => { root.drag-status-window(); }
         }
 
         VerticalLayout {
@@ -303,18 +316,10 @@ export component OverlayWindow inherits Window {
             }
 
             // Progress Bar
-            Rectangle {
-                height: 5px;
-                background: #334155;
-                border-radius: 2px;
-
-                Rectangle {
-                    x: 0;
-                    width: parent.width * Math.min(Math.max(root.progress-ratio, 0.0), 1.0);
-                    height: parent.height;
-                    background: #f59e0b;
-                    border-radius: 2px;
-                }
+            ProgressBar {
+                progress: root.progress-ratio;
+                fill-color: #f59e0b;
+                bar-height: 5px;
             }
 
             // Controls: Snooze & Dismiss when non-strict and interactive
@@ -355,14 +360,9 @@ export component OverlayWindow inherits Window {
         border-width: 1px;
         border-color: root.accent-color.with-alpha(0.5);
 
-        card_drag := TouchArea {
-            enabled: !root.click-through;
-            mouse-cursor: root.click-through ? default : move;
-            pointer-event(pe) => {
-                if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
-                    root.drag-status-window();
-                }
-            }
+        WindowDragArea {
+            click-through: root.click-through;
+            drag => { root.drag-status-window(); }
         }
 
         VerticalLayout {
