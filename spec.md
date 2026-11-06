@@ -377,6 +377,7 @@ $$\text{BreakEnforcer (4)} > \text{HudTimer (3)} > \text{HudToast (2)} > \text{H
 
 ### 6.2 Settings Window Architecture (`ui/settings.slint`, `src/main.rs`)
 - **Action & Delivery Channel Polish:** Section 2 automatically resets `Kill Process` to `Close Window` whenever the selection mode switches away from `Executables`. Section 4 exposes `Notification Method`, `Duration`, and `Show Time Remaining` controls whenever `warn_before > 0` or `action == Show Notification`, allowing full customization of Stage 1 pre-action warnings across all rule types.
+- **Pattern Validation for Titles & URLs:** Rules with `Titles` or `Urls` monitor selections strictly require non-empty, valid regular expressions. Empty or whitespace-only patterns are rejected with an inline error message ("Title regex pattern cannot be empty" or "URL regex pattern cannot be empty") and prevent saving until resolved. When `Executables` monitoring is selected, regular expression validation is marked valid and bypassed.
 - **Visual Feedback & Editor Layout:** In General Settings (Tab 0), interactive 24×24px color swatches provide instant visual feedback alongside Hex color inputs. In the Message Template editor, the container height dynamically expands (`Math.max(120px, message_lines.length * 20px + 14px)`) to accommodate templates with more than 5 lines without gutter clipping.
 
 ```mermaid

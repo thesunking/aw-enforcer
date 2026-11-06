@@ -309,44 +309,30 @@ pub fn validate_rule_pattern(mode: &str, title_re: &str, url_re: &str) -> (bool,
     }
 }
 
-/// Validates regular expressions across all rules if Title or URL monitoring is selected,
-/// prioritizing the currently active rule's error message, and updating `rule-regex-valid`
-/// and `rule-regex-error` on `win`.
-fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) {
+/// Validates regular expressions for the currently selected rule if Title or URL monitoring is selected.
+/// When Executables monitoring is selected, sets `rule-regex-valid = true` and `rule-regex-error = ""`.
+fn refresh_rule_regex_validation(win: &SettingsWindow, _rm: &VecModel<RuleView>) {
     let cur_idx = win.get_selected_rule_idx();
-    if cur_idx >= 0 && win.get_rule_enabled() {
+    if cur_idx >= 0 {
         let mode = win.get_rule_monitor_selection();
-        let title_re = win.get_rule_title_regex();
-        let url_re = win.get_rule_url_regex();
-        let (valid, err) = validate_rule_pattern(mode.as_str(), &title_re, &url_re);
-        if !valid {
-            win.set_rule_regex_valid(false);
-            win.set_rule_regex_error(err.into());
-            return;
-        }
-    }
-
-    for i in 0..rm.row_count() {
-        if cur_idx >= 0 && i as i32 == cur_idx {
-            continue;
-        }
-        if let Some(r) = rm.row_data(i) {
-            if !r.enabled {
-                continue;
+        match mode.as_str() {
+            "Titles" => {
+                let title_re = win.get_rule_title_regex();
+                let (valid, err) = validate_rule_pattern("Titles", &title_re, "");
+                win.set_rule_regex_valid(valid);
+                win.set_rule_regex_error(if valid { "".into() } else { err.into() });
+                return;
             }
-            let (valid, err) = validate_rule_pattern(
-                r.monitor_selection.as_str(),
-                &r.title_regex,
-                &r.url_regex,
-            );
-            if !valid {
-                let name = if !r.name.trim().is_empty() {
-                    r.name.as_str()
-                } else {
-                    "Unnamed"
-                };
-                win.set_rule_regex_valid(false);
-                win.set_rule_regex_error(format!("Rule '{name}': {err}").into());
+            "Urls" => {
+                let url_re = win.get_rule_url_regex();
+                let (valid, err) = validate_rule_pattern("Urls", "", &url_re);
+                win.set_rule_regex_valid(valid);
+                win.set_rule_regex_error(if valid { "".into() } else { err.into() });
+                return;
+            }
+            _ => {
+                win.set_rule_regex_valid(true);
+                win.set_rule_regex_error("".into());
                 return;
             }
         }
@@ -767,6 +753,40 @@ fn open_settings_window(
                 }
                 let was_destroy = cfg_cell.borrow().general.destroy_windows_on_hide;
                 let updated_config = config_from_ui(&win, &cfg_cell.borrow());
+
+                // Ensure all rules in config with Titles or Urls monitoring have non-empty valid regex patterns
+                for r in &updated_config.rules {
+                    match r.monitor_selection {
+                        MonitorSelection::Titles => {
+                            let (valid, err) = validate_rule_pattern("Titles", &r.title_regex, "");
+                            if !valid {
+                                let name = if !r.name.trim().is_empty() {
+                                    r.name.as_str()
+                                } else {
+                                    "Unnamed"
+                                };
+                                win.set_rule_regex_valid(false);
+                                win.set_rule_regex_error(format!("Rule '{name}': {err}").into());
+                                return;
+                            }
+                        }
+                        MonitorSelection::Urls => {
+                            let (valid, err) = validate_rule_pattern("Urls", "", &r.url_regex);
+                            if !valid {
+                                let name = if !r.name.trim().is_empty() {
+                                    r.name.as_str()
+                                } else {
+                                    "Unnamed"
+                                };
+                                win.set_rule_regex_valid(false);
+                                win.set_rule_regex_error(format!("Rule '{name}': {err}").into());
+                                return;
+                            }
+                        }
+                        MonitorSelection::Executables => {}
+                    }
+                }
+
                 let new_destroy = updated_config.general.destroy_windows_on_hide;
                 if was_destroy != new_destroy {
                     overlay_mgr_cell.borrow_mut().set_destroy_windows_on_hide(new_destroy);
@@ -2035,6 +2055,10 @@ mod tests {
         assert!(valid);
 
         // Titles mode requires non-empty pattern and valid regex
+        let (valid_blank_title, err_blank_title) = validate_rule_pattern("Titles", "", "");
+        assert!(!valid_blank_title);
+        assert_eq!(err_blank_title, "Title regex pattern cannot be empty");
+
         let (valid_empty_title, err_empty_title) = validate_rule_pattern("Titles", "   ", "");
         assert!(!valid_empty_title);
         assert_eq!(err_empty_title, "Title regex pattern cannot be empty");
@@ -2046,6 +2070,10 @@ mod tests {
         assert!(valid_good_title);
 
         // Urls mode requires non-empty pattern and valid regex
+        let (valid_blank_url, err_blank_url) = validate_rule_pattern("Urls", "", "");
+        assert!(!valid_blank_url);
+        assert_eq!(err_blank_url, "URL regex pattern cannot be empty");
+
         let (valid_empty_url, err_empty_url) = validate_rule_pattern("Urls", "", "   ");
         assert!(!valid_empty_url);
         assert_eq!(err_empty_url, "URL regex pattern cannot be empty");

@@ -586,6 +586,9 @@ pub fn validate_strftime_format(code: &str) -> (bool, String) {
 
 /// Validates a regular expression pattern using `regex::Regex::new` and returns `(is_valid, error_message)`.
 pub fn validate_regex_pattern(pattern: &str) -> (bool, String) {
+    if pattern.trim().is_empty() {
+        return (false, "Regular expression cannot be empty".to_string());
+    }
     match regex::Regex::new(pattern) {
         Ok(_) => (true, String::new()),
         Err(e) => (false, e.to_string()),
@@ -939,8 +942,12 @@ mod tests {
     #[test]
     fn test_validate_regex_pattern() {
         let (valid_empty, err_empty) = validate_regex_pattern("");
-        assert!(valid_empty);
-        assert!(err_empty.is_empty());
+        assert!(!valid_empty);
+        assert_eq!(err_empty, "Regular expression cannot be empty");
+
+        let (valid_ws, err_ws) = validate_regex_pattern("   ");
+        assert!(!valid_ws);
+        assert_eq!(err_ws, "Regular expression cannot be empty");
 
         let (valid_ok, err_ok) = validate_regex_pattern(r"(?i)(youtube|twitch)");
         assert!(valid_ok);
