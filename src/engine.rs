@@ -177,26 +177,16 @@ impl Engine {
             ) = (&self.active_overlay_mode, &mode)
             {
                 if cur_rule_id != new_rule_id {
-                    let cur_is_destructive = self.config.rules.iter().any(|r| {
-                        &r.id == cur_rule_id
-                            && matches!(
-                                r.action,
-                                RuleAction::LockWorkstation
-                                    | RuleAction::CloseTab
-                                    | RuleAction::CloseWindow
-                                    | RuleAction::KillProcess
-                            )
-                    });
-                    let new_is_destructive = self.config.rules.iter().any(|r| {
-                        &r.id == new_rule_id
-                            && matches!(
-                                r.action,
-                                RuleAction::LockWorkstation
-                                    | RuleAction::CloseTab
-                                    | RuleAction::CloseWindow
-                                    | RuleAction::KillProcess
-                            )
-                    });
+                    let cur_is_destructive = self
+                        .config
+                        .rules
+                        .iter()
+                        .any(|r| &r.id == cur_rule_id && r.action.is_destructive());
+                    let new_is_destructive = self
+                        .config
+                        .rules
+                        .iter()
+                        .any(|r| &r.id == new_rule_id && r.action.is_destructive());
                     let cur_urgency = (*cur_strict, cur_is_destructive, std::cmp::Reverse(*cur_rem));
                     let new_urgency = (*new_strict, new_is_destructive, std::cmp::Reverse(*new_rem));
                     if cur_urgency >= new_urgency {
@@ -274,6 +264,13 @@ impl Engine {
         self.active_overlay_mode.rule_id() == Some(rule_id)
     }
 
+    /// Transitions to another active countdown or hides the overlay if the rule is currently displayed or no countdowns are active.
+    fn transition_if_displayed_or_idle(&mut self, rule_id: &str) {
+        if self.is_rule_displayed(rule_id) || !self.any_countdown_active() {
+            self.transition_to_active_countdown_or_hide();
+        }
+    }
+
     /// Transitions to the highest-priority remaining active countdown rule, or hides the overlay if none remain.
     pub fn transition_to_active_countdown_or_hide(&mut self) {
         // 1. Highest priority: BreakEnforcer (active_break > 0)
@@ -346,13 +343,7 @@ impl Engine {
                     .unwrap_or(u32::MAX);
                 (
                     r.strict_mode,
-                    matches!(
-                        r.action,
-                        RuleAction::LockWorkstation
-                            | RuleAction::CloseTab
-                            | RuleAction::CloseWindow
-                            | RuleAction::KillProcess
-                    ),
+                    r.action.is_destructive(),
                     std::cmp::Reverse(rem),
                 )
             })
@@ -400,9 +391,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.snooze(until);
                 }
-                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.transition_if_displayed_or_idle(&rule_id);
                 self.poll_tick().await;
             }
             DaemonCommand::AcknowledgeAppWarning { rule_id } => {
@@ -424,16 +413,11 @@ impl Engine {
                     }
                 }
 
-                let is_destructive = self.config.rules.iter().any(|r| {
-                    r.id == rule_id
-                        && matches!(
-                            r.action,
-                            RuleAction::LockWorkstation
-                                | RuleAction::CloseTab
-                                | RuleAction::CloseWindow
-                                | RuleAction::KillProcess
-                        )
-                });
+                let is_destructive = self
+                    .config
+                    .rules
+                    .iter()
+                    .any(|r| r.id == rule_id && r.action.is_destructive());
 
                 let mut destructive_grace_dismissed = false;
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
@@ -450,8 +434,8 @@ impl Engine {
 
                 if destructive_grace_dismissed {
                     self.transition_to_active_countdown_or_hide();
-                } else if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
-                    self.transition_to_active_countdown_or_hide();
+                } else {
+                    self.transition_if_displayed_or_idle(&rule_id);
                 }
             }
             DaemonCommand::SkipBreak { rule_id } => {
@@ -464,9 +448,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.complete_cycle(Local::now());
                 }
-                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.transition_if_displayed_or_idle(&rule_id);
                 self.poll_tick().await;
             }
             DaemonCommand::DismissBreakOverlay => {
@@ -592,9 +574,7 @@ impl Engine {
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.reset_session(now);
                 }
-                if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
-                    self.transition_to_active_countdown_or_hide();
-                }
+                self.transition_if_displayed_or_idle(&rule_id);
                 self.poll_tick().await;
             }
             DaemonCommand::ClearSnoozeAll => {
@@ -688,12 +668,7 @@ impl Engine {
                         self.config.general.poll_interval_seconds,
                     );
                     let rt_app = self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone());
-                    match (win, rt_app) {
-                        (Some(ref w), Some(ref r)) if w == "Active Application" => r.clone(),
-                        (Some(w), _) => w,
-                        (None, Some(r)) => r,
-                        (None, None) => "Active Application".to_string(),
-                    }
+                    resolve_effective_app_name(win, rt_app)
                 };
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = rule.trigger_threshold_seconds();
@@ -885,12 +860,7 @@ impl Engine {
                         .unwrap_or_else(|| "Active Application".to_string())
                 } else {
                     let rt_app = self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone());
-                    match (target_window, rt_app) {
-                        (Some(ref w), Some(ref r)) if w == "Active Application" => r.clone(),
-                        (Some(w), _) => w,
-                        (None, Some(r)) => r,
-                        (None, None) => "Active Application".to_string(),
-                    }
+                    resolve_effective_app_name(target_window, rt_app)
                 };
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = rule.trigger_threshold_seconds();
@@ -1009,19 +979,16 @@ impl Engine {
         let mut should_transition_after_eval = false;
 
         if self.config.general.pause_all_rules {
-            for idx in 0..self.config.rules.len() {
-                let rule_id = self.config.rules[idx].id.clone();
-                if self.deactivate_rule_runtime(&rule_id) {
+            for rule in self.config.rules.clone() {
+                if self.deactivate_rule_runtime(&rule.id) {
                     should_transition_after_eval = true;
                 }
             }
         } else if is_globally_snoozed {
-            for idx in 0..self.config.rules.len() {
-                let rule_id = self.config.rules[idx].id.clone();
-                if self.deactivate_rule_runtime(&rule_id) {
+            for rule in self.config.rules.clone() {
+                if self.deactivate_rule_runtime(&rule.id) {
                     should_transition_after_eval = true;
                 }
-                let rule = &self.config.rules[idx];
                 if rule.enabled
                     && rule.schedule.is_active(day_index, hour_index)
                     && rule.trigger == TriggerType::Period
@@ -1031,27 +998,20 @@ impl Engine {
                     } else {
                         &all_events
                     };
-                    if let Some(rt) = self.runtimes.get_mut(&rule_id) {
+                    if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                         let last_completed = rt.last_completed_at;
                         let reset_gap = rule.reset_after_afk.to_seconds().max(1);
                         let compiled_re = rt.compiled_regex.as_ref();
-                        let session_duration = if is_wildcard_executables_rule(rule) {
-                            calculate_continuous_session_from_merged_clipped(
-                                &merged_all_intervals,
-                                now_utc,
-                                last_completed.map(|dt| dt.with_timezone(&Utc)),
-                                reset_gap,
-                            )
-                        } else {
-                            calculate_continuous_session_for_rule(
-                                events_for_rule,
-                                now,
-                                last_completed,
-                                reset_gap,
-                                rule,
-                                compiled_re,
-                            )
-                        };
+                        let session_duration = calculate_rule_session_duration(
+                            &rule,
+                            compiled_re,
+                            events_for_rule,
+                            &merged_all_intervals,
+                            now,
+                            now_utc,
+                            last_completed,
+                            reset_gap,
+                        );
                         if session_duration == 0 {
                             rt.warned_current_cycle = false;
                         }
@@ -1060,18 +1020,15 @@ impl Engine {
                 }
             }
         } else {
-            for idx in 0..self.config.rules.len() {
-                if !self.config.rules[idx].enabled
-                    || !self.config.rules[idx].schedule.is_active(day_index, hour_index)
+            for rule in self.config.rules.clone() {
+                if !rule.enabled
+                    || !rule.schedule.is_active(day_index, hour_index)
                 {
-                    let rule_id = self.config.rules[idx].id.clone();
-                    if self.deactivate_rule_runtime(&rule_id) {
+                    if self.deactivate_rule_runtime(&rule.id) {
                         should_transition_after_eval = true;
                     }
                     continue;
                 }
-
-                let rule = self.config.rules[idx].clone();
 
                 let events_for_rule = if rule.monitor_selection == MonitorSelection::Urls {
                     &web_events
@@ -1383,14 +1340,13 @@ impl Engine {
         let use_windows = suppress_intrusive || rule.notification_method == NotificationMethod::Windows;
 
         let warn_title = format!("Upcoming: {}", rule.name);
-        let default_body = format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
+        let warn_body = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
+            formatter::format_plain_message(&rule.message, ctx)
+        } else {
+            format!("{} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs))
+        };
 
         if use_windows {
-            let warn_body = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
-                formatter::format_plain_message(&rule.message, ctx)
-            } else {
-                default_body
-            };
             enforcer::send_system_notification(&warn_title, &warn_body);
         } else {
             let default_msg = format!("[color=#f59e0b bold] {} in {}.", rule.action.as_str(), formatter::format_seconds_human(rem_secs));
@@ -1415,11 +1371,6 @@ impl Engine {
                 show_time_remaining: rule.show_remaining_time,
             });
             if !self.is_rule_displayed(&rule.id) {
-                let warn_body = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
-                    formatter::format_plain_message(&rule.message, ctx)
-                } else {
-                    default_body
-                };
                 enforcer::send_system_notification(&warn_title, &warn_body);
             }
         }
@@ -1476,23 +1427,16 @@ impl Engine {
                     if rule.trigger == TriggerType::Period {
                         let last_completed = rt.last_completed_at;
                         let reset_gap = rule.reset_after_afk.to_seconds().max(1);
-                        let session_duration = if is_wildcard_executables_rule(rule) {
-                            calculate_continuous_session_from_merged_clipped(
-                                merged_all_intervals,
-                                now_utc,
-                                last_completed.map(|dt| dt.with_timezone(&Utc)),
-                                reset_gap,
-                            )
-                        } else {
-                            calculate_continuous_session_for_rule(
-                                events,
-                                now,
-                                last_completed,
-                                reset_gap,
-                                rule,
-                                compiled_re,
-                            )
-                        };
+                        let session_duration = calculate_rule_session_duration(
+                            rule,
+                            compiled_re,
+                            events,
+                            merged_all_intervals,
+                            now,
+                            now_utc,
+                            last_completed,
+                            reset_gap,
+                        );
                         rt.current_session_seconds = session_duration;
                     }
                     return false;
@@ -1508,23 +1452,16 @@ impl Engine {
                 let last_completed = self.runtimes.get(&rule.id).and_then(|r| r.last_completed_at);
                 let reset_gap = rule.reset_after_afk.to_seconds().max(1);
                 let period_secs = rule.period.to_seconds().max(1);
-                let session_duration = if is_wildcard_executables_rule(rule) {
-                    calculate_continuous_session_from_merged_clipped(
-                        merged_all_intervals,
-                        now_utc,
-                        last_completed.map(|dt| dt.with_timezone(&Utc)),
-                        reset_gap,
-                    )
-                } else {
-                    calculate_continuous_session_for_rule(
-                        events,
-                        now,
-                        last_completed,
-                        reset_gap,
-                        rule,
-                        compiled_re,
-                    )
-                };
+                let session_duration = calculate_rule_session_duration(
+                    rule,
+                    compiled_re,
+                    events,
+                    merged_all_intervals,
+                    now,
+                    now_utc,
+                    last_completed,
+                    reset_gap,
+                );
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     if session_duration == 0 {
                         rt.warned_current_cycle = false;
@@ -1570,18 +1507,13 @@ impl Engine {
             if elapsed_secs > 0 {
                 true
             } else {
-                let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
-                let has_recent = find_latest_matching_event(events, rule, compiled_re, recency_cutoff).is_some();
-                let has_fg = match rule.monitor_selection {
-                    MonitorSelection::Titles => {
-                        enforcer::find_matching_foreground_window::<&str>(&[], compiled_re).is_some()
-                    }
-                    MonitorSelection::Urls => false,
-                    MonitorSelection::Executables => {
-                        enforcer::find_matching_foreground_window(&rule.target_executables, None).is_some()
-                    }
-                };
-                has_recent || has_fg
+                is_target_actively_present(
+                    events,
+                    rule,
+                    compiled_re,
+                    now_utc,
+                    self.config.general.poll_interval_seconds,
+                )
             }
         } else {
             elapsed_secs >= threshold_secs
@@ -1645,13 +1577,7 @@ impl Engine {
         if should_trigger {
             // For Limit triggers with non-destructive actions (ShowOverlay, ShowNotification, ShowStatistics),
             // only fire once per logical day unless snoozed.
-            let is_destructive = matches!(
-                rule.action,
-                RuleAction::LockWorkstation
-                    | RuleAction::CloseTab
-                    | RuleAction::CloseWindow
-                    | RuleAction::KillProcess
-            );
+            let is_destructive = rule.action.is_destructive();
             let already_executed = self
                 .runtimes
                 .get(&rule.id)
@@ -1671,21 +1597,16 @@ impl Engine {
                 {
                     return true;
                 }
-                if !is_wildcard_executables_rule(rule) {
-                    let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
-                    let has_recent = find_latest_matching_event(events, rule, compiled_re, recency_cutoff).is_some();
-                    let has_fg = match rule.monitor_selection {
-                        MonitorSelection::Titles => {
-                            enforcer::find_matching_foreground_window::<&str>(&[], compiled_re).is_some()
-                        }
-                        MonitorSelection::Urls => false,
-                        MonitorSelection::Executables => {
-                            enforcer::find_matching_foreground_window(&rule.target_executables, None).is_some()
-                        }
-                    };
-                    if !has_recent && !has_fg {
-                        return true;
-                    }
+                if !is_wildcard_executables_rule(rule)
+                    && !is_target_actively_present(
+                        events,
+                        rule,
+                        compiled_re,
+                        now_utc,
+                        self.config.general.poll_interval_seconds,
+                    )
+                {
+                    return true;
                 }
             }
 

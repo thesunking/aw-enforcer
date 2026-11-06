@@ -5,7 +5,8 @@ use crate::aw_client::AwEvent;
 use crate::config::{MonitorSelection, Rule, RuleAction};
 use crate::enforcer;
 use crate::engine::intervals::{
-    calculate_continuous_session_from_merged, event_end_utc, merge_overlapping_intervals,
+    calculate_continuous_session_from_merged, calculate_continuous_session_from_merged_clipped,
+    event_end_utc, merge_overlapping_intervals,
 };
 
 // ============================================================================
@@ -316,6 +317,73 @@ pub fn calculate_usage_for_rule(
     total_secs.round() as u32
 }
 
+/// Calculates continuous session duration for a rule, choosing between zero-allocation pre-merged
+/// clipping for wildcard executable rules and rule-filtered traversal for specific rules.
+pub fn calculate_rule_session_duration(
+    rule: &Rule,
+    compiled_re: Option<&Regex>,
+    events: &[AwEvent],
+    merged_all_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+    now: DateTime<Local>,
+    now_utc: DateTime<Utc>,
+    last_completed: Option<DateTime<Local>>,
+    reset_gap: u32,
+) -> u32 {
+    if is_wildcard_executables_rule(rule) {
+        calculate_continuous_session_from_merged_clipped(
+            merged_all_intervals,
+            now_utc,
+            last_completed.map(|dt| dt.with_timezone(&Utc)),
+            reset_gap,
+        )
+    } else {
+        calculate_continuous_session_for_rule(
+            events,
+            now,
+            last_completed,
+            reset_gap,
+            rule,
+            compiled_re,
+        )
+    }
+}
+
+/// Checks whether a rule target is actively present (either via a matching event within
+/// the recency cutoff or an active matching foreground window).
+pub fn is_target_actively_present(
+    events: &[AwEvent],
+    rule: &Rule,
+    compiled_re: Option<&Regex>,
+    now_utc: DateTime<Utc>,
+    poll_interval_secs: u64,
+) -> bool {
+    let recency_cutoff = calculate_recency_cutoff(now_utc, poll_interval_secs);
+    let has_recent = find_latest_matching_event(events, rule, compiled_re, recency_cutoff).is_some();
+    let has_fg = match rule.monitor_selection {
+        MonitorSelection::Titles => {
+            enforcer::find_matching_foreground_window::<&str>(&[], compiled_re).is_some()
+        }
+        MonitorSelection::Urls => false,
+        MonitorSelection::Executables => {
+            enforcer::find_matching_foreground_window(&rule.target_executables, None).is_some()
+        }
+    };
+    has_recent || has_fg
+}
+
+/// Resolves the effective application name between live target window and cached runtime metadata.
+pub fn resolve_effective_app_name(
+    target_window: Option<String>,
+    rt_app: Option<String>,
+) -> String {
+    match (target_window, rt_app) {
+        (Some(ref w), Some(ref r)) if w == "Active Application" => r.clone(),
+        (Some(w), _) => w,
+        (None, Some(r)) => r,
+        (None, None) => "Active Application".to_string(),
+    }
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -576,5 +644,65 @@ mod tests {
         let ev3 = make_event(base_time, 1800.0, "code.exe", "Project A (Window 2)", "");
         let usage_identical = calculate_usage_for_rule(&[ev1, ev3], &rule, None, start_of_day, now_utc);
         assert_eq!(usage_identical, 1800);
+    }
+
+    #[test]
+    fn test_resolve_effective_app_name() {
+        assert_eq!(
+            resolve_effective_app_name(Some("Active Application".to_string()), Some("slack.exe".to_string())),
+            "slack.exe"
+        );
+        assert_eq!(
+            resolve_effective_app_name(Some("code.exe".to_string()), Some("slack.exe".to_string())),
+            "code.exe"
+        );
+        assert_eq!(
+            resolve_effective_app_name(None, Some("discord.exe".to_string())),
+            "discord.exe"
+        );
+        assert_eq!(
+            resolve_effective_app_name(None, None),
+            "Active Application"
+        );
+    }
+
+    #[test]
+    fn test_calculate_rule_session_duration_wildcard_vs_specific() {
+        let base_time = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let now_utc = base_time + Duration::seconds(1800);
+        let now = now_utc.with_timezone(&Local);
+
+        let ev1 = make_event(base_time, 1800.0, "code.exe", "Project", "");
+        let intervals = vec![(base_time, base_time + Duration::seconds(1800))];
+
+        let mut wildcard_rule = Rule::default_template(0);
+        wildcard_rule.target_executables = vec!["*".to_string()];
+
+        let dur_wildcard = calculate_rule_session_duration(
+            &wildcard_rule,
+            None,
+            &[ev1.clone()],
+            &intervals,
+            now,
+            now_utc,
+            None,
+            300,
+        );
+        assert_eq!(dur_wildcard, 1800);
+
+        let mut specific_rule = Rule::default_template(1);
+        specific_rule.target_executables = vec!["slack.exe".to_string()];
+
+        let dur_specific = calculate_rule_session_duration(
+            &specific_rule,
+            None,
+            &[ev1],
+            &intervals,
+            now,
+            now_utc,
+            None,
+            300,
+        );
+        assert_eq!(dur_specific, 0);
     }
 }

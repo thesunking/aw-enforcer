@@ -1,4 +1,4 @@
-﻿use chrono::format::{Item, StrftimeItems};
+use chrono::format::{Item, StrftimeItems};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -788,6 +788,14 @@ impl RuleAction {
             "Kill Process" => Self::KillProcess,
             _ => Self::ShowOverlay,
         }
+    }
+
+    /// Returns `true` if this action terminates windows/processes or locks the workstation.
+    pub fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::LockWorkstation | Self::CloseTab | Self::CloseWindow | Self::KillProcess
+        )
     }
 }
 
