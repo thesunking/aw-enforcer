@@ -7,134 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-/// Predicate checking if an ActivityWatch bucket key represents a local (non-synchronized) bucket.
-pub fn is_local_bucket(key: &str) -> bool {
-    !key.contains("-synced") && !key.contains("_synced")
-}
-
-/// Escapes backslashes and double quotes in bucket IDs for safe interpolation into aw-server query strings.
-pub fn escape_bucket_id(id: &str) -> String {
-    id.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Builds the ActivityWatch query expression string for one or more browser web buckets.
-/// Floods each bucket individually, folds multiple buckets via binary `concat(acc, next)`,
-/// and wraps multiple buckets in `sort_by_timestamp(...)`.
-pub fn build_web_query_expr(web_buckets: &[String]) -> Option<String> {
-    if web_buckets.is_empty() {
-        return None;
-    }
-    if web_buckets.len() == 1 {
-        return Some(format!(
-            "flood(query_bucket(\"{}\"))",
-            escape_bucket_id(&web_buckets[0])
-        ));
-    }
-    let mut it = web_buckets
-        .iter()
-        .map(|b| format!("flood(query_bucket(\"{}\"))", escape_bucket_id(b)));
-    let first = it.next()?;
-    let folded = it.fold(first, |acc, next| format!("concat({}, {})", acc, next));
-    Some(format!("sort_by_timestamp({})", folded))
-}
-
-/// Helper to parse an ISO 8601 / RFC 3339 timestamp from a JSON value field.
-fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
-    val.get(field)
-        .and_then(|v| v.as_str())
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-/// Formats a start/end time range into an ActivityWatch `start/end` timeperiod string.
-fn format_timeperiod(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
-    format!("{}/{}", start.to_rfc3339(), end.to_rfc3339())
-}
-
-/// Builds an ActivityWatch query body intersecting `target_expr` with `not_afk` status.
-fn build_not_afk_intersect_query(timeperiod: String, target_expr: &str, afk_id: &str) -> Value {
-    serde_json::json!({
-        "timeperiods": [timeperiod],
-        "query": [
-            format!("events = {target_expr};"),
-            format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id)),
-            "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
-            "events = filter_period_intersect(events, not_afk);",
-            "RETURN = events;"
-        ]
-    })
-}
-
-/// Selects the best bucket matching `prefix` among candidate local buckets.
-///
-/// When multiple local buckets exist (e.g. following a hostname change), metadata is inspected:
-/// 1. Candidates with `last_updated` are compared first (`b.last_updated.cmp(&a.last_updated)`).
-/// 2. Prefer buckets whose `"hostname"` matches the local machine hostname (`COMPUTERNAME`).
-/// 3. Compare effective timestamp (`created`).
-/// 4. Fall back to deterministic ascending lexicographical key order.
-pub fn select_best_bucket<'a>(
-    prefix: &str,
-    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
-) -> Option<String> {
-    select_best_bucket_with_hostname(
-        prefix,
-        std::env::var("COMPUTERNAME").ok().as_deref(),
-        buckets,
-    )
-}
-
-pub fn select_best_bucket_with_hostname<'a>(
-    prefix: &str,
-    local_hostname: Option<&str>,
-    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
-) -> Option<String> {
-    struct Candidate<'a> {
-        key: &'a str,
-        effective_time: Option<DateTime<Utc>>,
-        last_updated: Option<DateTime<Utc>>,
-        hostname_matches: bool,
-    }
-
-    let mut candidates: Vec<Candidate<'a>> = buckets
-        .into_iter()
-        .filter(|(key, _)| key.starts_with(prefix) && is_local_bucket(key))
-        .map(|(key, val)| {
-            let last_updated = parse_bucket_time(val, "last_updated");
-            let created = parse_bucket_time(val, "created");
-            let effective_time = last_updated.or(created);
-
-            let hostname_matches = if let Some(local_h) = local_hostname {
-                val.get("hostname")
-                    .and_then(|h| h.as_str())
-                    .map_or(false, |h| h.eq_ignore_ascii_case(local_h))
-            } else {
-                false
-            };
-
-            Candidate {
-                key,
-                effective_time,
-                last_updated,
-                hostname_matches,
-            }
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    candidates.sort_by(|a, b| {
-        b.last_updated
-            .cmp(&a.last_updated)
-            .then_with(|| b.hostname_matches.cmp(&a.hostname_matches))
-            .then_with(|| b.effective_time.cmp(&a.effective_time))
-            .then_with(|| a.key.cmp(b.key))
-    });
-
-    candidates.first().map(|c| c.key.to_string())
-}
-
 /// Typed payload for ActivityWatch window, web, and afk events.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AwEventData {
@@ -218,23 +90,6 @@ impl AwClient {
         }
     }
 
-    /// URL for the ActivityWatch query endpoint.
-    fn query_url(&self) -> String {
-        format!("{}/api/0/query/", self.base_url)
-    }
-
-    /// Checks whether web buckets need a refresh (unverified or >=60 seconds since last check).
-    fn should_refresh_web_buckets(&self) -> bool {
-        let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
-        last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
-    }
-
-    /// Resilient bucket discovery: checks GET /api/0/buckets/ to confirm both
-    /// aw-watcher-window_ and aw-watcher-afk_ buckets exist before querying.
-    pub async fn has_required_buckets(&self) -> bool {
-        self.prepare_poll_buckets(false).await
-    }
-
     /// Prepares buckets before polling, refreshing `/api/0/buckets/` if unverified or if web buckets need a 60s refresh.
     /// Returns `true` if required buckets are ready, avoiding duplicate calls and racing queries during `tokio::join!`.
     pub async fn prepare_poll_buckets(&self, need_web: bool) -> bool {
@@ -246,6 +101,12 @@ impl AwClient {
         } else {
             true
         }
+    }
+
+    /// Resilient bucket discovery: checks GET /api/0/buckets/ to confirm both
+    /// aw-watcher-window_ and aw-watcher-afk_ buckets exist before querying.
+    pub async fn has_required_buckets(&self) -> bool {
+        self.prepare_poll_buckets(false).await
     }
 
     /// Fetches all buckets from `/api/0/buckets/`, updates cached window, afk, and web bucket IDs,
@@ -371,11 +232,158 @@ impl AwClient {
 
         Ok(parse_query_response_events(batches))
     }
+
+    /// Checks whether web buckets need a refresh (unverified or >=60 seconds since last check).
+    fn should_refresh_web_buckets(&self) -> bool {
+        let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
+        last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
+    }
+
+    /// URL for the ActivityWatch query endpoint.
+    fn query_url(&self) -> String {
+        format!("{}/api/0/query/", self.base_url)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Query Construction & Response Extraction Helpers
+// ---------------------------------------------------------------------------
 
 /// Extracts `Vec<AwEvent>` from an ActivityWatch `/api/0/query/` response batch array (`[[events]]`).
 pub fn parse_query_response_events(batches: Vec<Vec<AwEvent>>) -> Vec<AwEvent> {
     batches.into_iter().next().unwrap_or_default()
+}
+
+/// Builds an ActivityWatch query body intersecting `target_expr` with `not_afk` status.
+fn build_not_afk_intersect_query(timeperiod: String, target_expr: &str, afk_id: &str) -> Value {
+    serde_json::json!({
+        "timeperiods": [timeperiod],
+        "query": [
+            format!("events = {target_expr};"),
+            format!("not_afk = flood(query_bucket(\"{}\"));", escape_bucket_id(afk_id)),
+            "not_afk = filter_keyvals(not_afk, \"status\", [\"not-afk\"]);",
+            "events = filter_period_intersect(events, not_afk);",
+            "RETURN = events;"
+        ]
+    })
+}
+
+/// Builds the ActivityWatch query expression string for one or more browser web buckets.
+/// Floods each bucket individually, folds multiple buckets via binary `concat(acc, next)`,
+/// and wraps multiple buckets in `sort_by_timestamp(...)`.
+pub fn build_web_query_expr(web_buckets: &[String]) -> Option<String> {
+    if web_buckets.is_empty() {
+        return None;
+    }
+    if web_buckets.len() == 1 {
+        return Some(format!(
+            "flood(query_bucket(\"{}\"))",
+            escape_bucket_id(&web_buckets[0])
+        ));
+    }
+    let mut it = web_buckets
+        .iter()
+        .map(|b| format!("flood(query_bucket(\"{}\"))", escape_bucket_id(b)));
+    let first = it.next()?;
+    let folded = it.fold(first, |acc, next| format!("concat({}, {})", acc, next));
+    Some(format!("sort_by_timestamp({})", folded))
+}
+
+/// Formats a start/end time range into an ActivityWatch `start/end` timeperiod string.
+fn format_timeperiod(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
+    format!("{}/{}", start.to_rfc3339(), end.to_rfc3339())
+}
+
+/// Escapes backslashes and double quotes in bucket IDs for safe interpolation into aw-server query strings.
+pub fn escape_bucket_id(id: &str) -> String {
+    id.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+// ---------------------------------------------------------------------------
+// Bucket Discovery & Selection Helpers
+// ---------------------------------------------------------------------------
+
+/// Selects the best bucket matching `prefix` among candidate local buckets.
+///
+/// When multiple local buckets exist (e.g. following a hostname change), metadata is inspected:
+/// 1. Candidates with `last_updated` are compared first (`b.last_updated.cmp(&a.last_updated)`).
+/// 2. Prefer buckets whose `"hostname"` matches the local machine hostname (`COMPUTERNAME`).
+/// 3. Compare effective timestamp (`created`).
+/// 4. Fall back to deterministic ascending lexicographical key order.
+pub fn select_best_bucket<'a>(
+    prefix: &str,
+    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<String> {
+    select_best_bucket_with_hostname(
+        prefix,
+        std::env::var("COMPUTERNAME").ok().as_deref(),
+        buckets,
+    )
+}
+
+pub fn select_best_bucket_with_hostname<'a>(
+    prefix: &str,
+    local_hostname: Option<&str>,
+    buckets: impl IntoIterator<Item = (&'a str, &'a Value)>,
+) -> Option<String> {
+    struct Candidate<'a> {
+        key: &'a str,
+        effective_time: Option<DateTime<Utc>>,
+        last_updated: Option<DateTime<Utc>>,
+        hostname_matches: bool,
+    }
+
+    let mut candidates: Vec<Candidate<'a>> = buckets
+        .into_iter()
+        .filter(|(key, _)| key.starts_with(prefix) && is_local_bucket(key))
+        .map(|(key, val)| {
+            let last_updated = parse_bucket_time(val, "last_updated");
+            let created = parse_bucket_time(val, "created");
+            let effective_time = last_updated.or(created);
+
+            let hostname_matches = if let Some(local_h) = local_hostname {
+                val.get("hostname")
+                    .and_then(|h| h.as_str())
+                    .map_or(false, |h| h.eq_ignore_ascii_case(local_h))
+            } else {
+                false
+            };
+
+            Candidate {
+                key,
+                effective_time,
+                last_updated,
+                hostname_matches,
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.last_updated
+            .cmp(&a.last_updated)
+            .then_with(|| b.hostname_matches.cmp(&a.hostname_matches))
+            .then_with(|| b.effective_time.cmp(&a.effective_time))
+            .then_with(|| a.key.cmp(b.key))
+    });
+
+    candidates.first().map(|c| c.key.to_string())
+}
+
+/// Predicate checking if an ActivityWatch bucket key represents a local (non-synchronized) bucket.
+pub fn is_local_bucket(key: &str) -> bool {
+    !key.contains("-synced") && !key.contains("_synced")
+}
+
+/// Helper to parse an ISO 8601 / RFC 3339 timestamp from a JSON value field.
+fn parse_bucket_time(val: &Value, field: &str) -> Option<DateTime<Utc>> {
+    val.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
