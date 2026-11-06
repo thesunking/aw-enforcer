@@ -7618,7 +7618,7 @@ mod tests {
     #[tokio::test]
     async fn test_global_snooze_updates_session_and_resets_warned_on_afk() {
         let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
-        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let aw_client = Arc::new(AwClient::new(56999, ""));
         let mut cfg = AppConfig::default();
         cfg.general.suppress_fullscreen_d3d = false;
 

@@ -310,6 +310,7 @@ ActivityWatch event streams are processed on each `poll_tick()`:
 2. **Pre-Poll Verification:** `AwClient::prepare_poll_buckets` checks bucket readiness and re-discovers web buckets every 60 seconds. Offline servers produce empty event vectors immediately, reducing network roundtrips from 3 to 1.
 3. **Interval Coalescing (`merge_overlapping_intervals`):** Activity intervals across overlapping windows are merged into contiguous non-overlapping spans.
 4. **Web Event Filtering & Empty-Window Clearing:** Raw `aw-watcher-web` events are clipped to overlapping active foreground browser intervals (`filter_web_events_by_active_browser_windows`). When no foreground window events were recorded during the polling window (`all_events.is_empty()`), `web_events` are cleared immediately so background browser events never accumulate screen time while the user is AFK or on the desktop.
+5. **Low-Latency Loopback & Concurrent Query Isolation (`AwClient`):** `AwClient` enables `.tcp_nodelay(true)` on its underlying HTTP connection pool to eliminate Nagle packet batching delay across local loopback queries. When querying web events via `query_web_events` concurrently with window/AFK queries in `tokio::join!`, legitimate zero-event responses do not reset or mutate `has_web_bucket`, isolating web bucket discovery state from transient failures or empty activity periods. Malformed JSON response payloads in `execute_query` log descriptive warnings rather than silently masking deserialization errors.
 
 ### 5.2 Rule Lifecycle State Machine
 
@@ -422,6 +423,7 @@ graph LR
 | **Deduplicated Tab-Closing** | Explicit Win32 Key Synthesis & UIPI Diagnostics | Clears general and physical left/right modifier and Windows keys (`VK_SHIFT`, `VK_LSHIFT`, `VK_RSHIFT`, `VK_MENU`, `VK_LMENU`, `VK_RMENU`, `VK_LWIN`, `VK_RWIN`) prior to dispatching `Ctrl+W` to avoid accidental window closure or shell shortcuts, and checks `SendInput` / `PostMessageW` return values to diagnose UIPI elevation blocks. |
 | **Poisoned Mutex Recovery** | Safe Lock Unwrapping | All synchronization locks use `.unwrap_or_else(|e| e.into_inner())` to prevent daemon panics if an internal thread panics. |
 | **Native Toast Branding** | Custom WinRT AUMID Registration | Registers `AW-Enforcer` under `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` with `DisplayName = "AW-Enforcer"` and executable `IconUri` on launch, replacing generic PowerShell toast attribution with branded headers and falling back gracefully. |
+| **Idempotent Registry Autostart** | Registry Key Read Comparison | `set_autostart` checks whether `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AW-Enforcer` already equals the current executable `--autostart` command before writing, skipping redundant `key.set_value` Win32 calls on configuration saves. `is_autostart_enabled` queries presence and path match. |
 
 ---
 

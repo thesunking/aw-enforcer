@@ -167,6 +167,7 @@ impl AwClient {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(5))
+            .tcp_nodelay(true)
             .build()
             .unwrap_or_default();
 
@@ -364,11 +365,7 @@ impl AwClient {
             ]
         });
 
-        let events = self.execute_query(&url, &query_body).await.unwrap_or_default();
-        if events.is_empty() && !self.buckets_verified.load(Ordering::Relaxed) {
-            self.has_web_bucket.store(false, Ordering::Relaxed);
-        }
-        events
+        self.execute_query(&url, &query_body).await.unwrap_or_default()
     }
 
     /// Dispatches a query request to ActivityWatch `/api/0/query/`, checking HTTP status and parsing returned events.
@@ -395,7 +392,10 @@ impl AwClient {
 
         let batches = match resp.json::<Vec<Vec<AwEvent>>>().await {
             Ok(b) => b,
-            Err(_) => return Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!("Failed to parse ActivityWatch query response JSON: {}", e);
+                return Ok(Vec::new());
+            }
         };
 
         Ok(parse_query_response_events(batches))
@@ -733,5 +733,26 @@ mod tests {
         assert!(client_empty.matches_config(5600, ""));
         assert!(client_empty.matches_config(5600, "   "));
         assert!(!client_empty.matches_config(5600, "token"));
+    }
+
+    #[tokio::test]
+    async fn test_query_web_events_empty_preserves_has_web_bucket() {
+        let client = AwClient::new(56999, "");
+        *client.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        client.buckets_verified.store(false, Ordering::Relaxed);
+        client.has_web_bucket.store(true, Ordering::Relaxed);
+        *client.web_bucket_ids.write().await = vec!["aw-watcher-web-chrome_LOCAL".to_string()];
+        *client.afk_bucket_id.write().await = Some("aw-watcher-afk_LOCAL".to_string());
+
+        let now = Utc::now();
+        let start = now - chrono::Duration::hours(1);
+
+        // When execute_query fails or returns empty (e.g. server offline), has_web_bucket remains true
+        let events = client.query_web_events(start, now).await;
+        assert!(events.is_empty());
+        assert!(
+            client.has_web_bucket.load(Ordering::Relaxed),
+            "Empty web events must not falsely clear has_web_bucket"
+        );
     }
 }
