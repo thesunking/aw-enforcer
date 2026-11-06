@@ -2334,6 +2334,10 @@ impl Engine {
         };
         self.show_overlay(loading_mode);
 
+        if !matches!(self.active_overlay_mode, OverlayMode::HudStatus { .. }) {
+            return;
+        }
+
         let now = Local::now();
         let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
         let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
@@ -2349,8 +2353,8 @@ impl Engine {
             .await
             .unwrap_or_default();
 
-        // If the overlay was dismissed/closed while waiting for ActivityWatch, do not re-open it
-        if matches!(self.active_overlay_mode, OverlayMode::Hidden) {
+        // If the overlay was dismissed/closed or preempted by a higher-priority overlay while waiting for ActivityWatch, do not re-open it
+        if !matches!(self.active_overlay_mode, OverlayMode::HudStatus { .. }) {
             return;
         }
 
@@ -6628,5 +6632,64 @@ mod tests {
             rt.active_break.is_some(),
             "Break must re-trigger after previous attempt was aborted"
         );
+    }
+
+    #[tokio::test]
+    async fn test_display_stats_overlay_blocked_by_higher_priority_overlay() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let cfg = AppConfig::default();
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // 1. BreakEnforcer overlay is active (priority 4)
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-active-break".into(),
+            title: "Mandatory Break".into(),
+            paragraphs: vec![],
+            duration_seconds: 300,
+            remaining_seconds: 300,
+            allow_snooze: false,
+            strict_mode: true,
+            click_through: false,
+        };
+
+        engine.display_stats_overlay(false).await;
+
+        assert!(
+            engine.stats_cache.is_none(),
+            "stats_cache must not be populated when BreakEnforcer is active"
+        );
+        match &engine.active_overlay_mode {
+            OverlayMode::BreakEnforcer { rule_id, .. } => {
+                assert_eq!(rule_id, "rule-active-break");
+            }
+            other => panic!("Expected BreakEnforcer to remain active, got {:?}", other),
+        }
+        assert!(overlay_rx.try_recv().is_err(), "No overlay action should be sent");
+
+        // 2. HudTimer overlay is active (priority 3)
+        engine.active_overlay_mode = OverlayMode::HudTimer {
+            rule_id: "rule-active-timer".into(),
+            title: "Grace Timer".into(),
+            paragraphs: vec![],
+            duration_seconds: 30,
+            remaining_seconds: 30,
+            allow_snooze: false,
+            strict_mode: true,
+        };
+
+        engine.display_stats_overlay(false).await;
+
+        assert!(
+            engine.stats_cache.is_none(),
+            "stats_cache must not be populated when HudTimer is active"
+        );
+        match &engine.active_overlay_mode {
+            OverlayMode::HudTimer { rule_id, .. } => {
+                assert_eq!(rule_id, "rule-active-timer");
+            }
+            other => panic!("Expected HudTimer to remain active, got {:?}", other),
+        }
+        assert!(overlay_rx.try_recv().is_err(), "No overlay action should be sent");
     }
 }
