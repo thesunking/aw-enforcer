@@ -230,44 +230,65 @@ pub struct RuleSchedule {
 impl Default for RuleSchedule {
     fn default() -> Self {
         // Default: 09:00 - 17:59 active on weekdays
-        Self {
-            mon: "000000000111111111000000".to_string(),
-            tue: "000000000111111111000000".to_string(),
-            wed: "000000000111111111000000".to_string(),
-            thu: "000000000111111111000000".to_string(),
-            fri: "000000000111111111000000".to_string(),
-            sat: "000000000000000000000000".to_string(),
-            sun: "000000000000000000000000".to_string(),
-        }
+        Self::from_weekday_weekend("000000000111111111000000", "000000000000000000000000")
     }
 }
 
 impl RuleSchedule {
+    /// Constructs a `RuleSchedule` from an array of 7 24-character day bitmask strings (Mon..Sun).
+    pub fn from_days(days: [String; 7]) -> Self {
+        let [mon, tue, wed, thu, fri, sat, sun] = days;
+        Self { mon, tue, wed, thu, fri, sat, sun }
+    }
+
+    /// Creates a schedule with identical 24-hour bitmasks for all 7 days.
+    pub fn uniform(day_mask: &str) -> Self {
+        Self {
+            mon: day_mask.to_string(),
+            tue: day_mask.to_string(),
+            wed: day_mask.to_string(),
+            thu: day_mask.to_string(),
+            fri: day_mask.to_string(),
+            sat: day_mask.to_string(),
+            sun: day_mask.to_string(),
+        }
+    }
+
+    /// Creates a schedule with one bitmask for weekdays (Mon-Fri) and another for weekends (Sat-Sun).
+    pub fn from_weekday_weekend(weekday_mask: &str, weekend_mask: &str) -> Self {
+        Self {
+            mon: weekday_mask.to_string(),
+            tue: weekday_mask.to_string(),
+            wed: weekday_mask.to_string(),
+            thu: weekday_mask.to_string(),
+            fri: weekday_mask.to_string(),
+            sat: weekend_mask.to_string(),
+            sun: weekend_mask.to_string(),
+        }
+    }
+
+    /// Returns an array of references to the 7 daily schedule bitmask strings (Mon..Sun).
+    pub fn days(&self) -> [&str; 7] {
+        [
+            &self.mon, &self.tue, &self.wed, &self.thu, &self.fri, &self.sat, &self.sun,
+        ]
+    }
+
     /// Returns `true` if the rule is scheduled to be active on `day` (0 = Monday .. 6 = Sunday) at `hour` (0..23).
     pub fn is_active(&self, day: usize, hour: usize) -> bool {
         if hour >= 24 {
             return false;
         }
-        let day_str = match day {
-            0 => &self.mon,
-            1 => &self.tue,
-            2 => &self.wed,
-            3 => &self.thu,
-            4 => &self.fri,
-            5 => &self.sat,
-            6 => &self.sun,
-            _ => return false,
+        let Some(day_str) = self.days().get(day).copied() else {
+            return false;
         };
-        day_str.chars().nth(hour).map(|c| c == '1').unwrap_or(false)
+        day_str.chars().nth(hour).map_or(false, |c| c == '1')
     }
 
     /// Flattens the 7x24 schedule into a 168-element boolean array for the Slint UI matrix.
     pub fn to_bool_array(&self) -> [bool; 168] {
         let mut slots = [false; 168];
-        let days = [
-            &self.mon, &self.tue, &self.wed, &self.thu, &self.fri, &self.sat, &self.sun,
-        ];
-        for (d, day_str) in days.iter().enumerate() {
+        for (d, day_str) in self.days().into_iter().enumerate() {
             for (h, c) in day_str.chars().take(24).enumerate() {
                 slots[d * 24 + h] = c == '1';
             }
@@ -277,20 +298,12 @@ impl RuleSchedule {
 
     /// Reconstructs a `RuleSchedule` from a flattened 168-element boolean slice.
     pub fn from_bool_array(slots: &[bool]) -> Self {
-        let day_str = |d: usize| -> String {
+        let days = std::array::from_fn(|d| {
             (0..24)
                 .map(|h| if slots.get(d * 24 + h).copied().unwrap_or(false) { '1' } else { '0' })
                 .collect()
-        };
-        Self {
-            mon: day_str(0),
-            tue: day_str(1),
-            wed: day_str(2),
-            thu: day_str(3),
-            fri: day_str(4),
-            sat: day_str(5),
-            sun: day_str(6),
-        }
+        });
+        Self::from_days(days)
     }
 
     /// Returns a pre-configured `RuleSchedule` for known preset names, or `None` if unrecognized.
@@ -301,43 +314,17 @@ impl RuleSchedule {
     /// - `"weekends"`: Monday-Friday completely inactive, Saturday-Sunday active all 24 hours.
     pub fn from_preset(preset: &str) -> Option<Self> {
         match preset {
-            "select_all" => Some(Self {
-                mon: "111111111111111111111111".to_string(),
-                tue: "111111111111111111111111".to_string(),
-                wed: "111111111111111111111111".to_string(),
-                thu: "111111111111111111111111".to_string(),
-                fri: "111111111111111111111111".to_string(),
-                sat: "111111111111111111111111".to_string(),
-                sun: "111111111111111111111111".to_string(),
-            }),
-            "clear" => Some(Self {
-                mon: "000000000000000000000000".to_string(),
-                tue: "000000000000000000000000".to_string(),
-                wed: "000000000000000000000000".to_string(),
-                thu: "000000000000000000000000".to_string(),
-                fri: "000000000000000000000000".to_string(),
-                sat: "000000000000000000000000".to_string(),
-                sun: "000000000000000000000000".to_string(),
-            }),
+            "select_all" => Some(Self::uniform("111111111111111111111111")),
+            "clear" => Some(Self::uniform("000000000000000000000000")),
             "work_hours" => Some(Self::default()),
-            "evenings" => Some(Self {
-                mon: "000000000000000000111111".to_string(),
-                tue: "000000000000000000111111".to_string(),
-                wed: "000000000000000000111111".to_string(),
-                thu: "000000000000000000111111".to_string(),
-                fri: "000000000000000000111111".to_string(),
-                sat: "000000001111111111111111".to_string(),
-                sun: "000000001111111111111111".to_string(),
-            }),
-            "weekends" => Some(Self {
-                mon: "000000000000000000000000".to_string(),
-                tue: "000000000000000000000000".to_string(),
-                wed: "000000000000000000000000".to_string(),
-                thu: "000000000000000000000000".to_string(),
-                fri: "000000000000000000000000".to_string(),
-                sat: "111111111111111111111111".to_string(),
-                sun: "111111111111111111111111".to_string(),
-            }),
+            "evenings" => Some(Self::from_weekday_weekend(
+                "000000000000000000111111",
+                "000000001111111111111111",
+            )),
+            "weekends" => Some(Self::from_weekday_weekend(
+                "000000000000000000000000",
+                "111111111111111111111111",
+            )),
             _ => None,
         }
     }
@@ -488,13 +475,11 @@ impl Rule {
         }
 
         if normalized_targets.is_empty() {
-            self.target_executables = vec!["*".to_string()];
+            normalized_targets.push("*".to_string());
         } else if has_exclusions && !has_positive_specific {
             normalized_targets.insert(0, "*".to_string());
-            self.target_executables = normalized_targets;
-        } else {
-            self.target_executables = normalized_targets;
         }
+        self.target_executables = normalized_targets;
 
         if !self.has_specific_executable() && self.action == RuleAction::KillProcess {
             self.action = RuleAction::CloseWindow;
@@ -703,15 +688,10 @@ impl Default for Config {
                     notification_duration: DurationConfig::new(10, TimeUnit::Sec),
                     show_remaining_time: false,
                     message: "# Time to stretch!\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge.".to_string(),
-                    schedule: RuleSchedule {
-                        mon: "000000001111111111000000".to_string(),
-                        tue: "000000001111111111000000".to_string(),
-                        wed: "000000001111111111000000".to_string(),
-                        thu: "000000001111111111000000".to_string(),
-                        fri: "000000001111111111000000".to_string(),
-                        sat: "000000000000000000000000".to_string(),
-                        sun: "000000000000000000000000".to_string(),
-                    },
+                    schedule: RuleSchedule::from_weekday_weekend(
+                        "000000001111111111000000",
+                        "000000000000000000000000",
+                    ),
                 },
                 Rule {
                     id: "rule-gaming-limit".to_string(),
@@ -735,15 +715,10 @@ impl Default for Config {
                     notification_duration: DurationConfig::new(10, TimeUnit::Sec),
                     show_remaining_time: false,
                     message: "## Quota Warning: {app}\n[color=#f59e0b bold] {remaining} remaining out of your {limit} daily limit.\nPlease wrap up and save your work.".to_string(),
-                    schedule: RuleSchedule {
-                        mon: "000000000111111111111100".to_string(),
-                        tue: "000000000111111111111100".to_string(),
-                        wed: "000000000111111111111100".to_string(),
-                        thu: "000000000111111111111100".to_string(),
-                        fri: "000000000111111111111100".to_string(),
-                        sat: "000000000000000000000000".to_string(),
-                        sun: "000000000000000000000000".to_string(),
-                    },
+                    schedule: RuleSchedule::from_weekday_weekend(
+                        "000000000111111111111100",
+                        "000000000000000000000000",
+                    ),
                 },
             ],
         }
@@ -761,13 +736,10 @@ impl Config {
 
     /// Loads `config.toml` from disk, falling back to `Config::default()` if reading or parsing fails.
     pub fn load() -> Self {
-        match Self::try_load() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::warn!("Failed to load config.toml ({e}); using defaults.");
-                Self::default()
-            }
-        }
+        Self::try_load().unwrap_or_else(|e| {
+            tracing::warn!("Failed to load config.toml ({e}); using defaults.");
+            Self::default()
+        })
     }
 
     /// Enforces full application configuration invariants and sanitization across general, overlay, stats, and rule configs.
@@ -789,15 +761,14 @@ impl Config {
 
         self.overlay.opacity = self.overlay.opacity.clamp(0.1, 1.0);
         let default_overlay = OverlayConfig::default();
-        if crate::formatter::parse_hex_color(&self.overlay.accent_color).is_none() {
-            self.overlay.accent_color = default_overlay.accent_color;
-        }
-        if crate::formatter::parse_hex_color(&self.overlay.background_color).is_none() {
-            self.overlay.background_color = default_overlay.background_color;
-        }
-        if crate::formatter::parse_hex_color(&self.overlay.text_color).is_none() {
-            self.overlay.text_color = default_overlay.text_color;
-        }
+        let sanitize_hex = |color: &mut String, default: &str| {
+            if crate::formatter::parse_hex_color(color).is_none() {
+                *color = default.to_string();
+            }
+        };
+        sanitize_hex(&mut self.overlay.accent_color, &default_overlay.accent_color);
+        sanitize_hex(&mut self.overlay.background_color, &default_overlay.background_color);
+        sanitize_hex(&mut self.overlay.text_color, &default_overlay.text_color);
 
         self.stats.daily_screentime_target_minutes =
             self.stats.daily_screentime_target_minutes.clamp(1, 1440);
@@ -828,20 +799,17 @@ impl Config {
             return Ok(default_cfg);
         }
 
-        match Self::load_from_path(path) {
-            Ok(cfg) => Ok(cfg),
-            Err(e) => {
-                let bak_path = path.with_extension("toml.bak");
-                let _ = fs::copy(path, &bak_path);
-                tracing::warn!(
-                    "Failed to load existing config at {:?} ({}); backed up corrupted file to {:?}",
-                    path,
-                    e,
-                    bak_path
-                );
-                Err(e)
-            }
-        }
+        Self::load_from_path(path).map_err(|e| {
+            let bak_path = path.with_extension("toml.bak");
+            let _ = fs::copy(path, &bak_path);
+            tracing::warn!(
+                "Failed to load existing config at {:?} ({}); backed up corrupted file to {:?}",
+                path,
+                e,
+                bak_path
+            );
+            e
+        })
     }
 
     /// Attempts to read, parse, validate, and sanitize `config.toml`, creating a default file if none exists.
