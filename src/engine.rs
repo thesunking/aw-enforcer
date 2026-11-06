@@ -6861,12 +6861,17 @@ mod tests {
         }
 
         // 2. Dispatch warning for rule_win: NotificationMethod::Windows routes to system toast, NOT HudToast
+        let count_before = enforcer::get_test_notifications_sent();
         engine.active_overlay_mode = OverlayMode::Hidden;
         let ctx_win = formatter::build_preview_context(&rule_win);
         engine.dispatch_pre_action_warning(&rule_win, &ctx_win, 60);
         assert!(
             matches!(engine.active_overlay_mode, OverlayMode::Hidden),
             "NotificationMethod::Windows must not emit HudToast overlay"
+        );
+        assert!(
+            enforcer::get_test_notifications_sent() > count_before,
+            "NotificationMethod::Windows should dispatch a native system notification"
         );
     }
 

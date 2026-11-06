@@ -292,27 +292,63 @@ pub fn ensure_app_user_model_id_registered() {
     });
 }
 
+#[cfg(test)]
+static TEST_NOTIFICATIONS_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LAST_TEST_NOTIFICATION: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+/// Returns the total count of native system notifications dispatched during tests.
+pub fn get_test_notifications_sent() -> usize {
+    TEST_NOTIFICATIONS_SENT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+/// Returns the most recently dispatched native system notification (title, message) in test mode.
+pub fn get_last_test_notification() -> Option<(String, String)> {
+    LAST_TEST_NOTIFICATION.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+/// Resets test notification tracking counters and records.
+pub fn reset_test_notifications() {
+    TEST_NOTIFICATIONS_SENT.store(0, std::sync::atomic::Ordering::SeqCst);
+    *LAST_TEST_NOTIFICATION.lock().unwrap() = None;
+}
+
 /// Sends a passive native Windows notification via WinRT using the branded AUMID.
 pub fn send_system_notification(title: &str, message: &str) {
-    ensure_app_user_model_id_registered();
+    #[cfg(test)]
+    {
+        tracing::debug!("[TEST] send_system_notification suppressed: title='{title}', message='{message}'");
+        TEST_NOTIFICATIONS_SENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut last = LAST_TEST_NOTIFICATION.lock().unwrap();
+        *last = Some((title.to_string(), message.to_string()));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        ensure_app_user_model_id_registered();
 
-    let res = winrt_notification::Toast::new(APP_AUMID)
-        .title(title)
-        .text1(message)
-        .duration(winrt_notification::Duration::Short)
-        .show();
-
-    if let Err(e) = res {
-        tracing::warn!(
-            "Failed to send WinRT notification with custom AUMID '{APP_AUMID}': {e}. Falling back to PowerShell AUMID."
-        );
-        if let Err(e2) = winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
+        let res = winrt_notification::Toast::new(APP_AUMID)
             .title(title)
             .text1(message)
             .duration(winrt_notification::Duration::Short)
-            .show()
-        {
-            tracing::warn!("Failed to send WinRT notification with fallback AUMID: {e2}");
+            .show();
+
+        if let Err(e) = res {
+            tracing::warn!(
+                "Failed to send WinRT notification with custom AUMID '{APP_AUMID}': {e}. Falling back to PowerShell AUMID."
+            );
+            if let Err(e2) = winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
+                .title(title)
+                .text1(message)
+                .duration(winrt_notification::Duration::Short)
+                .show()
+            {
+                tracing::warn!("Failed to send WinRT notification with fallback AUMID: {e2}");
+            }
         }
     }
 }
@@ -953,5 +989,19 @@ mod tests {
         // Ensure repeated calls succeed idempotently
         let res2 = register_app_user_model_id();
         assert!(res2.is_ok(), "Repeated register_app_user_model_id calls should succeed");
+    }
+
+    #[test]
+    fn test_send_system_notification_mocked_in_tests() {
+        let before_count = get_test_notifications_sent();
+        send_system_notification("Test Alert", "Testing notification suppression");
+        let after_count = get_test_notifications_sent();
+        assert_eq!(after_count, before_count + 1);
+
+        let last = get_last_test_notification();
+        assert_eq!(
+            last,
+            Some(("Test Alert".to_string(), "Testing notification suppression".to_string()))
+        );
     }
 }
