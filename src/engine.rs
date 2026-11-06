@@ -358,6 +358,7 @@ impl RuleRuntime {
         self.last_matched_app = None;
         self.last_matched_url = None;
         self.set_last_matched_title(None);
+        self.last_matched_title_regex = None;
     }
 
     /// Resets all state for a rule on a new logical day rollover.
@@ -5454,6 +5455,17 @@ mod tests {
 
         // 5. Setting empty string clears title and regex
         rt.set_last_matched_title(Some("".to_string()));
+        assert!(rt.last_matched_title.is_none());
+        assert!(rt.last_matched_title_regex.is_none());
+
+        // 6. clear_matched_metadata clears app, url, title, and cached regex
+        rt.last_matched_app = Some("chrome.exe".to_string());
+        rt.last_matched_url = Some("https://example.com".to_string());
+        rt.set_last_matched_title(Some("Example Page".to_string()));
+        assert!(rt.last_matched_title_regex.is_some());
+        rt.clear_matched_metadata();
+        assert!(rt.last_matched_app.is_none());
+        assert!(rt.last_matched_url.is_none());
         assert!(rt.last_matched_title.is_none());
         assert!(rt.last_matched_title_regex.is_none());
     }
