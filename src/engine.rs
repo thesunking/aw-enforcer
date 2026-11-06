@@ -344,6 +344,10 @@ impl RuleRuntime {
 
     /// Clears active break, grace countdown, pending break, and warning flags for the current cycle.
     pub fn reset_active_timers(&mut self) {
+        if self.active_break.is_some() {
+            self.action_executed_today = false;
+            self.can_rollback_completion = false;
+        }
         self.current_session_seconds = 0;
         self.active_break = None;
         self.grace_countdown = None;
@@ -384,6 +388,10 @@ impl RuleRuntime {
     /// the current session so the snoozed rule re-triggers once `until` expires instead of wiping
     /// the pre-snooze session.
     pub fn snooze(&mut self, until: DateTime<Local>) {
+        let was_enforcing = self.active_break.is_some()
+            || self.pending_break_since.is_some()
+            || self.grace_countdown.is_some()
+            || self.can_rollback_completion;
         let preserve_warned = self.active_break.is_none()
             && self.pending_break_since.is_none()
             && self.grace_countdown.is_none()
@@ -398,7 +406,9 @@ impl RuleRuntime {
             self.last_completed_at = self.prev_completed_at;
         }
         self.can_rollback_completion = false;
-        self.action_executed_today = false;
+        if was_enforcing {
+            self.action_executed_today = false;
+        }
     }
 
     /// Recompiles the rule's title or URL regex when configuration is reloaded without losing runtime state.
@@ -6488,6 +6498,135 @@ mod tests {
         assert!(
             matches!(engine.active_overlay_mode, OverlayMode::Hidden),
             "NotificationMethod::Windows must not emit HudToast overlay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snooze_all_preserves_action_executed_today_on_completed_limit_rules() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.poll_interval_seconds = 3600;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-limit-complete".to_string();
+        rule.trigger = TriggerType::Limit;
+        rule.action = RuleAction::ShowNotification;
+        rule.limit = DurationConfig::new(1, TimeUnit::Hr);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // Mark rule cycle completed earlier today
+        let rt = engine.runtimes.get_mut("rule-limit-complete").unwrap();
+        rt.complete_cycle(now - Duration::hours(2));
+        assert!(rt.action_executed_today);
+        assert!(!rt.can_rollback_completion);
+
+        // User executes SnoozeAll
+        engine.handle_command(DaemonCommand::SnoozeAll { minutes: 15 }).await;
+
+        let rt = engine.runtimes.get("rule-limit-complete").unwrap();
+        assert!(
+            rt.action_executed_today,
+            "action_executed_today must be preserved on idle completed Limit rules"
+        );
+
+        // Simulate expiration of snooze
+        let later = now + Duration::minutes(20);
+        let later_utc = later.with_timezone(&Utc);
+        let ev = make_event(now_utc - Duration::hours(2), 7200.0, "work.exe", "Working", "");
+
+        engine
+            .evaluate_rule(&rule, None, later, &[ev], start_of_day_utc, later_utc)
+            .await;
+
+        let rt = engine.runtimes.get("rule-limit-complete").unwrap();
+        assert!(rt.action_executed_today);
+        assert!(rt.grace_countdown.is_none());
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+    }
+
+    #[tokio::test]
+    async fn test_aborted_active_break_resets_action_executed_today() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+        cfg.general.poll_interval_seconds = 3600;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-limit-break".to_string();
+        rule.trigger = TriggerType::Limit;
+        rule.action = RuleAction::ShowOverlay;
+        rule.limit = DurationConfig::new(1, TimeUnit::Hr);
+        rule.break_duration = DurationConfig::new(10, TimeUnit::Min);
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        let ev = make_event(now_utc - Duration::hours(2), 7200.0, "work.exe", "Working", "");
+
+        // Trigger break
+        engine
+            .evaluate_rule(&rule, None, now, &[ev.clone()], start_of_day_utc, now_utc)
+            .await;
+
+        // If system was active (< 1500ms idle), evaluate_rule placed rule in pending_break_since.
+        // Fast-forward pending_break_since past natural delay and tick realtime to launch active break.
+        if engine.runtimes.get("rule-limit-break").unwrap().active_break.is_none() {
+            if let Some(rt) = engine.runtimes.get_mut("rule-limit-break") {
+                rt.pending_break_since = Some(now - Duration::seconds(20));
+            }
+            engine.realtime_tick().await;
+        }
+
+        let rt = engine.runtimes.get("rule-limit-break").unwrap();
+        assert!(rt.active_break.is_some());
+        assert!(rt.action_executed_today);
+
+        // Abort active break via pause
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+
+        let rt = engine.runtimes.get("rule-limit-break").unwrap();
+        assert!(rt.active_break.is_none());
+        assert!(
+            !rt.action_executed_today,
+            "Aborted active break must reset action_executed_today to false"
+        );
+
+        // Unpause and evaluate again: break should re-trigger
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: false }).await;
+        engine
+            .evaluate_rule(
+                &rule,
+                None,
+                now + Duration::seconds(1),
+                &[ev],
+                start_of_day_utc,
+                now_utc + Duration::seconds(1),
+            )
+            .await;
+
+        if engine.runtimes.get("rule-limit-break").unwrap().active_break.is_none() {
+            if let Some(rt) = engine.runtimes.get_mut("rule-limit-break") {
+                rt.pending_break_since = Some(now - Duration::seconds(20));
+            }
+            engine.realtime_tick().await;
+        }
+
+        let rt = engine.runtimes.get("rule-limit-break").unwrap();
+        assert!(
+            rt.active_break.is_some(),
+            "Break must re-trigger after previous attempt was aborted"
         );
     }
 }
