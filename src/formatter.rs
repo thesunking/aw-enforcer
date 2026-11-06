@@ -8,72 +8,124 @@ use crate::config::{Rule, RuleAction, TriggerType};
 pub use crate::FormattedParagraph;
 pub use crate::TextAlignment as TextHorizontalAlignment;
 
-/// Parses a 6-digit (`#RRGGBB`) or 8-digit (`#RRGGBBAA`) hexadecimal color string into a Slint `Color`.
-pub fn parse_hex_color(hex: &str) -> Option<Color> {
-    let s = hex.trim().strip_prefix('#')?;
-    let r = u8::from_str_radix(s.get(0..2)?, 16).ok()?;
-    let g = u8::from_str_radix(s.get(2..4)?, 16).ok()?;
-    let b = u8::from_str_radix(s.get(4..6)?, 16).ok()?;
-    match s.len() {
-        6 => Some(Color::from_rgb_u8(r, g, b)),
-        8 => {
-            let a = u8::from_str_radix(s.get(6..8)?, 16).ok()?;
-            Some(Color::from_argb_u8(a, r, g, b))
+
+// ============================================================================
+// Message Parsing & Interpolation
+// ============================================================================
+
+/// Interpolates placeholders and parses line-level headings (`#`, `##`) and `[attr ...]` style blocks
+/// into a list of Slint `FormattedParagraph` items.
+pub fn parse_message(
+    raw_message: &str,
+    ctx: &MessageContext,
+    default_color: Color,
+    alignment: TextHorizontalAlignment,
+) -> Vec<FormattedParagraph> {
+    let interpolated = ctx.interpolate(raw_message);
+    let mut paragraphs = Vec::new();
+
+    let make_para = |text: &str, font_size: f32, font_weight: i32, italic: bool, underline: bool, color: Color| {
+        let final_text = if text.is_empty() { "\u{00A0}" } else { text };
+        FormattedParagraph {
+            text: SharedString::from(final_text),
+            font_size,
+            font_weight,
+            italic,
+            underline,
+            color,
+            alignment,
         }
-        _ => None,
-    }
-}
+    };
 
-/// Formats a duration in seconds into a human-readable string (e.g., `"45s"`, `"10m"`, `"1h 15m"`).
-pub fn format_seconds_human(secs: u32) -> String {
-    if secs == 0 {
-        "0s".to_string()
-    } else if secs < 60 {
-        format!("{}s", secs)
-    } else if secs >= 3600 {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        if m > 0 {
-            format!("{}h {}m", h, m)
-        } else {
-            format!("{}h", h)
+    for line in split_lines(&interpolated) {
+        let (heading_prefix, rest) = split_header_prefix(line);
+        if heading_prefix.is_empty() && rest.is_empty() {
+            paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
+            continue;
         }
-    } else if secs.is_multiple_of(60) {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{}m {}s", secs / 60, secs % 60)
-    }
-}
 
-/// Formats a snooze expiration badge relative to `now`.
-/// Returns `"Snoozed (Xs)"` when remaining time is under 60 seconds, and `"Snoozed (Xm)"` when 60 seconds or more.
-pub fn format_snooze_badge(until: DateTime<Local>, now: DateTime<Local>) -> String {
-    let rem_secs = (until - now).num_seconds().max(0);
-    if rem_secs < 60 {
-        format!("Snoozed ({}s)", rem_secs)
-    } else {
-        format!("Snoozed ({}m)", (rem_secs + 59) / 60)
-    }
-}
-
-/// Validates whether the contents of a leading `[...]` bracket block consist exclusively of
-/// recognized inline style tokens (`bold`, `italic`, `underline`, `size=8..72`, `color=#hex`).
-pub fn is_valid_attr_block(inner: &str) -> bool {
-    let mut has_token = false;
-    for token in inner.split_whitespace() {
-        has_token = true;
-        let valid = match token {
-            "bold" | "italic" | "underline" => true,
-            s if s.starts_with("size=") => s[5..].parse::<u16>().is_ok_and(|sz| (8..=72).contains(&sz)),
-            s if s.starts_with("color=") => parse_hex_color(&s[6..]).is_some(),
-            _ => false,
+        let default_size = match heading_prefix {
+            "## " => 20.0,
+            "# " => 26.0,
+            _ => 15.0,
         };
-        if !valid {
-            return false;
+        let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
+
+        // Check for attribute prefix: [attr1 attr2 ...]
+        if let Some((inner, content)) = extract_attr_block(rest) {
+            let attrs = ParsedAttributes::from_inner(inner);
+            let font_size = attrs.size.map_or(default_size, |sz| sz as f32);
+            let font_weight = if attrs.bold { 700 } else { default_weight };
+            let text_color = attrs.color_hex.and_then(parse_hex_color).unwrap_or(default_color);
+
+            paragraphs.push(make_para(
+                content,
+                font_size,
+                font_weight,
+                attrs.italic,
+                attrs.underline,
+                text_color,
+            ));
+            continue;
         }
+
+        // Plain line fallback (or plain heading fallback)
+        paragraphs.push(make_para(rest, default_size, default_weight, false, false, default_color));
     }
-    has_token
+
+    if paragraphs.is_empty() {
+        paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
+    }
+
+    paragraphs
 }
+
+
+/// Convenience parser using specific placeholder context and alignment for UI live previews.
+pub fn parse_formatted_text_with_context_and_alignment(
+    raw_message: &str,
+    ctx: &MessageContext,
+    alignment: TextHorizontalAlignment,
+) -> Vec<FormattedParagraph> {
+    let default_color = Color::from_rgb_u8(248, 250, 252); // #f8fafc
+    parse_message(
+        raw_message,
+        ctx,
+        default_color,
+        alignment,
+    )
+}
+
+
+/// Convenience parser using specific placeholder context for UI live previews.
+pub fn parse_formatted_text_with_context(
+    raw_message: &str,
+    ctx: &MessageContext,
+) -> Vec<FormattedParagraph> {
+    parse_formatted_text_with_context_and_alignment(raw_message, ctx, TextHorizontalAlignment::Center)
+}
+
+
+/// Convenience parser using sample placeholder values and default theme styling for UI live previews.
+#[allow(dead_code)]
+pub fn parse_formatted_text(raw_message: &str) -> Vec<FormattedParagraph> {
+    parse_formatted_text_with_context(raw_message, &MessageContext::sample())
+}
+
+
+/// Interpolates placeholders and strips heading prefixes (`# `, `## `) and style attribute blocks (`[...]`)
+/// to produce clean plain text suitable for native system notifications.
+pub fn format_plain_message(raw_message: &str, ctx: &MessageContext) -> String {
+    let interpolated = ctx.interpolate(raw_message);
+    split_lines(&interpolated)
+        .map(|line| {
+            let (_, rest) = split_header_prefix(line);
+            extract_attr_block(rest).map_or(rest, |(_, remaining)| remaining)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 
 /// Dynamic runtime values used to interpolate `{...}` placeholders in rule messages.
 #[derive(Debug, Clone, Default)]
@@ -87,90 +139,6 @@ pub struct MessageContext {
     pub remaining: String,
 }
 
-/// Builds a consistent `MessageContext` for previewing warnings and alerts for a given rule.
-pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
-    let threshold_secs = rule.trigger_threshold_seconds().max(1);
-    let warn_secs = rule.warn_before.to_seconds();
-    let grace_secs = rule.grace_duration.to_seconds();
-    let rem_secs = if warn_secs > 0 {
-        warn_secs.min(threshold_secs)
-    } else if grace_secs > 0 {
-        grace_secs.min(threshold_secs)
-    } else {
-        300.min(threshold_secs)
-    };
-    let used_secs = threshold_secs.saturating_sub(rem_secs);
-    let trimmed_name = rule.name.trim();
-
-    let app = match rule.monitor_selection {
-        crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
-        crate::config::MonitorSelection::Titles => {
-            if trimmed_name.is_empty() {
-                "Active Window".to_string()
-            } else {
-                trimmed_name.to_string()
-            }
-        }
-        crate::config::MonitorSelection::Executables => rule
-            .target_executables
-            .iter()
-            .find(|t| {
-                let s = t.trim();
-                !s.is_empty() && s != "*"
-            })
-            .cloned()
-            .unwrap_or_else(|| "code.exe".to_string()),
-    };
-
-    let rule_name = if trimmed_name.is_empty() {
-        "Break Reminder".to_string()
-    } else {
-        trimmed_name.to_string()
-    };
-
-    let (session_duration, limit) = match rule.trigger {
-        crate::config::TriggerType::Period => {
-            let lim = if rule.limit.to_seconds() == 0 {
-                rule.period.to_short_string()
-            } else {
-                rule.limit.to_short_string()
-            };
-            (rule.period.to_short_string(), lim)
-        }
-        crate::config::TriggerType::Limit => (
-            format_seconds_human(used_secs),
-            rule.limit.to_short_string(),
-        ),
-    };
-
-    MessageContext {
-        rule_name,
-        session_duration,
-        break_time: rule.break_duration.to_short_string(),
-        app,
-        used: format_seconds_human(used_secs),
-        limit,
-        remaining: format_seconds_human(rem_secs),
-    }
-}
-
-/// Returns the fallback template message when `rule.message.trim().is_empty()` for Stage 3 actions and preview alerts.
-pub fn rule_message_fallback(rule: &Rule) -> &'static str {
-    match rule.action {
-        RuleAction::ShowOverlay => {
-            "# Time for a Break\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
-        }
-        RuleAction::ShowNotification => match rule.trigger {
-            TriggerType::Period => {
-                "[color=#38bdf8 bold] {rule_name}: Active for {session_duration} on {app}."
-            }
-            TriggerType::Limit => {
-                "[color=#f59e0b bold] {rule_name}: Daily limit ({limit}) reached for {app}."
-            }
-        },
-        _ => "",
-    }
-}
 
 impl MessageContext {
     /// Returns a sample `MessageContext` for live previewing in the Settings UI.
@@ -243,229 +211,103 @@ impl MessageContext {
     }
 }
 
-/// Interpolates placeholders and strips heading prefixes (`# `, `## `) and style attribute blocks (`[...]`)
-/// to produce clean plain text suitable for native system notifications.
-pub fn format_plain_message(raw_message: &str, ctx: &MessageContext) -> String {
-    let interpolated = ctx.interpolate(raw_message);
-    split_lines(&interpolated)
-        .map(|line| {
-            let (_, rest) = split_header_prefix(line);
-            extract_attr_block(rest).map_or(rest, |(_, remaining)| remaining)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
-/// Preset color palette mapping hex color codes to their UI combo-box labels.
-pub const COLOR_PALETTE: &[(&str, &str)] = &[
-    ("#38bdf8", "Color: Sky Blue"),
-    ("#10b981", "Color: Emerald"),
-    ("#f59e0b", "Color: Amber"),
-    ("#f43f5e", "Color: Rose"),
-    ("#a855f7", "Color: Purple"),
-    ("#6366f1", "Color: Indigo"),
-    ("#ffffff", "Color: White"),
-];
 
-/// Converts a hex color code (e.g. `"#38bdf8"`) into its human-readable UI combo-box label.
-pub fn color_code_to_display(code: &str) -> &'static str {
-    COLOR_PALETTE
-        .iter()
-        .find(|&&(hex, _)| hex.eq_ignore_ascii_case(code))
-        .map(|&(_, label)| label)
-        .unwrap_or("Color: Default")
-}
+// ============================================================================
+// Rule Context & Fallback Templates
+// ============================================================================
 
-/// Splits text into lines while normalizing CRLF (`\r\n`) line endings.
-fn split_lines(text: &str) -> impl Iterator<Item = &str> {
-    text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l))
-}
-
-/// Applies transformation `f` to the line at `line_idx` (clamped to the last line) and rejoins with `\n`.
-fn modify_line_at(raw_text: &str, line_idx: usize, f: impl FnOnce(&str) -> String) -> String {
-    let mut lines: Vec<String> = split_lines(raw_text).map(String::from).collect();
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    let idx = line_idx.min(lines.len() - 1);
-    lines[idx] = f(&lines[idx]);
-    lines.join("\n")
-}
-
-/// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
-fn split_header_prefix(line: &str) -> (&str, &str) {
-    let trimmed = line.trim_start().trim_end_matches('\r');
-    if let Some(r) = trimmed.strip_prefix("## ") {
-        ("## ", r.trim_start())
-    } else if trimmed == "##" {
-        ("## ", "")
-    } else if let Some(r) = trimmed.strip_prefix("# ") {
-        ("# ", r.trim_start())
-    } else if trimmed == "#" {
-        ("# ", "")
+/// Builds a consistent `MessageContext` for previewing warnings and alerts for a given rule.
+pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
+    let threshold_secs = rule.trigger_threshold_seconds().max(1);
+    let warn_secs = rule.warn_before.to_seconds();
+    let grace_secs = rule.grace_duration.to_seconds();
+    let rem_secs = if warn_secs > 0 {
+        warn_secs.min(threshold_secs)
+    } else if grace_secs > 0 {
+        grace_secs.min(threshold_secs)
     } else {
-        ("", trimmed.trim_end())
-    }
-}
+        300.min(threshold_secs)
+    };
+    let used_secs = threshold_secs.saturating_sub(rem_secs);
+    let trimmed_name = rule.name.trim();
 
-/// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
-fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
-    if rest.starts_with('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let inner = &rest[1..close_idx];
-            if is_valid_attr_block(inner) {
-                let content = rest[close_idx + 1..].trim_start();
-                return Some((inner, content));
+    let app = match rule.monitor_selection {
+        crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
+        crate::config::MonitorSelection::Titles => {
+            if trimmed_name.is_empty() {
+                "Active Window".to_string()
+            } else {
+                trimmed_name.to_string()
             }
         }
-    }
-    None
-}
-
-/// Internal helper representing parsed inline attributes from a `[...]` block.
-#[derive(Debug, Default)]
-struct ParsedAttributes<'a> {
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    color_hex: Option<&'a str>,
-    size: Option<u16>,
-}
-
-impl<'a> ParsedAttributes<'a> {
-    fn from_inner(inner: &'a str) -> Self {
-        let mut attrs = Self::default();
-        for token in inner.split_whitespace() {
-            match token {
-                "bold" => attrs.bold = true,
-                "italic" => attrs.italic = true,
-                "underline" => attrs.underline = true,
-                s if s.starts_with("color=") => attrs.color_hex = Some(&s[6..]),
-                s if s.starts_with("size=") => attrs.size = s[5..].parse().ok(),
-                _ => {}
-            }
-        }
-        attrs
-    }
-}
-
-/// Interpolates placeholders and parses line-level headings (`#`, `##`) and `[attr ...]` style blocks
-/// into a list of Slint `FormattedParagraph` items.
-pub fn parse_message(
-    raw_message: &str,
-    ctx: &MessageContext,
-    default_color: Color,
-    alignment: TextHorizontalAlignment,
-) -> Vec<FormattedParagraph> {
-    let interpolated = ctx.interpolate(raw_message);
-    let mut paragraphs = Vec::new();
-
-    let make_para = |text: &str, font_size: f32, font_weight: i32, italic: bool, underline: bool, color: Color| {
-        let final_text = if text.is_empty() { "\u{00A0}" } else { text };
-        FormattedParagraph {
-            text: SharedString::from(final_text),
-            font_size,
-            font_weight,
-            italic,
-            underline,
-            color,
-            alignment,
-        }
+        crate::config::MonitorSelection::Executables => rule
+            .target_executables
+            .iter()
+            .find(|t| {
+                let s = t.trim();
+                !s.is_empty() && s != "*"
+            })
+            .cloned()
+            .unwrap_or_else(|| "code.exe".to_string()),
     };
 
-    for line in split_lines(&interpolated) {
-        let (heading_prefix, rest) = split_header_prefix(line);
-        if heading_prefix.is_empty() && rest.is_empty() {
-            paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
-            continue;
-        }
-
-        let default_size = match heading_prefix {
-            "## " => 20.0,
-            "# " => 26.0,
-            _ => 15.0,
-        };
-        let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
-
-        // Check for attribute prefix: [attr1 attr2 ...]
-        if let Some((inner, content)) = extract_attr_block(rest) {
-            let attrs = ParsedAttributes::from_inner(inner);
-            let font_size = attrs.size.map_or(default_size, |sz| sz as f32);
-            let font_weight = if attrs.bold { 700 } else { default_weight };
-            let text_color = attrs.color_hex.and_then(parse_hex_color).unwrap_or(default_color);
-
-            paragraphs.push(make_para(
-                content,
-                font_size,
-                font_weight,
-                attrs.italic,
-                attrs.underline,
-                text_color,
-            ));
-            continue;
-        }
-
-        // Plain line fallback (or plain heading fallback)
-        paragraphs.push(make_para(rest, default_size, default_weight, false, false, default_color));
-    }
-
-    if paragraphs.is_empty() {
-        paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
-    }
-
-    paragraphs
-}
-
-/// Convenience parser using sample placeholder values and default theme styling for UI live previews.
-#[allow(dead_code)]
-pub fn parse_formatted_text(raw_message: &str) -> Vec<FormattedParagraph> {
-    parse_formatted_text_with_context(raw_message, &MessageContext::sample())
-}
-
-/// Convenience parser using specific placeholder context for UI live previews.
-pub fn parse_formatted_text_with_context(
-    raw_message: &str,
-    ctx: &MessageContext,
-) -> Vec<FormattedParagraph> {
-    parse_formatted_text_with_context_and_alignment(raw_message, ctx, TextHorizontalAlignment::Center)
-}
-
-/// Convenience parser using specific placeholder context and alignment for UI live previews.
-pub fn parse_formatted_text_with_context_and_alignment(
-    raw_message: &str,
-    ctx: &MessageContext,
-    alignment: TextHorizontalAlignment,
-) -> Vec<FormattedParagraph> {
-    let default_color = Color::from_rgb_u8(248, 250, 252); // #f8fafc
-    parse_message(
-        raw_message,
-        ctx,
-        default_color,
-        alignment,
-    )
-}
-
-/// Represents the detected formatting attributes on a single line of the message editor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LineFormattingStatus {
-    pub is_h1: bool,
-    pub is_h2: bool,
-    pub is_bold: bool,
-    pub is_italic: bool,
-    pub is_underline: bool,
-    pub color_code: String, // e.g. "#38bdf8" or ""
-    pub size_val: u32,      // e.g. 18 or 0 (default)
-}
-
-/// Formats a line by attaching header prefix and attribute block if tokens are non-empty.
-fn format_line_with_attrs<T: AsRef<str>>(header_prefix: &str, tokens: &[T], content: &str) -> String {
-    if tokens.is_empty() {
-        format!("{header_prefix}{content}")
+    let rule_name = if trimmed_name.is_empty() {
+        "Break Reminder".to_string()
     } else {
-        let joined = tokens.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
-        format!("{header_prefix}[{joined}] {content}")
+        trimmed_name.to_string()
+    };
+
+    let (session_duration, limit) = match rule.trigger {
+        crate::config::TriggerType::Period => {
+            let lim = if rule.limit.to_seconds() == 0 {
+                rule.period.to_short_string()
+            } else {
+                rule.limit.to_short_string()
+            };
+            (rule.period.to_short_string(), lim)
+        }
+        crate::config::TriggerType::Limit => (
+            format_seconds_human(used_secs),
+            rule.limit.to_short_string(),
+        ),
+    };
+
+    MessageContext {
+        rule_name,
+        session_duration,
+        break_time: rule.break_duration.to_short_string(),
+        app,
+        used: format_seconds_human(used_secs),
+        limit,
+        remaining: format_seconds_human(rem_secs),
     }
 }
+
+
+/// Returns the fallback template message when `rule.message.trim().is_empty()` for Stage 3 actions and preview alerts.
+pub fn rule_message_fallback(rule: &Rule) -> &'static str {
+    match rule.action {
+        RuleAction::ShowOverlay => {
+            "# Time for a Break\n[color=#38bdf8 size=18 bold] You have been active for {session_duration}.\nPlease step away for {break_time} to recharge."
+        }
+        RuleAction::ShowNotification => match rule.trigger {
+            TriggerType::Period => {
+                "[color=#38bdf8 bold] {rule_name}: Active for {session_duration} on {app}."
+            }
+            TriggerType::Limit => {
+                "[color=#f59e0b bold] {rule_name}: Daily limit ({limit}) reached for {app}."
+            }
+        },
+        _ => "",
+    }
+}
+
+
+
+// ============================================================================
+// Message Editor Formatting Controls
+// ============================================================================
 
 /// Inspects the line at `line_idx` and returns its active heading or `[attr ...]` formatting state.
 pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormattingStatus {
@@ -495,6 +337,7 @@ pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormatting
 
     status
 }
+
 
 /// Toggles or applies a formatting style (`"h1"`, `"h2"`, `"bold"`, `"italic"`, `"underline"`, color, or size)
 /// on the specified line index in `raw_text`.
@@ -526,6 +369,7 @@ pub fn apply_line_style(raw_text: &str, line_idx: usize, style: &str) -> String 
     })
 }
 
+
 /// Appends a `{placeholder}` token to the end of the line at `line_idx`, inserting a space if needed.
 pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) -> String {
     modify_line_at(raw_text, line_idx, |target_line| {
@@ -538,19 +382,155 @@ pub fn append_placeholder(raw_text: &str, line_idx: usize, placeholder: &str) ->
     })
 }
 
-/// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block,
-/// preserving any leading `# ` or `## ` heading prefix.
-fn strip_attr_prefix(line: &str, prefix: &str) -> String {
-    let (header_prefix, rest) = split_header_prefix(line);
-    if let Some((inner, content)) = extract_attr_block(rest) {
-        let tokens: Vec<&str> = inner
-            .split_whitespace()
-            .filter(|t| !t.starts_with(prefix))
-            .collect();
-        return format_line_with_attrs(header_prefix, &tokens, content);
-    }
-    line.to_string()
+
+/// Represents the detected formatting attributes on a single line of the message editor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LineFormattingStatus {
+    pub is_h1: bool,
+    pub is_h2: bool,
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub is_underline: bool,
+    pub color_code: String, // e.g. "#38bdf8" or ""
+    pub size_val: u32,      // e.g. 18 or 0 (default)
 }
+
+
+/// Converts a hex color code (e.g. `"#38bdf8"`) into its human-readable UI combo-box label.
+pub fn color_code_to_display(code: &str) -> &'static str {
+    COLOR_PALETTE
+        .iter()
+        .find(|&&(hex, _)| hex.eq_ignore_ascii_case(code))
+        .map(|&(_, label)| label)
+        .unwrap_or("Color: Default")
+}
+
+
+/// Preset color palette mapping hex color codes to their UI combo-box labels.
+pub const COLOR_PALETTE: &[(&str, &str)] = &[
+    ("#38bdf8", "Color: Sky Blue"),
+    ("#10b981", "Color: Emerald"),
+    ("#f59e0b", "Color: Amber"),
+    ("#f43f5e", "Color: Rose"),
+    ("#a855f7", "Color: Purple"),
+    ("#6366f1", "Color: Indigo"),
+    ("#ffffff", "Color: White"),
+];
+
+
+
+// ============================================================================
+// Line & Attribute Parsing Utilities
+// ============================================================================
+
+/// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
+fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
+    if rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[1..close_idx];
+            if is_valid_attr_block(inner) {
+                let content = rest[close_idx + 1..].trim_start();
+                return Some((inner, content));
+            }
+        }
+    }
+    None
+}
+
+
+/// Validates whether the contents of a leading `[...]` bracket block consist exclusively of
+/// recognized inline style tokens (`bold`, `italic`, `underline`, `size=8..72`, `color=#hex`).
+pub fn is_valid_attr_block(inner: &str) -> bool {
+    let mut has_token = false;
+    for token in inner.split_whitespace() {
+        has_token = true;
+        let valid = match token {
+            "bold" | "italic" | "underline" => true,
+            s if s.starts_with("size=") => s[5..].parse::<u16>().is_ok_and(|sz| (8..=72).contains(&sz)),
+            s if s.starts_with("color=") => parse_hex_color(&s[6..]).is_some(),
+            _ => false,
+        };
+        if !valid {
+            return false;
+        }
+    }
+    has_token
+}
+
+
+/// Internal helper representing parsed inline attributes from a `[...]` block.
+#[derive(Debug, Default)]
+struct ParsedAttributes<'a> {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    color_hex: Option<&'a str>,
+    size: Option<u16>,
+}
+
+impl<'a> ParsedAttributes<'a> {
+    fn from_inner(inner: &'a str) -> Self {
+        let mut attrs = Self::default();
+        for token in inner.split_whitespace() {
+            match token {
+                "bold" => attrs.bold = true,
+                "italic" => attrs.italic = true,
+                "underline" => attrs.underline = true,
+                s if s.starts_with("color=") => attrs.color_hex = Some(&s[6..]),
+                s if s.starts_with("size=") => attrs.size = s[5..].parse().ok(),
+                _ => {}
+            }
+        }
+        attrs
+    }
+}
+
+
+/// Splits a line into its optional leading heading prefix (`"# "` or `"## "`) and the rest of the trimmed line.
+fn split_header_prefix(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start().trim_end_matches('\r');
+    if let Some(r) = trimmed.strip_prefix("## ") {
+        ("## ", r.trim_start())
+    } else if trimmed == "##" {
+        ("## ", "")
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        ("# ", r.trim_start())
+    } else if trimmed == "#" {
+        ("# ", "")
+    } else {
+        ("", trimmed.trim_end())
+    }
+}
+
+
+/// Splits text into lines while normalizing CRLF (`\r\n`) line endings.
+fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l))
+}
+
+
+/// Applies transformation `f` to the line at `line_idx` (clamped to the last line) and rejoins with `\n`.
+fn modify_line_at(raw_text: &str, line_idx: usize, f: impl FnOnce(&str) -> String) -> String {
+    let mut lines: Vec<String> = split_lines(raw_text).map(String::from).collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let idx = line_idx.min(lines.len() - 1);
+    lines[idx] = f(&lines[idx]);
+    lines.join("\n")
+}
+
+
+/// Formats a line by attaching header prefix and attribute block if tokens are non-empty.
+fn format_line_with_attrs<T: AsRef<str>>(header_prefix: &str, tokens: &[T], content: &str) -> String {
+    if tokens.is_empty() {
+        format!("{header_prefix}{content}")
+    } else {
+        let joined = tokens.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+        format!("{header_prefix}[{joined}] {content}")
+    }
+}
+
 
 /// Toggles or replaces a single attribute token inside a line's leading `[...]` attribute block,
 /// preserving any leading `# ` or `## ` heading prefix.
@@ -576,6 +556,77 @@ fn toggle_attr(line: &str, attr: &str) -> String {
     }
 
     format_line_with_attrs(header_prefix, &[attr], rest)
+}
+
+
+/// Removes all attribute tokens starting with `prefix` (e.g. `"color="` or `"size="`) from a line's `[...]` block,
+/// preserving any leading `# ` or `## ` heading prefix.
+fn strip_attr_prefix(line: &str, prefix: &str) -> String {
+    let (header_prefix, rest) = split_header_prefix(line);
+    if let Some((inner, content)) = extract_attr_block(rest) {
+        let tokens: Vec<&str> = inner
+            .split_whitespace()
+            .filter(|t| !t.starts_with(prefix))
+            .collect();
+        return format_line_with_attrs(header_prefix, &tokens, content);
+    }
+    line.to_string()
+}
+
+
+
+// ============================================================================
+// Scalar & Color Formatting Helpers
+// ============================================================================
+
+/// Formats a duration in seconds into a human-readable string (e.g., `"45s"`, `"10m"`, `"1h 15m"`).
+pub fn format_seconds_human(secs: u32) -> String {
+    if secs == 0 {
+        "0s".to_string()
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m > 0 {
+            format!("{}h {}m", h, m)
+        } else {
+            format!("{}h", h)
+        }
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+
+/// Formats a snooze expiration badge relative to `now`.
+/// Returns `"Snoozed (Xs)"` when remaining time is under 60 seconds, and `"Snoozed (Xm)"` when 60 seconds or more.
+pub fn format_snooze_badge(until: DateTime<Local>, now: DateTime<Local>) -> String {
+    let rem_secs = (until - now).num_seconds().max(0);
+    if rem_secs < 60 {
+        format!("Snoozed ({}s)", rem_secs)
+    } else {
+        format!("Snoozed ({}m)", (rem_secs + 59) / 60)
+    }
+}
+
+
+/// Parses a 6-digit (`#RRGGBB`) or 8-digit (`#RRGGBBAA`) hexadecimal color string into a Slint `Color`.
+pub fn parse_hex_color(hex: &str) -> Option<Color> {
+    let s = hex.trim().strip_prefix('#')?;
+    let r = u8::from_str_radix(s.get(0..2)?, 16).ok()?;
+    let g = u8::from_str_radix(s.get(2..4)?, 16).ok()?;
+    let b = u8::from_str_radix(s.get(4..6)?, 16).ok()?;
+    match s.len() {
+        6 => Some(Color::from_rgb_u8(r, g, b)),
+        8 => {
+            let a = u8::from_str_radix(s.get(6..8)?, 16).ok()?;
+            Some(Color::from_argb_u8(a, r, g, b))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
