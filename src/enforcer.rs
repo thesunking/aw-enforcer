@@ -27,6 +27,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, PostMessageW, WM_CLOSE,
 };
 
+// ============================================================================
+// Constants & Module Statics
+// ============================================================================
+
 /// Canonical list of known browser executables used for URL rules and tab-closing actions.
 pub const BROWSER_EXES: &[&str] = &[
     "chrome.exe",
@@ -44,248 +48,6 @@ pub const BROWSER_EXES: &[&str] = &[
     "thorium.exe",
 ];
 
-/// Helper retrieving the process ID owning the given window handle.
-#[inline]
-unsafe fn get_window_pid(hwnd: HWND) -> u32 {
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    pid
-}
-
-/// Helper retrieving the window title as a UTF-8 string on a 512-word stack buffer.
-unsafe fn get_window_title(hwnd: HWND) -> String {
-    let mut title_buf = [0u16; 512];
-    let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
-    if len > 0 {
-        String::from_utf16_lossy(&title_buf[..len as usize])
-    } else {
-        String::new()
-    }
-}
-
-/// Helper retrieving the executable name of the process owning the given window handle.
-#[inline]
-unsafe fn get_window_process_name(hwnd: HWND) -> Option<String> {
-    get_process_name_by_pid(get_window_pid(hwnd))
-}
-
-/// Helper to post WM_CLOSE to a window with logging.
-unsafe fn post_wm_close(hwnd: HWND, title: Option<&str>) -> bool {
-    if let Some(t) = title {
-        tracing::info!(
-            "Posting WM_CLOSE to matching window (HWND: {:?}, Title: '{}')",
-            hwnd,
-            t
-        );
-    }
-    if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
-        true
-    } else {
-        tracing::warn!(
-            "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
-            hwnd
-        );
-        false
-    }
-}
-
-/// Returns the process executable name (or non-empty title fallback) of the current foreground window,
-/// returning None if there is no foreground window, or if it is a protected shell / application window.
-pub fn get_foreground_app_name() -> Option<String> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if is_protected_foreground_window(hwnd) {
-            return None;
-        }
-
-        if let Some(exe_name) = get_window_process_name(hwnd) {
-            if !exe_name.trim().is_empty() {
-                return Some(exe_name);
-            }
-        }
-
-        let title = get_window_title(hwnd);
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            Some(trimmed.to_string())
-        } else {
-            None
-        }
-    }
-}
-
-/// Checks if the current foreground window is a non-protected window belonging to an executable in `BROWSER_EXES`.
-pub fn is_foreground_browser() -> bool {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if is_protected_foreground_window(hwnd) {
-            return false;
-        }
-        get_window_process_name(hwnd)
-            .map_or(false, |exe| exe_name_matches_targets(&exe, BROWSER_EXES))
-    }
-}
-
-/// Trims whitespace, strips any leading directory path, and returns `(basename, stem_without_exe)`
-/// handling case-insensitive `.exe` suffixes.
-pub fn normalize_exe_stem(name: &str) -> (&str, &str) {
-    let trimmed = name.trim();
-    let basename = match trimmed.rsplit_once(['\\', '/']) {
-        Some((_, base)) => base.trim(),
-        None => trimmed,
-    };
-    let stem = if basename.len() >= 4 && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe") {
-        &basename[..basename.len() - 4]
-    } else {
-        basename
-    };
-    (basename, stem)
-}
-
-#[inline]
-fn stem_or_base_matches(
-    exe_base: &str,
-    exe_stem: &str,
-    target_base: &str,
-    target_stem: &str,
-) -> bool {
-    exe_base.eq_ignore_ascii_case(target_base)
-        || exe_base.eq_ignore_ascii_case(target_stem)
-        || exe_stem.eq_ignore_ascii_case(target_base)
-        || exe_stem.eq_ignore_ascii_case(target_stem)
-}
-
-/// Returns true if `exe_name` matches any `!`-prefixed exclusion entry in `target_executables`.
-pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &[S]) -> bool {
-    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
-    if exe_base.is_empty() {
-        return false;
-    }
-    for target in target_executables {
-        let t = target.as_ref().trim();
-        if let Some(rest) = t.strip_prefix('!') {
-            let (target_base, target_stem) = normalize_exe_stem(rest);
-            if !target_base.is_empty()
-                && stem_or_base_matches(exe_base, exe_stem, target_base, target_stem)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`),
-/// respecting `!`-prefixed exclusion entries.
-pub fn exe_name_matches_targets<S: AsRef<str>>(
-    exe_name: &str,
-    target_executables: &[S],
-) -> bool {
-    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
-    if exe_base.is_empty() || target_executables.is_empty() {
-        return false;
-    }
-
-    if exe_name_is_excluded(exe_name, target_executables) {
-        return false;
-    }
-
-    let has_exclusions = has_exclusion_targets(target_executables);
-    let has_pos_specific = has_specific_targets(target_executables);
-    let has_wildcard = has_wildcard_target(target_executables);
-
-    if has_exclusions && (has_wildcard || !has_pos_specific) {
-        return true;
-    }
-
-    for target in target_executables {
-        let t = target.as_ref().trim();
-        if t.is_empty() || t == "*" || t.starts_with('!') {
-            continue;
-        }
-        let (t_base, t_stem) = normalize_exe_stem(t);
-        if !t_base.is_empty() && stem_or_base_matches(exe_base, exe_stem, t_base, t_stem) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Iterates over all running processes via a Win32 ToolHelp snapshot, invoking `f(pid, exe_name)`.
-pub fn for_each_process(mut f: impl FnMut(u32, &str)) {
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
-            return;
-        }
-
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                f(entry.th32ProcessID, &exe_name);
-
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-
-        CloseHandle(snapshot);
-    }
-}
-
-/// Retrieves the executable file name for a process ID using `QueryFullProcessImageNameW` on a stack buffer.
-pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
-    if pid == 0 {
-        return None;
-    }
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return None;
-        }
-
-        let mut buf = [0u16; 1024];
-        let mut size = buf.len() as u32;
-        let success = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
-
-        if success != 0 && size > 0 {
-            let full_path = String::from_utf16_lossy(&buf[..size as usize]);
-            let exe_name = full_path
-                .rsplit_once('\\')
-                .map(|(_, name)| name)
-                .unwrap_or(&full_path);
-            Some(exe_name.to_string())
-        } else {
-            None
-        }
-    }
-}
-
-/// Returns true if Windows reports a fullscreen D3D app, presentation mode, busy fullscreen app, or Focus Assist quiet time.
-pub fn is_fullscreen_or_presentation_active() -> bool {
-    unsafe {
-        let mut state: i32 = 0;
-        if SHQueryUserNotificationState(&mut state) == 0 {
-            matches!(
-                state,
-                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_BUSY | QUNS_QUIET_TIME
-            )
-        } else {
-            false
-        }
-    }
-}
-
 /// Application User Model ID (AUMID) used for native Windows Action Center notifications.
 pub const APP_AUMID: &str = "AW-Enforcer";
 /// Display name associated with the AUMID shown in Windows notification headers.
@@ -294,54 +56,148 @@ const AUMID_REG_PATH: &str = r"Software\Classes\AppUserModelId\AW-Enforcer";
 
 static AUMID_REGISTERED: Once = Once::new();
 
-/// Registers the application user model ID (AUMID) in the Windows Registry under
-/// `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` so that native Action Center
-/// toast notifications display "AW-Enforcer" as the header instead of "Windows PowerShell".
-pub fn register_app_user_model_id() -> Result<(), Box<dyn std::error::Error>> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu.create_subkey(AUMID_REG_PATH)?;
-    key.set_value("DisplayName", &APP_DISPLAY_NAME)?;
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_str) = exe_path.to_str() {
-            let _ = key.set_value("IconUri", &exe_str);
-        }
-    }
-    tracing::info!("Registered AUMID '{}' in Windows Registry", APP_AUMID);
-    Ok(())
-}
-
-/// Ensures the application user model ID (AUMID) has been registered in the Windows Registry at least once.
-pub fn ensure_app_user_model_id_registered() {
-    AUMID_REGISTERED.call_once(|| {
-        if let Err(e) = register_app_user_model_id() {
-            tracing::warn!("Failed to register AUMID '{APP_AUMID}' in registry: {e}");
-        }
-    });
-}
-
 #[cfg(test)]
 static TEST_NOTIFICATIONS_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static LAST_TEST_NOTIFICATION: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
-#[cfg(test)]
-/// Returns the total count of native system notifications dispatched during tests.
-pub fn get_test_notifications_sent() -> usize {
-    TEST_NOTIFICATIONS_SENT.load(std::sync::atomic::Ordering::SeqCst)
+// ============================================================================
+// High-Level Enforcement Actions
+// ============================================================================
+
+/// Closes top-level visible windows matching target executables or title regex by sending WM_CLOSE.
+pub fn close_target_windows<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+) -> usize {
+    let is_wildcard = compiled_regex.is_none() && has_wildcard_target(target_executables);
+    if is_wildcard {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if !is_protected_foreground_window(hwnd) {
+                if let Some(exe_name) = get_window_process_name(hwnd) {
+                    if exe_name_is_excluded(&exe_name, target_executables) {
+                        return 0;
+                    }
+                }
+                if post_wm_close(hwnd, None) {
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+    scan_windows(target_executables, compiled_regex, true).0
 }
 
-#[cfg(test)]
-/// Returns the most recently dispatched native system notification (title, message) in test mode.
-pub fn get_last_test_notification() -> Option<(String, String)> {
-    LAST_TEST_NOTIFICATION.lock().unwrap().clone()
+/// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
+/// returns true if Ctrl+W was sent.
+pub fn close_active_browser_tab<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+) -> bool {
+    if find_matching_foreground_window(target_executables, compiled_regex).is_some() {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let make_key = |vk: u16, flags: u32| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        wScan: 0,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            let inputs = [
+                make_key(VK_SHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_LSHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_RSHIFT, KEYEVENTF_KEYUP),
+                make_key(VK_MENU, KEYEVENTF_KEYUP),
+                make_key(VK_LMENU, KEYEVENTF_KEYUP),
+                make_key(VK_RMENU, KEYEVENTF_KEYUP),
+                make_key(VK_LWIN, KEYEVENTF_KEYUP),
+                make_key(VK_RWIN, KEYEVENTF_KEYUP),
+                make_key(VK_CONTROL, 0),
+                make_key(b'W' as u16, 0),
+                make_key(b'W' as u16, KEYEVENTF_KEYUP),
+                make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+                make_key(VK_LCONTROL, KEYEVENTF_KEYUP),
+                make_key(VK_RCONTROL, KEYEVENTF_KEYUP),
+            ];
+            let sent = SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+            if sent == 0 {
+                tracing::warn!(
+                    "SendInput(Ctrl+W) failed or was blocked by UIPI on HWND {:?}",
+                    hwnd
+                );
+                return false;
+            }
+            tracing::info!("Sent Ctrl+W to close active tab on HWND {:?}", hwnd);
+            return true;
+        }
+    }
+    false
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-/// Resets test notification tracking counters and records.
-pub fn reset_test_notifications() {
-    TEST_NOTIFICATIONS_SENT.store(0, std::sync::atomic::Ordering::SeqCst);
-    *LAST_TEST_NOTIFICATION.lock().unwrap() = None;
+/// Terminates processes matching target executables via Win32 ToolHelp snapshot.
+pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
+    if target_executables.is_empty() || !has_specific_targets(target_executables) {
+        return 0;
+    }
+
+    let my_pid = unsafe { GetCurrentProcessId() };
+    let mut killed_count = 0;
+
+    for_each_process(|pid, exe_name| {
+        if pid == my_pid || pid == 0 {
+            return;
+        }
+
+        // Never allow wildcard "*" to terminate all system processes
+        if exe_name_matches_targets(exe_name, target_executables) {
+            #[cfg(test)]
+            {
+                killed_count += 1;
+            }
+            #[cfg(not(test))]
+            {
+                tracing::info!(
+                    "Terminating target process: {} (PID: {})",
+                    exe_name,
+                    pid
+                );
+                unsafe {
+                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !h_proc.is_null() {
+                        if TerminateProcess(h_proc, 1) != 0 {
+                            killed_count += 1;
+                        }
+                        CloseHandle(h_proc);
+                    }
+                }
+            }
+        }
+    });
+
+    killed_count
+}
+
+/// Locks the Windows workstation immediately.
+pub fn lock_workstation() -> bool {
+    tracing::info!("Locking workstation via LockWorkStation()");
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
 }
 
 /// Sends a passive native Windows notification via WinRT using the branded AUMID.
@@ -380,69 +236,238 @@ pub fn send_system_notification(title: &str, message: &str) {
     }
 }
 
-/// Locks the Windows workstation immediately.
-pub fn lock_workstation() -> bool {
-    tracing::info!("Locking workstation via LockWorkStation()");
-    #[cfg(test)]
-    {
-        true
-    }
-    #[cfg(not(test))]
-    unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() != 0 }
+/// Ensures the application user model ID (AUMID) has been registered in the Windows Registry at least once.
+pub fn ensure_app_user_model_id_registered() {
+    AUMID_REGISTERED.call_once(|| {
+        if let Err(e) = register_app_user_model_id() {
+            tracing::warn!("Failed to register AUMID '{APP_AUMID}' in registry: {e}");
+        }
+    });
 }
 
-const PROTECTED_CLASSES: &[&str] = &[
-    "Progman",
-    "WorkerW",
-    "Shell_TrayWnd",
-    "Shell_SecondaryTrayWnd",
-    "NotifyIconOverflowWindow",
-    "TopLevelWindowForOverflowXamlIsland",
-    "MultitaskingViewFrame",
-    "Windows.UI.Core.CoreWindow",
-    "XamlExplorerHostIslandWindow",
-    "ForegroundStaging",
-];
-
-#[inline]
-fn utf16_matches_ascii(utf16: &[u16], ascii: &str) -> bool {
-    utf16.len() == ascii.len()
-        && utf16
-            .iter()
-            .zip(ascii.bytes())
-            .all(|(&u, b)| u == b as u16)
+/// Registers the application user model ID (AUMID) in the Windows Registry under
+/// `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` so that native Action Center
+/// toast notifications display "AW-Enforcer" as the header instead of "Windows PowerShell".
+pub fn register_app_user_model_id() -> Result<(), Box<dyn std::error::Error>> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(AUMID_REG_PATH)?;
+    key.set_value("DisplayName", &APP_DISPLAY_NAME)?;
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_str) = exe_path.to_str() {
+            let _ = key.set_value("IconUri", &exe_str);
+        }
+    }
+    tracing::info!("Registered AUMID '{}' in Windows Registry", APP_AUMID);
+    Ok(())
 }
 
-/// Returns true if the UTF-16 class name corresponds to a protected Windows shell class without heap allocation.
-pub fn is_protected_window_class(class_name: &[u16]) -> bool {
-    PROTECTED_CLASSES
-        .iter()
-        .any(|&cls| utf16_matches_ascii(class_name, cls))
+#[cfg(test)]
+/// Returns the total count of native system notifications dispatched during tests.
+pub fn get_test_notifications_sent() -> usize {
+    TEST_NOTIFICATIONS_SENT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Returns true if the window is invalid, invisible, owned by current process, or a Windows shell surface.
-/// Does not reject minimized (iconic) windows.
-unsafe fn is_protected_window_base(hwnd: HWND) -> bool {
-    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
-        return true;
-    }
-
-    if get_window_pid(hwnd) == GetCurrentProcessId() {
-        return true;
-    }
-
-    let mut class_buf = [0u16; 256];
-    let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
-    if len > 0 && is_protected_window_class(&class_buf[..len as usize]) {
-        return true;
-    }
-
-    false
+#[cfg(test)]
+/// Returns the most recently dispatched native system notification (title, message) in test mode.
+pub fn get_last_test_notification() -> Option<(String, String)> {
+    LAST_TEST_NOTIFICATION.lock().unwrap().clone()
 }
 
-/// Returns true if the window is protected, invisible, owned by current process, a shell surface, or minimized.
-unsafe fn is_protected_foreground_window(hwnd: HWND) -> bool {
-    is_protected_window_base(hwnd) || IsIconic(hwnd) != 0
+#[cfg(test)]
+#[allow(dead_code)]
+/// Resets test notification tracking counters and records.
+pub fn reset_test_notifications() {
+    TEST_NOTIFICATIONS_SENT.store(0, std::sync::atomic::Ordering::SeqCst);
+    *LAST_TEST_NOTIFICATION.lock().unwrap() = None;
+}
+
+// ============================================================================
+// High-Level Window & Process Inspection Queries
+// ============================================================================
+
+/// Returns the process executable name (or non-empty title fallback) of the current foreground window,
+/// returning None if there is no foreground window, or if it is a protected shell / application window.
+pub fn get_foreground_app_name() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if is_protected_foreground_window(hwnd) {
+            return None;
+        }
+
+        if let Some(exe_name) = get_window_process_name(hwnd) {
+            if !exe_name.trim().is_empty() {
+                return Some(exe_name);
+            }
+        }
+
+        let title = get_window_title(hwnd);
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// Checks if the current foreground window is a non-protected window belonging to an executable in `BROWSER_EXES`.
+pub fn is_foreground_browser() -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if is_protected_foreground_window(hwnd) {
+            return false;
+        }
+        get_window_process_name(hwnd)
+            .map_or(false, |exe| exe_name_matches_targets(&exe, BROWSER_EXES))
+    }
+}
+
+/// Inspects the current foreground window (`GetForegroundWindow`).
+/// Returns `None` if the foreground window is protected, minimized, or does not match the target executables and/or compiled regex.
+/// Otherwise, returns `Some(window_title)` or `Some(process_name)`.
+pub fn find_matching_foreground_window<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+) -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if is_protected_foreground_window(hwnd) {
+            return None;
+        }
+
+        let fg_exe = get_window_process_name(hwnd);
+        if let Some(ref exe) = fg_exe {
+            if exe_name_is_excluded(exe, target_executables) {
+                return None;
+            }
+        }
+
+        let has_wildcard = has_wildcard_target(target_executables);
+        let has_exe_targets = has_specific_targets(target_executables);
+
+        let window_title = get_window_title(hwnd);
+
+        let title_matches = match compiled_regex {
+            Some(re) => !window_title.is_empty() && re.is_match(&window_title),
+            None => false,
+        };
+
+        if compiled_regex.is_some() && !title_matches {
+            return None;
+        }
+
+        let mut matched_exe_name = None;
+        let exe_matches = if has_exe_targets {
+            if let Some(exe_name) = fg_exe {
+                let matches = exe_name_matches_targets(&exe_name, target_executables);
+                if matches {
+                    matched_exe_name = Some(exe_name);
+                }
+                matches
+            } else {
+                false
+            }
+        } else {
+            has_wildcard
+        };
+
+        let matches = match (compiled_regex.is_some(), has_exe_targets) {
+            (true, true) => title_matches && exe_matches,
+            (true, false) => title_matches && (exe_matches || target_executables.is_empty()),
+            (false, true) => exe_matches,
+            (false, false) => has_wildcard,
+        };
+
+        if matches {
+            if !window_title.is_empty() {
+                Some(window_title)
+            } else if let Some(exe) = matched_exe_name {
+                Some(exe)
+            } else {
+                get_window_process_name(hwnd).or_else(|| Some("foreground_window".to_string()))
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Finds the first matching visible top-level window (including minimized taskbar windows) and returns the matched title or process name.
+pub fn find_matching_window<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+) -> Option<String> {
+    scan_windows(target_executables, compiled_regex, false).1
+}
+
+/// Finds the first running process matching `target_executables` via ToolHelp snapshot,
+/// skipping PID 0 and the current process ID. Returns `None` if targets are empty or wildcard.
+pub fn find_matching_process<S: AsRef<str>>(target_executables: &[S]) -> Option<String> {
+    if target_executables.is_empty() || !has_specific_targets(target_executables) {
+        return None;
+    }
+
+    let my_pid = unsafe { GetCurrentProcessId() };
+    let mut matched_exe = None;
+
+    for_each_process(|pid, exe_name| {
+        if matched_exe.is_some() || pid == my_pid || pid == 0 {
+            return;
+        }
+
+        if exe_name_matches_targets(exe_name, target_executables) {
+            matched_exe = Some(exe_name.to_string());
+        }
+    });
+
+    matched_exe
+}
+
+/// Returns true if Windows reports a fullscreen D3D app, presentation mode, busy fullscreen app, or Focus Assist quiet time.
+pub fn is_fullscreen_or_presentation_active() -> bool {
+    unsafe {
+        let mut state: i32 = 0;
+        if SHQueryUserNotificationState(&mut state) == 0 {
+            matches!(
+                state,
+                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_BUSY | QUNS_QUIET_TIME
+            )
+        } else {
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Window Enumeration & Protection Engine
+// ============================================================================
+
+/// Enumerates top-level windows, optionally sending `WM_CLOSE` to matches, and returns `(matched_count, first_matched_name)`.
+fn scan_windows<S: AsRef<str>>(
+    target_executables: &[S],
+    compiled_regex: Option<&Regex>,
+    close_matched: bool,
+) -> (usize, Option<String>) {
+    let has_exe_targets = has_specific_targets(target_executables);
+
+    let mut ctx = EnumMatchContext {
+        target_executables,
+        compiled_regex,
+        has_exe_targets,
+        close_matched,
+        matched_count: 0,
+        matched_name: None,
+        pid_cache: std::collections::HashMap::new(),
+    };
+
+    unsafe {
+        EnumWindows(
+            Some(enum_windows_callback::<S>),
+            &mut ctx as *mut EnumMatchContext<'_, S> as isize,
+        );
+    }
+
+    (ctx.matched_count, ctx.matched_name)
 }
 
 /// Context passed into the Win32 `EnumWindows` callback to match and optionally close top-level windows.
@@ -532,12 +557,160 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     1
 }
 
+/// Returns true if the window is protected, invisible, owned by current process, a shell surface, or minimized.
+unsafe fn is_protected_foreground_window(hwnd: HWND) -> bool {
+    is_protected_window_base(hwnd) || IsIconic(hwnd) != 0
+}
+
+/// Returns true if the window is invalid, invisible, owned by current process, or a Windows shell surface.
+/// Does not reject minimized (iconic) windows.
+unsafe fn is_protected_window_base(hwnd: HWND) -> bool {
+    if hwnd.is_null() || IsWindowVisible(hwnd) == 0 {
+        return true;
+    }
+
+    if get_window_pid(hwnd) == GetCurrentProcessId() {
+        return true;
+    }
+
+    let mut class_buf = [0u16; 256];
+    let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32);
+    if len > 0 && is_protected_window_class(&class_buf[..len as usize]) {
+        return true;
+    }
+
+    false
+}
+
+/// Returns true if the UTF-16 class name corresponds to a protected Windows shell class without heap allocation.
+pub fn is_protected_window_class(class_name: &[u16]) -> bool {
+    PROTECTED_CLASSES
+        .iter()
+        .any(|&cls| utf16_matches_ascii(class_name, cls))
+}
+
+#[inline]
+fn utf16_matches_ascii(utf16: &[u16], ascii: &str) -> bool {
+    utf16.len() == ascii.len()
+        && utf16
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(&u, b)| u == b as u16)
+}
+
+const PROTECTED_CLASSES: &[&str] = &[
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland",
+    "MultitaskingViewFrame",
+    "Windows.UI.Core.CoreWindow",
+    "XamlExplorerHostIslandWindow",
+    "ForegroundStaging",
+];
+
+// ============================================================================
+// Target Matching & Filtering Predicates
+// ============================================================================
+
+/// Checks if `exe_name` matches any target in `target_executables` (case-insensitive, with or without `.exe`),
+/// respecting `!`-prefixed exclusion entries.
+pub fn exe_name_matches_targets<S: AsRef<str>>(
+    exe_name: &str,
+    target_executables: &[S],
+) -> bool {
+    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
+    if exe_base.is_empty() || target_executables.is_empty() {
+        return false;
+    }
+
+    if exe_name_is_excluded(exe_name, target_executables) {
+        return false;
+    }
+
+    let has_exclusions = has_exclusion_targets(target_executables);
+    let has_pos_specific = has_specific_targets(target_executables);
+    let has_wildcard = has_wildcard_target(target_executables);
+
+    if has_exclusions && (has_wildcard || !has_pos_specific) {
+        return true;
+    }
+
+    for target in target_executables {
+        let t = target.as_ref().trim();
+        if t.is_empty() || t == "*" || t.starts_with('!') {
+            continue;
+        }
+        let (t_base, t_stem) = normalize_exe_stem(t);
+        if !t_base.is_empty() && stem_or_base_matches(exe_base, exe_stem, t_base, t_stem) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `exe_name` matches any `!`-prefixed exclusion entry in `target_executables`.
+pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &[S]) -> bool {
+    let (exe_base, exe_stem) = normalize_exe_stem(exe_name);
+    if exe_base.is_empty() {
+        return false;
+    }
+    for target in target_executables {
+        let t = target.as_ref().trim();
+        if let Some(rest) = t.strip_prefix('!') {
+            let (target_base, target_stem) = normalize_exe_stem(rest);
+            if !target_base.is_empty()
+                && stem_or_base_matches(exe_base, exe_stem, target_base, target_stem)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline]
+fn stem_or_base_matches(
+    exe_base: &str,
+    exe_stem: &str,
+    target_base: &str,
+    target_stem: &str,
+) -> bool {
+    exe_base.eq_ignore_ascii_case(target_base)
+        || exe_base.eq_ignore_ascii_case(target_stem)
+        || exe_stem.eq_ignore_ascii_case(target_base)
+        || exe_stem.eq_ignore_ascii_case(target_stem)
+}
+
+/// Trims whitespace, strips any leading directory path, and returns `(basename, stem_without_exe)`
+/// handling case-insensitive `.exe` suffixes.
+pub fn normalize_exe_stem(name: &str) -> (&str, &str) {
+    let trimmed = name.trim();
+    let basename = match trimmed.rsplit_once(['\\', '/']) {
+        Some((_, base)) => base.trim(),
+        None => trimmed,
+    };
+    let stem = if basename.len() >= 4 && basename[basename.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &basename[..basename.len() - 4]
+    } else {
+        basename
+    };
+    (basename, stem)
+}
+
 /// Returns true if `targets` contains at least one non-empty, non-wildcard, non-exclusion executable entry.
 pub fn has_specific_targets<S: AsRef<str>>(targets: &[S]) -> bool {
     targets.iter().any(|t| {
         let s = t.as_ref().trim();
         !s.is_empty() && s != "*" && !s.starts_with('!')
     })
+}
+
+/// Returns true if `targets` contains a wildcard `"*"` entry.
+pub fn has_wildcard_target<S: AsRef<str>>(targets: &[S]) -> bool {
+    targets.iter().any(|t| t.as_ref().trim() == "*")
 }
 
 /// Returns true if `targets` contains at least one non-empty `!`-prefixed exclusion entry.
@@ -548,263 +721,118 @@ pub fn has_exclusion_targets<S: AsRef<str>>(targets: &[S]) -> bool {
     })
 }
 
-/// Returns true if `targets` contains a wildcard `"*"` entry.
-pub fn has_wildcard_target<S: AsRef<str>>(targets: &[S]) -> bool {
-    targets.iter().any(|t| t.as_ref().trim() == "*")
-}
+// ============================================================================
+// Low-Level Win32 Process & Window Primitives
+// ============================================================================
 
-/// Enumerates top-level windows, optionally sending `WM_CLOSE` to matches, and returns `(matched_count, first_matched_name)`.
-fn scan_windows<S: AsRef<str>>(
-    target_executables: &[S],
-    compiled_regex: Option<&Regex>,
-    close_matched: bool,
-) -> (usize, Option<String>) {
-    let has_exe_targets = has_specific_targets(target_executables);
-
-    let mut ctx = EnumMatchContext {
-        target_executables,
-        compiled_regex,
-        has_exe_targets,
-        close_matched,
-        matched_count: 0,
-        matched_name: None,
-        pid_cache: std::collections::HashMap::new(),
-    };
-
+/// Iterates over all running processes via a Win32 ToolHelp snapshot, invoking `f(pid, exe_name)`.
+pub fn for_each_process(mut f: impl FnMut(u32, &str)) {
     unsafe {
-        EnumWindows(
-            Some(enum_windows_callback::<S>),
-            &mut ctx as *mut EnumMatchContext<'_, S> as isize,
-        );
-    }
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return;
+        }
 
-    (ctx.matched_count, ctx.matched_name)
-}
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
 
-/// Closes top-level visible windows matching target executables or title regex by sending WM_CLOSE.
-pub fn close_target_windows<S: AsRef<str>>(
-    target_executables: &[S],
-    compiled_regex: Option<&Regex>,
-) -> usize {
-    let is_wildcard = compiled_regex.is_none() && has_wildcard_target(target_executables);
-    if is_wildcard {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if !is_protected_foreground_window(hwnd) {
-                if let Some(exe_name) = get_window_process_name(hwnd) {
-                    if exe_name_is_excluded(&exe_name, target_executables) {
-                        return 0;
-                    }
-                }
-                if post_wm_close(hwnd, None) {
-                    return 1;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                f(entry.th32ProcessID, &exe_name);
+
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
                 }
             }
         }
-        return 0;
+
+        CloseHandle(snapshot);
     }
-    scan_windows(target_executables, compiled_regex, true).0
 }
 
-/// Finds the first matching visible top-level window (including minimized taskbar windows) and returns the matched title or process name.
-pub fn find_matching_window<S: AsRef<str>>(
-    target_executables: &[S],
-    compiled_regex: Option<&Regex>,
-) -> Option<String> {
-    scan_windows(target_executables, compiled_regex, false).1
-}
-
-/// Finds the first running process matching `target_executables` via ToolHelp snapshot,
-/// skipping PID 0 and the current process ID. Returns `None` if targets are empty or wildcard.
-pub fn find_matching_process<S: AsRef<str>>(target_executables: &[S]) -> Option<String> {
-    if target_executables.is_empty() || !has_specific_targets(target_executables) {
+/// Retrieves the executable file name for a process ID using `QueryFullProcessImageNameW` on a stack buffer.
+pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    if pid == 0 {
         return None;
     }
-
-    let my_pid = unsafe { GetCurrentProcessId() };
-    let mut matched_exe = None;
-
-    for_each_process(|pid, exe_name| {
-        if matched_exe.is_some() || pid == my_pid || pid == 0 {
-            return;
-        }
-
-        if exe_name_matches_targets(exe_name, target_executables) {
-            matched_exe = Some(exe_name.to_string());
-        }
-    });
-
-    matched_exe
-}
-
-/// Terminates processes matching target executables via Win32 ToolHelp snapshot.
-pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
-    if target_executables.is_empty() || !has_specific_targets(target_executables) {
-        return 0;
-    }
-
-    let my_pid = unsafe { GetCurrentProcessId() };
-    let mut killed_count = 0;
-
-    for_each_process(|pid, exe_name| {
-        if pid == my_pid || pid == 0 {
-            return;
-        }
-
-        // Never allow wildcard "*" to terminate all system processes
-        if exe_name_matches_targets(exe_name, target_executables) {
-            #[cfg(test)]
-            {
-                killed_count += 1;
-            }
-            #[cfg(not(test))]
-            {
-                tracing::info!(
-                    "Terminating target process: {} (PID: {})",
-                    exe_name,
-                    pid
-                );
-                unsafe {
-                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                    if !h_proc.is_null() {
-                        if TerminateProcess(h_proc, 1) != 0 {
-                            killed_count += 1;
-                        }
-                        CloseHandle(h_proc);
-                    }
-                }
-            }
-        }
-    });
-
-    killed_count
-}
-
-/// Inspects the current foreground window (`GetForegroundWindow`).
-/// Returns `None` if the foreground window is protected, minimized, or does not match the target executables and/or compiled regex.
-/// Otherwise, returns `Some(window_title)` or `Some(process_name)`.
-pub fn find_matching_foreground_window<S: AsRef<str>>(
-    target_executables: &[S],
-    compiled_regex: Option<&Regex>,
-) -> Option<String> {
     unsafe {
-        let hwnd = GetForegroundWindow();
-        if is_protected_foreground_window(hwnd) {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
             return None;
         }
 
-        let fg_exe = get_window_process_name(hwnd);
-        if let Some(ref exe) = fg_exe {
-            if exe_name_is_excluded(exe, target_executables) {
-                return None;
-            }
-        }
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let success = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
 
-        let has_wildcard = has_wildcard_target(target_executables);
-        let has_exe_targets = has_specific_targets(target_executables);
-
-        let window_title = get_window_title(hwnd);
-
-        let title_matches = match compiled_regex {
-            Some(re) => !window_title.is_empty() && re.is_match(&window_title),
-            None => false,
-        };
-
-        if compiled_regex.is_some() && !title_matches {
-            return None;
-        }
-
-        let mut matched_exe_name = None;
-        let exe_matches = if has_exe_targets {
-            if let Some(exe_name) = fg_exe {
-                let matches = exe_name_matches_targets(&exe_name, target_executables);
-                if matches {
-                    matched_exe_name = Some(exe_name);
-                }
-                matches
-            } else {
-                false
-            }
-        } else {
-            has_wildcard
-        };
-
-        let matches = match (compiled_regex.is_some(), has_exe_targets) {
-            (true, true) => title_matches && exe_matches,
-            (true, false) => title_matches && (exe_matches || target_executables.is_empty()),
-            (false, true) => exe_matches,
-            (false, false) => has_wildcard,
-        };
-
-        if matches {
-            if !window_title.is_empty() {
-                Some(window_title)
-            } else if let Some(exe) = matched_exe_name {
-                Some(exe)
-            } else {
-                get_window_process_name(hwnd).or_else(|| Some("foreground_window".to_string()))
-            }
+        if success != 0 && size > 0 {
+            let full_path = String::from_utf16_lossy(&buf[..size as usize]);
+            let exe_name = full_path
+                .rsplit_once('\\')
+                .map(|(_, name)| name)
+                .unwrap_or(&full_path);
+            Some(exe_name.to_string())
         } else {
             None
         }
     }
 }
 
-/// Sends Ctrl+W to close the active tab if the foreground window matches the target criteria;
-/// returns true if Ctrl+W was sent.
-pub fn close_active_browser_tab<S: AsRef<str>>(
-    target_executables: &[S],
-    compiled_regex: Option<&Regex>,
-) -> bool {
-    if find_matching_foreground_window(target_executables, compiled_regex).is_some() {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            let make_key = |vk: u16, flags: u32| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: vk,
-                        wScan: 0,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            };
-            let inputs = [
-                make_key(VK_SHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_LSHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_RSHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_MENU, KEYEVENTF_KEYUP),
-                make_key(VK_LMENU, KEYEVENTF_KEYUP),
-                make_key(VK_RMENU, KEYEVENTF_KEYUP),
-                make_key(VK_LWIN, KEYEVENTF_KEYUP),
-                make_key(VK_RWIN, KEYEVENTF_KEYUP),
-                make_key(VK_CONTROL, 0),
-                make_key(b'W' as u16, 0),
-                make_key(b'W' as u16, KEYEVENTF_KEYUP),
-                make_key(VK_CONTROL, KEYEVENTF_KEYUP),
-                make_key(VK_LCONTROL, KEYEVENTF_KEYUP),
-                make_key(VK_RCONTROL, KEYEVENTF_KEYUP),
-            ];
-            let sent = SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
-                std::mem::size_of::<INPUT>() as i32,
-            );
-            if sent == 0 {
-                tracing::warn!(
-                    "SendInput(Ctrl+W) failed or was blocked by UIPI on HWND {:?}",
-                    hwnd
-                );
-                return false;
-            }
-            tracing::info!("Sent Ctrl+W to close active tab on HWND {:?}", hwnd);
-            return true;
-        }
-    }
-    false
+/// Helper retrieving the process ID owning the given window handle.
+#[inline]
+unsafe fn get_window_pid(hwnd: HWND) -> u32 {
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    pid
 }
+
+/// Helper retrieving the executable name of the process owning the given window handle.
+#[inline]
+unsafe fn get_window_process_name(hwnd: HWND) -> Option<String> {
+    get_process_name_by_pid(get_window_pid(hwnd))
+}
+
+/// Helper retrieving the window title as a UTF-8 string on a 512-word stack buffer.
+unsafe fn get_window_title(hwnd: HWND) -> String {
+    let mut title_buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32);
+    if len > 0 {
+        String::from_utf16_lossy(&title_buf[..len as usize])
+    } else {
+        String::new()
+    }
+}
+
+/// Helper to post WM_CLOSE to a window with logging.
+unsafe fn post_wm_close(hwnd: HWND, title: Option<&str>) -> bool {
+    if let Some(t) = title {
+        tracing::info!(
+            "Posting WM_CLOSE to matching window (HWND: {:?}, Title: '{}')",
+            hwnd,
+            t
+        );
+    }
+    if PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0 {
+        true
+    } else {
+        tracing::warn!(
+            "PostMessageW(WM_CLOSE) failed or was blocked by UIPI on HWND {:?}",
+            hwnd
+        );
+        false
+    }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
