@@ -1748,14 +1748,7 @@ impl Engine {
                         if event_matches_rule(ev, rule, compiled_re) {
                             rt.last_matched_url = ev.data.url.clone();
                             if let Some(url_str) = ev.data.url.as_deref() {
-                                let host = url_str
-                                    .strip_prefix("https://")
-                                    .or_else(|| url_str.strip_prefix("http://"))
-                                    .unwrap_or(url_str)
-                                    .split('/')
-                                    .next()
-                                    .unwrap_or(url_str);
-                                rt.last_matched_app = Some(host.to_string());
+                                rt.last_matched_app = Some(extract_url_host(url_str));
                             }
                             if let Some(ref title) = ev.data.title {
                                 if !title.trim().is_empty() {
@@ -1879,14 +1872,7 @@ impl Engine {
                     if rule.monitor_selection == MonitorSelection::Urls {
                         rt.last_matched_url = ev.data.url.clone();
                         if let Some(url_str) = ev.data.url.as_deref() {
-                            let host = url_str
-                                .strip_prefix("https://")
-                                .or_else(|| url_str.strip_prefix("http://"))
-                                .unwrap_or(url_str)
-                                .split('/')
-                                .next()
-                                .unwrap_or(url_str);
-                            rt.last_matched_app = Some(host.to_string());
+                            rt.last_matched_app = Some(extract_url_host(url_str));
                         }
                     } else if let Some(ref app) = ev.data.app {
                         rt.last_matched_app = Some(app.clone());
@@ -2636,6 +2622,39 @@ pub fn event_end_utc(ev: &AwEvent) -> DateTime<Utc> {
     ev.timestamp + Duration::milliseconds((ev.duration * 1000.0) as i64)
 }
 
+/// Extracts the hostname/authority or top-level component from a URL string, stripping
+/// scheme prefixes (HTTP, HTTPS, custom schemes like chrome:// or file://), query parameters,
+/// and credentials.
+pub fn extract_url_host(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = after_scheme
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or(after_scheme);
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    if !host.is_empty() {
+        host.to_string()
+    } else {
+        after_scheme
+            .trim_start_matches('/')
+            .split(&['/', '?', '#'][..])
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(trimmed)
+            .to_string()
+    }
+}
+
 /// Helper checking whether a rule's URL regex matches the full URL (`last_matched_url`), or falls back to the hostname in `last_matched_app`.
 pub fn matched_url_or_app_matches_rule(
     url: Option<&str>,
@@ -2732,15 +2751,7 @@ pub fn find_matching_window_for_rule(
                         ev.data
                             .url
                             .as_deref()
-                            .map(|u| {
-                                u.strip_prefix("https://")
-                                    .or_else(|| u.strip_prefix("http://"))
-                                    .unwrap_or(u)
-                                    .split('/')
-                                    .next()
-                                    .unwrap_or(u)
-                                    .to_string()
-                            })
+                            .map(extract_url_host)
                             .or_else(|| ev.data.url.clone())
                             .unwrap_or(browser_match),
                     )
@@ -6773,5 +6784,44 @@ mod tests {
 
         let rt = engine.runtimes.get("rule-period-snoozed").unwrap();
         assert_eq!(rt.current_session_seconds, 1800, "Snoozed Period rule must still update current_session_seconds");
+    }
+
+    #[test]
+    fn test_extract_url_host_schemes_and_edge_cases() {
+        // Standard HTTP / HTTPS
+        assert_eq!(extract_url_host("http://example.com"), "example.com");
+        assert_eq!(extract_url_host("http://example.com/"), "example.com");
+        assert_eq!(extract_url_host("https://www.youtube.com/watch?v=123"), "www.youtube.com");
+        assert_eq!(extract_url_host("https://sub.domain.co.uk/path/to/page"), "sub.domain.co.uk");
+
+        // Uppercase HTTPS://
+        assert_eq!(extract_url_host("HTTPS://GITHUB.COM/OWNER/REPO"), "GITHUB.COM");
+        assert_eq!(extract_url_host("HTTP://WWW.EXAMPLE.COM/PATH"), "WWW.EXAMPLE.COM");
+
+        // Browser internal schemes
+        assert_eq!(extract_url_host("chrome://extensions/shortcuts"), "extensions");
+        assert_eq!(extract_url_host("edge://settings"), "settings");
+        assert_eq!(extract_url_host("brave://flags"), "flags");
+
+        // File scheme
+        assert_eq!(extract_url_host("file:///C:/Users/test.html"), "C:");
+
+        // URLs with query strings and fragments
+        assert_eq!(extract_url_host("https://example.com?query=1"), "example.com");
+        assert_eq!(extract_url_host("http://example.org#fragment"), "example.org");
+        assert_eq!(extract_url_host("example.com?foo=bar#section"), "example.com");
+
+        // Bare domains
+        assert_eq!(extract_url_host("reddit.com/r/rust"), "reddit.com");
+        assert_eq!(extract_url_host("crates.io"), "crates.io");
+        assert_eq!(extract_url_host("github.com/foo/bar"), "github.com");
+
+        // User credentials in authority
+        assert_eq!(extract_url_host("https://user:pass@secret.internal.net/admin"), "secret.internal.net");
+        assert_eq!(extract_url_host("http://admin@localhost:8080/metrics"), "localhost:8080");
+
+        // Empty and whitespace strings
+        assert_eq!(extract_url_host(""), "");
+        assert_eq!(extract_url_host("   "), "");
     }
 }
