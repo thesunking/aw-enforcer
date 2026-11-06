@@ -649,7 +649,7 @@ impl OverlayManager {
                         win.set_allow_snooze(*allow_snooze);
                         win.set_strict_mode(*strict_mode);
                         win.set_click_through(*click_through);
-                        win.set_is_user_idle(crate::engine::get_idle_time_millis() >= 3000);
+                        win.set_is_user_idle(crate::enforcer::get_idle_time_millis() >= 3000);
 
                         set_window_paragraphs(win, paragraphs);
                     }

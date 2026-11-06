@@ -4,8 +4,6 @@ use slint::Color;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use windows_sys::Win32::System::SystemInformation::GetTickCount;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
 use crate::aw_client::{AwClient, AwEvent};
 use crate::config::{
@@ -170,22 +168,7 @@ pub fn rule_message_fallback(rule: &Rule) -> &'static str {
     }
 }
 
-/// Returns physical user idle duration in milliseconds using GetLastInputInfo.
-/// Uses `wrapping_sub` to properly handle 32-bit `GetTickCount()` rollover after 49.7 days.
-pub fn get_idle_time_millis() -> u32 {
-    let mut lii = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    unsafe {
-        if GetLastInputInfo(&mut lii) != 0 {
-            let tick = GetTickCount();
-            tick.wrapping_sub(lii.dwTime)
-        } else {
-            0
-        }
-    }
-}
+pub use crate::enforcer::get_idle_time_millis;
 
 /// Resolves a `NaiveDateTime` to local timezone, safely handling DST gaps (spring-forward) and ambiguities (fall-back).
 fn resolve_local_ndt(ndt: NaiveDateTime) -> Option<DateTime<Local>> {

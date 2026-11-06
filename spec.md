@@ -92,6 +92,9 @@ flowchart TD
     ConfigDisk -.->|Automatic Backup on Corruption| ConfigBackup
 ```
 
+- **Win32 Enforcer Subsystem (`src/enforcer.rs`):** Centralizes all platform-specific Win32 FFI calls (`windows_sys`), including window enumeration (`EnumWindows`), process inspection and termination, simulated keyboard input (`SendInput`), workstation locking, fullscreen/presentation state querying (`SHQueryUserNotificationState`), physical user idle tracking (`GetLastInputInfo`, `GetTickCount`), and WinRT toast notifications.
+- **Rule Engine & State Machine (`src/engine.rs`):** Implemented in 100% safe Rust with zero direct Win32 FFI dependencies, evaluating telemetry against user-configured rules and delegating OS interactions to `src/enforcer.rs`.
+
 ### 3.2 Threading & Communication
 1. **Slint Event Loop (Main Thread):** Owns window handles, OpenGL/FemtoVG render contexts, and the Win32 message pump for the system tray. It periodically polls for activation events via a 250ms timer.
 2. **Tokio Async Engine Runtime (Background):** A 2-worker multithreaded Tokio runtime driving periodic polling ticks (`poll_interval_seconds`) and a 1-second high-resolution `realtime_tick()` timer.

@@ -8,6 +8,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -15,6 +16,7 @@ use windows_sys::Win32::System::Threading::{
 #[cfg(not(test))]
 use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetLastInputInfo, LASTINPUTINFO,
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_LCONTROL,
     VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
@@ -434,6 +436,23 @@ pub fn is_fullscreen_or_presentation_active() -> bool {
             )
         } else {
             false
+        }
+    }
+}
+
+/// Returns physical user idle duration in milliseconds using GetLastInputInfo.
+/// Uses `wrapping_sub` to properly handle 32-bit `GetTickCount()` rollover after 49.7 days.
+pub fn get_idle_time_millis() -> u32 {
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        if GetLastInputInfo(&mut lii) != 0 {
+            let tick = GetTickCount();
+            tick.wrapping_sub(lii.dwTime)
+        } else {
+            0
         }
     }
 }
@@ -979,5 +998,11 @@ mod tests {
             last,
             Some(("Test Alert".to_string(), "Testing notification suppression".to_string()))
         );
+    }
+
+    #[test]
+    fn test_get_idle_time_millis() {
+        // Safe query returning physical idle milliseconds without panic
+        let _idle = get_idle_time_millis();
     }
 }
