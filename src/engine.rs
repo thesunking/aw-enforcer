@@ -1072,17 +1072,23 @@ impl Engine {
                         .get(&rule.id)
                         .and_then(|r| r.last_matched_app.clone())
                         .or_else(|| enforcer::find_matching_window(enforcer::BROWSER_EXES, None))
+                        .unwrap_or_else(|| "Active Application".to_string())
                 } else {
-                    find_matching_window_for_rule(
+                    let win = find_matching_window_for_rule(
                         &rule,
                         re.as_ref(),
                         &[],
                         now.with_timezone(&Utc),
                         self.config.general.poll_interval_seconds,
-                    )
-                    .or_else(|| self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone()))
-                }
-                .unwrap_or_else(|| "Active Application".to_string());
+                    );
+                    let rt_app = self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone());
+                    match (win, rt_app) {
+                        (Some(ref w), Some(ref r)) if w == "Active Application" => r.clone(),
+                        (Some(w), _) => w,
+                        (None, Some(r)) => r,
+                        (None, None) => "Active Application".to_string(),
+                    }
+                };
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = rule.trigger_threshold_seconds();
                 let break_secs = rule.break_duration.to_seconds().max(1);
@@ -1269,11 +1275,16 @@ impl Engine {
                         .get(&rule.id)
                         .and_then(|r| r.last_matched_app.clone())
                         .or(target_window)
+                        .unwrap_or_else(|| "Active Application".to_string())
                 } else {
-                    target_window
-                        .or_else(|| self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone()))
-                }
-                .unwrap_or_else(|| "Active Application".to_string());
+                    let rt_app = self.runtimes.get(&rule.id).and_then(|r| r.last_matched_app.clone());
+                    match (target_window, rt_app) {
+                        (Some(ref w), Some(ref r)) if w == "Active Application" => r.clone(),
+                        (Some(w), _) => w,
+                        (None, Some(r)) => r,
+                        (None, None) => "Active Application".to_string(),
+                    }
+                };
                 let elapsed = self.rule_elapsed_seconds(&rule);
                 let threshold = rule.trigger_threshold_seconds();
                 self.execute_rule_action(&rule, re.as_ref(), now, &matched_name, elapsed, threshold).await;
@@ -1796,9 +1807,6 @@ impl Engine {
                                 compiled_re,
                             )
                         };
-                        if session_duration == 0 {
-                            rt.warned_current_cycle = false;
-                        }
                         rt.current_session_seconds = session_duration;
                     }
                     return false;
@@ -1871,7 +1879,27 @@ impl Engine {
             && warn_secs < threshold_secs
             && elapsed_secs >= threshold_secs.saturating_sub(warn_secs)
             && elapsed_secs < threshold_secs;
-        let should_trigger = elapsed_secs >= threshold_secs;
+
+        let should_trigger = if threshold_secs == 0 {
+            if elapsed_secs > 0 {
+                true
+            } else {
+                let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
+                let has_recent = find_latest_matching_event(events, rule, compiled_re, recency_cutoff).is_some();
+                let has_fg = match rule.monitor_selection {
+                    MonitorSelection::Titles => {
+                        enforcer::find_matching_foreground_window::<&str>(&[], compiled_re).is_some()
+                    }
+                    MonitorSelection::Urls => false,
+                    MonitorSelection::Executables => {
+                        enforcer::find_matching_foreground_window(&rule.target_executables, None).is_some()
+                    }
+                };
+                has_recent || has_fg
+            }
+        } else {
+            elapsed_secs >= threshold_secs
+        };
 
         if !should_warn && !should_trigger {
             if let Some(rt) = self.runtimes.get_mut(&rule.id) {
@@ -1951,10 +1979,28 @@ impl Engine {
             if rule.trigger == TriggerType::Limit
                 && rule.action == RuleAction::LockWorkstation
                 && already_executed
-                && get_idle_time_millis()
-                    >= (self.config.general.poll_interval_seconds.max(2) as u32) * 1000
             {
-                return true;
+                if get_idle_time_millis()
+                    >= (self.config.general.poll_interval_seconds.max(2) as u32) * 1000
+                {
+                    return true;
+                }
+                if !is_wildcard_executables_rule(rule) {
+                    let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
+                    let has_recent = find_latest_matching_event(events, rule, compiled_re, recency_cutoff).is_some();
+                    let has_fg = match rule.monitor_selection {
+                        MonitorSelection::Titles => {
+                            enforcer::find_matching_foreground_window::<&str>(&[], compiled_re).is_some()
+                        }
+                        MonitorSelection::Urls => false,
+                        MonitorSelection::Executables => {
+                            enforcer::find_matching_foreground_window(&rule.target_executables, None).is_some()
+                        }
+                    };
+                    if !has_recent && !has_fg {
+                        return true;
+                    }
+                }
             }
 
             let effective_grace = if rule.trigger == TriggerType::Limit && already_executed {
@@ -7012,5 +7058,138 @@ mod tests {
         assert_eq!(format_snooze_badge(now + Duration::seconds(120), now), "Snoozed (2m)");
         assert_eq!(format_snooze_badge(now + Duration::minutes(5), now), "Snoozed (5m)");
         assert_eq!(format_snooze_badge(now + Duration::minutes(15), now), "Snoozed (15m)");
+    }
+
+    #[tokio::test]
+    async fn test_limit_zero_does_not_trigger_when_no_recent_events_and_not_foreground() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-limit-zero".to_string();
+        rule.monitor_selection = MonitorSelection::Executables;
+        rule.target_executables = vec!["nonexistent_app_99999.exe".to_string()];
+        rule.trigger = TriggerType::Limit;
+        rule.limit = DurationConfig::new(0, TimeUnit::Sec);
+        rule.grace_duration = DurationConfig::new(0, TimeUnit::Sec);
+        rule.action = RuleAction::CloseWindow;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // Evaluate with empty events and nonexistent app (so it is not in foreground)
+        engine
+            .evaluate_rule(
+                &rule,
+                None,
+                now,
+                &[],
+                start_of_day_utc,
+                now_utc,
+                &[],
+            )
+            .await;
+
+        let rt = engine.runtimes.get("rule-limit-zero").unwrap();
+        assert!(!rt.action_executed_today);
+        assert!(rt.grace_countdown.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_show_overlay_pending_break_preserves_last_matched_app() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-overlay-preserve-app".to_string();
+        rule.action = RuleAction::ShowOverlay;
+        rule.monitor_selection = MonitorSelection::Executables;
+        rule.target_executables = vec!["*".to_string()];
+        rule.message = "Take a break from {app}!".to_string();
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let rt = engine.runtimes.get_mut("rule-overlay-preserve-app").unwrap();
+        rt.pending_break_since = Some(now - Duration::seconds(20)); // > 15s to force launch
+        rt.last_matched_app = Some("code.exe".to_string());
+
+        engine.realtime_tick().await;
+
+        let rt_after = engine.runtimes.get("rule-overlay-preserve-app").unwrap();
+        assert!(rt_after.active_break.is_some());
+
+        // Verify that the overlay mode paragraphs contain "code.exe" instead of "Active Application"
+        if let OverlayMode::BreakEnforcer { ref paragraphs, .. } = engine.active_overlay_mode {
+            let full_text = paragraphs
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                full_text.contains("code.exe"),
+                "Break overlay must preserve last_matched_app 'code.exe', found: {:?}",
+                full_text
+            );
+            assert!(
+                !full_text.contains("Active Application"),
+                "Break overlay should not contain 'Active Application', found: {:?}",
+                full_text
+            );
+        } else {
+            panic!("Expected BreakEnforcer overlay, got {:?}", engine.active_overlay_mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_limit_repeat_lock_workstation_requires_active_target() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-repeat-lock".to_string();
+        rule.monitor_selection = MonitorSelection::Executables;
+        rule.target_executables = vec!["nonexistent_game_99999.exe".to_string()];
+        rule.trigger = TriggerType::Limit;
+        rule.limit = DurationConfig::new(10, TimeUnit::Min);
+        rule.grace_duration = DurationConfig::new(15, TimeUnit::Sec);
+        rule.action = RuleAction::LockWorkstation;
+
+        cfg.rules = vec![rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let now_utc = now.with_timezone(&Utc);
+        let start_of_day_utc = now_utc - Duration::hours(5);
+
+        // Rule already executed today, elapsed usage exceeds limit
+        let rt = engine.runtimes.get_mut("rule-repeat-lock").unwrap();
+        rt.action_executed_today = true;
+        rt.daily_usage_seconds = 1200; // 20m > 10m
+
+        // With empty events and target not in foreground, repeat lock should NOT re-trigger
+        engine
+            .evaluate_rule(
+                &rule,
+                None,
+                now,
+                &[],
+                start_of_day_utc,
+                now_utc,
+                &[],
+            )
+            .await;
+
+        let rt_after = engine.runtimes.get("rule-repeat-lock").unwrap();
+        assert!(rt_after.grace_countdown.is_none());
     }
 }
