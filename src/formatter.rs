@@ -22,59 +22,12 @@ pub fn parse_message(
     alignment: TextHorizontalAlignment,
 ) -> Vec<FormattedParagraph> {
     let interpolated = ctx.interpolate(raw_message);
-    let mut paragraphs = Vec::new();
-
-    let make_para = |text: &str, font_size: f32, font_weight: i32, italic: bool, underline: bool, color: Color| {
-        let final_text = if text.is_empty() { "\u{00A0}" } else { text };
-        FormattedParagraph {
-            text: SharedString::from(final_text),
-            font_size,
-            font_weight,
-            italic,
-            underline,
-            color,
-            alignment,
-        }
-    };
-
-    for line in split_lines(&interpolated) {
-        let (heading_prefix, rest) = split_header_prefix(line);
-        if heading_prefix.is_empty() && rest.is_empty() {
-            paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
-            continue;
-        }
-
-        let default_size = match heading_prefix {
-            "## " => 20.0,
-            "# " => 26.0,
-            _ => 15.0,
-        };
-        let default_weight = if heading_prefix.is_empty() { 400 } else { 700 };
-
-        // Check for attribute prefix: [attr1 attr2 ...]
-        if let Some((inner, content)) = extract_attr_block(rest) {
-            let attrs = ParsedAttributes::from_inner(inner);
-            let font_size = attrs.size.map_or(default_size, |sz| sz as f32);
-            let font_weight = if attrs.bold { 700 } else { default_weight };
-            let text_color = attrs.color_hex.and_then(parse_hex_color).unwrap_or(default_color);
-
-            paragraphs.push(make_para(
-                content,
-                font_size,
-                font_weight,
-                attrs.italic,
-                attrs.underline,
-                text_color,
-            ));
-            continue;
-        }
-
-        // Plain line fallback (or plain heading fallback)
-        paragraphs.push(make_para(rest, default_size, default_weight, false, false, default_color));
-    }
+    let mut paragraphs: Vec<_> = split_lines(&interpolated)
+        .map(|line| parse_line_paragraph(line, default_color, alignment))
+        .collect();
 
     if paragraphs.is_empty() {
-        paragraphs.push(make_para("", 15.0, 400, false, false, default_color));
+        paragraphs.push(create_paragraph("", 15.0, 400, false, false, default_color, alignment));
     }
 
     paragraphs
@@ -219,38 +172,9 @@ impl MessageContext {
 
 /// Builds a consistent `MessageContext` for previewing warnings and alerts for a given rule.
 pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
-    let threshold_secs = rule.trigger_threshold_seconds().max(1);
-    let warn_secs = rule.warn_before.to_seconds();
-    let grace_secs = rule.grace_duration.to_seconds();
-    let rem_secs = if warn_secs > 0 {
-        warn_secs.min(threshold_secs)
-    } else if grace_secs > 0 {
-        grace_secs.min(threshold_secs)
-    } else {
-        300.min(threshold_secs)
-    };
-    let used_secs = threshold_secs.saturating_sub(rem_secs);
     let trimmed_name = rule.name.trim();
-
-    let app = match rule.monitor_selection {
-        crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
-        crate::config::MonitorSelection::Titles => {
-            if trimmed_name.is_empty() {
-                "Active Window".to_string()
-            } else {
-                trimmed_name.to_string()
-            }
-        }
-        crate::config::MonitorSelection::Executables => rule
-            .target_executables
-            .iter()
-            .find(|t| {
-                let s = t.trim();
-                !s.is_empty() && s != "*"
-            })
-            .cloned()
-            .unwrap_or_else(|| "code.exe".to_string()),
-    };
+    let (used_secs, rem_secs) = calculate_preview_times(rule);
+    let app = resolve_preview_app(rule, trimmed_name);
 
     let rule_name = if trimmed_name.is_empty() {
         "Break Reminder".to_string()
@@ -281,6 +205,45 @@ pub fn build_preview_context(rule: &crate::config::Rule) -> MessageContext {
         used: format_seconds_human(used_secs),
         limit,
         remaining: format_seconds_human(rem_secs),
+    }
+}
+
+/// Computes the synthetic `(used_secs, rem_secs)` preview bounds for a rule.
+fn calculate_preview_times(rule: &Rule) -> (u32, u32) {
+    let threshold_secs = rule.trigger_threshold_seconds().max(1);
+    let warn_secs = rule.warn_before.to_seconds();
+    let grace_secs = rule.grace_duration.to_seconds();
+    let rem_secs = if warn_secs > 0 {
+        warn_secs.min(threshold_secs)
+    } else if grace_secs > 0 {
+        grace_secs.min(threshold_secs)
+    } else {
+        300.min(threshold_secs)
+    };
+    let used_secs = threshold_secs.saturating_sub(rem_secs);
+    (used_secs, rem_secs)
+}
+
+/// Resolves the preview application name for a rule based on its monitor selection.
+fn resolve_preview_app(rule: &Rule, trimmed_name: &str) -> String {
+    match rule.monitor_selection {
+        crate::config::MonitorSelection::Urls => "youtube.com".to_string(),
+        crate::config::MonitorSelection::Titles => {
+            if trimmed_name.is_empty() {
+                "Active Window".to_string()
+            } else {
+                trimmed_name.to_string()
+            }
+        }
+        crate::config::MonitorSelection::Executables => rule
+            .target_executables
+            .iter()
+            .find(|t| {
+                let s = t.trim();
+                !s.is_empty() && s != "*"
+            })
+            .cloned()
+            .unwrap_or_else(|| "code.exe".to_string()),
     }
 }
 
@@ -343,30 +306,39 @@ pub fn detect_line_formatting(raw_text: &str, line_idx: usize) -> LineFormatting
 /// on the specified line index in `raw_text`.
 pub fn apply_line_style(raw_text: &str, line_idx: usize, style: &str) -> String {
     modify_line_at(raw_text, line_idx, |target_line| {
-        if let Some(&(hex, _)) = COLOR_PALETTE.iter().find(|&&(_, label)| label == style) {
-            return toggle_attr(target_line, &format!("color={hex}"));
-        }
-        if let Some(px_str) = style.strip_prefix("Size: ").and_then(|s| s.strip_suffix("px")) {
-            return toggle_attr(target_line, &format!("size={px_str}"));
-        }
-
-        match style {
-            "h1" | "h2" => {
-                let target_prefix = if style == "h1" { "# " } else { "## " };
-                let (header, rest) = split_header_prefix(target_line);
-                if header == target_prefix {
-                    rest.to_string()
-                } else {
-                    format!("{target_prefix}{rest}")
-                }
-            }
-            "bold" | "italic" | "underline" => toggle_attr(target_line, style),
-            "Color: Default" => strip_attr_prefix(target_line, "color="),
-            "Size: Default" => strip_attr_prefix(target_line, "size="),
-            s if s.starts_with("color=") || s.starts_with("size=") => toggle_attr(target_line, s),
-            _ => target_line.to_string(),
-        }
+        transform_line_style(target_line, style)
     })
+}
+
+/// Applies or toggles formatting `style` on a single line string.
+fn transform_line_style(target_line: &str, style: &str) -> String {
+    if let Some(&(hex, _)) = COLOR_PALETTE.iter().find(|&&(_, label)| label == style) {
+        return toggle_attr(target_line, &format!("color={hex}"));
+    }
+    if let Some(px_str) = style.strip_prefix("Size: ").and_then(|s| s.strip_suffix("px")) {
+        return toggle_attr(target_line, &format!("size={px_str}"));
+    }
+
+    match style {
+        "h1" => toggle_heading(target_line, true),
+        "h2" => toggle_heading(target_line, false),
+        "bold" | "italic" | "underline" => toggle_attr(target_line, style),
+        "Color: Default" => strip_attr_prefix(target_line, "color="),
+        "Size: Default" => strip_attr_prefix(target_line, "size="),
+        s if s.starts_with("color=") || s.starts_with("size=") => toggle_attr(target_line, s),
+        _ => target_line.to_string(),
+    }
+}
+
+/// Toggles `# ` (H1) or `## ` (H2) heading prefix on a line string.
+fn toggle_heading(line: &str, is_h1: bool) -> String {
+    let target_prefix = if is_h1 { "# " } else { "## " };
+    let (header, rest) = split_header_prefix(line);
+    if header == target_prefix {
+        rest.to_string()
+    } else {
+        format!("{target_prefix}{rest}")
+    }
 }
 
 
@@ -422,6 +394,71 @@ pub const COLOR_PALETTE: &[(&str, &str)] = &[
 // ============================================================================
 // Line & Attribute Parsing Utilities
 // ============================================================================
+
+/// Parses a single line of text into a Slint `FormattedParagraph`, respecting heading prefixes and inline attributes.
+fn parse_line_paragraph(
+    line: &str,
+    default_color: Color,
+    alignment: TextHorizontalAlignment,
+) -> FormattedParagraph {
+    let (heading_prefix, rest) = split_header_prefix(line);
+    if heading_prefix.is_empty() && rest.is_empty() {
+        return create_paragraph("", 15.0, 400, false, false, default_color, alignment);
+    }
+
+    let (default_size, default_weight) = heading_defaults(heading_prefix);
+
+    if let Some((inner, content)) = extract_attr_block(rest) {
+        let attrs = ParsedAttributes::from_inner(inner);
+        let font_size = attrs.size.map_or(default_size, |sz| sz as f32);
+        let font_weight = if attrs.bold { 700 } else { default_weight };
+        let text_color = attrs.color_hex.and_then(parse_hex_color).unwrap_or(default_color);
+
+        return create_paragraph(
+            content,
+            font_size,
+            font_weight,
+            attrs.italic,
+            attrs.underline,
+            text_color,
+            alignment,
+        );
+    }
+
+    create_paragraph(rest, default_size, default_weight, false, false, default_color, alignment)
+}
+
+/// Constructs a `FormattedParagraph`, substituting a non-breaking space `\u{00A0}` for empty text.
+fn create_paragraph(
+    text: &str,
+    font_size: f32,
+    font_weight: i32,
+    italic: bool,
+    underline: bool,
+    color: Color,
+    alignment: TextHorizontalAlignment,
+) -> FormattedParagraph {
+    let final_text = if text.is_empty() { "\u{00A0}" } else { text };
+    FormattedParagraph {
+        text: SharedString::from(final_text),
+        font_size,
+        font_weight,
+        italic,
+        underline,
+        color,
+        alignment,
+    }
+}
+
+/// Returns the default font size and font weight for a heading prefix (`"## "`, `"# "`, or none).
+#[inline]
+fn heading_defaults(heading_prefix: &str) -> (f32, i32) {
+    match heading_prefix {
+        "## " => (20.0, 700),
+        "# " => (26.0, 700),
+        _ => (15.0, 400),
+    }
+}
 
 /// If `rest` begins with an attribute block `[...]`, validates and extracts `(inner_attributes, remaining_content)`.
 fn extract_attr_block(rest: &str) -> Option<(&str, &str)> {
@@ -544,10 +581,8 @@ fn toggle_attr(line: &str, attr: &str) -> String {
             tokens.remove(pos);
         } else {
             let lower = attr.to_ascii_lowercase();
-            if lower.starts_with("color=") {
-                tokens.retain(|t| !t.to_ascii_lowercase().starts_with("color="));
-            } else if lower.starts_with("size=") {
-                tokens.retain(|t| !t.to_ascii_lowercase().starts_with("size="));
+            if let Some(prefix) = ["color=", "size="].into_iter().find(|&p| lower.starts_with(p)) {
+                tokens.retain(|t| !t.to_ascii_lowercase().starts_with(prefix));
             }
             tokens.push(attr.to_string());
         }
