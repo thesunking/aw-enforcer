@@ -31,12 +31,11 @@
   - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement (while warning/notification toasts can still be acknowledged and dismissed).
 
 - **Customizable Appearance & 24-Hour Statistics HUD:**
-  - Full control over overlay opacity, accent color, background color, and text color in **General Settings**, featuring interactive 24×24px color swatches next to Hex inputs for real-time visual feedback.
-  - Draggable non-fullscreen HUD overlay cards (`HudToast`, `HudTimer`, `HudStatus`): click and drag any card to position it anywhere across the desktop away from active application controls.
-  - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes) with dynamically resizing bars and intelligent timeline label decimation.
-  - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor, with real-time countdown ticking and immediate dismissal.
-  - Rich text formatting with alignment-aware underline rendering sized directly to paragraph text, case-insensitive attribute toggling (e.g., uppercase hex colors), grace-aware preview context interpolation, and an adaptive template editor height with line-selection gutter that dynamically expands to avoid overflow.
-  - High-performance binary-searched interval intersection (`partition_point`) for $O(\log N)$ overlap queries and web event window clipping, with single-pass merged interval reuse computed once per poll tick across wildcard rule evaluations, live telemetry, and 24-hour statistics overlays.
+  - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
+  - Draggable non-fullscreen HUD overlay cards (`HudToast`, `HudTimer`, `HudStatus`).
+  - Configurable 24-hour histogram bin count (1–96) and bin size (1–1440 minutes).
+  - One-click rule alert previewing accessible for all rule configurations directly in the Rule Editor.
+  - Rich text formatting.
 
 ---
 
@@ -87,18 +86,6 @@ AW-Enforcer automatically loads and saves its configuration to:
 %LOCALAPPDATA%\aw-enforcer\config.toml
 
 ```
-
-Whenever the configuration is loaded or saved, comprehensive sanitization invariants are enforced:
-- **Duration & Quota Clamping:** Polling intervals are clamped to 2–120 seconds, daily screentime targets to 1–1440 minutes, histogram bins to 1–96 bins (1–1440 min/bin), and rule duration inputs to 1–3600 (matching UI SpinBox bounds).
-- **Target Normalization:** Executable target entries are trimmed and empty strings dropped; if specific executables exist, wildcards (`"*"`) are dropped and entries are deduplicated case-insensitively while preserving order.
-- **Schedule Bitmask Normalization:** Weekday active schedules are canonicalized to standard 24-character `'0'`/`'1'` strings.
-- **Rule ID Uniqueness:** Non-empty, unique rule IDs are strictly enforced; duplicate, empty, or `"test_*"` prefixed IDs are automatically assigned the next available `rule-{n}` identifier.
-- **Pattern Validation for Titles & URLs:** Rules with `Titles` or `Urls` monitoring require a non-empty, valid regular expression pattern. Empty or whitespace-only patterns are rejected with an inline error in the editor and prevent saving until a valid regex is provided.
-- **Global Session & Telemetry Accuracy:** Live status and system tray tooltip session telemetry track continuous active screen time walking backward across merged activity intervals with a 5-minute AFK reset gap, providing continuous session metrics even when only `Limit` rules are configured or `Period` rules are snoozed.
-- **Sub-Minute Snooze Badge Precision:** Live telemetry and rule overview status badges report remaining snooze durations with second-level precision (`Snoozed (Xs)`) when under 1 minute, and ceiling-rounded minute precision (`Snoozed (Xm)`) when 1 minute or greater.
-- **Schedule Matrix Presets & Alignment:** Interactive 7×24 weekly schedule grid with pixel-exact hour row alignment and one-click presets via `RuleSchedule::from_preset`: "Work Hours (M-F 9-5)", "Evenings", "Weekends", "Select All", and "Clear All".
-- **Deduplicated Tab-Closing & UIPI Diagnostics:** Explicit release of modifier and Windows keys (`VK_LWIN`, `VK_RWIN`, `VK_SHIFT`, `VK_MENU`) before synthesizing `Ctrl+W`, with return status verification on `SendInput` and `PostMessageW(WM_CLOSE)` to detect and log UIPI elevation blocks.
-- **Branded Native Action Center Notifications:** Automatic registration of custom AUMID under `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` with `DisplayName = "AW-Enforcer"` and application icon URI, replacing generic PowerShell toast attribution with branded headers and fallback resilience.
 
 ---
 
