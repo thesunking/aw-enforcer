@@ -179,440 +179,6 @@ impl OverlayManager {
         }
     }
 
-    /// Sets whether overlay windows are destroyed when hidden or kept in memory.
-    pub fn set_destroy_windows_on_hide(&mut self, destroy: bool) {
-        self.destroy_windows_on_hide = destroy;
-        if destroy && matches!(self.current_mode, OverlayMode::Hidden) {
-            self.windows.clear();
-        }
-    }
-
-    /// Ensures at least `active_count` overlay windows exist and hides or destroys any surplus windows.
-    fn prepare_windows(&mut self, active_count: usize) {
-        self.ensure_window_count(active_count);
-        for i in 0..active_count {
-            if i < self.windows.len() {
-                self.windows[i].show().ok();
-            }
-        }
-        for i in active_count..self.windows.len() {
-            hide_overlay_window(&self.windows[i]);
-            if !self.destroy_windows_on_hide && i < self.desired_placements.len() {
-                self.desired_placements[i] = None;
-                self.applied_placements[i] = None;
-            }
-        }
-        if self.destroy_windows_on_hide {
-            self.windows.truncate(active_count);
-            self.desired_placements.truncate(active_count);
-            self.applied_placements.truncate(active_count);
-        }
-    }
-
-    /// Returns the primary monitor, or the first monitor if no primary monitor is designated.
-    pub fn primary_monitor(monitors: &[MonitorBounds]) -> &MonitorBounds {
-        monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0])
-    }
-
-    /// Computes top-right coordinates `(x, y)` inset by `margin` inside the primary monitor's work area.
-    pub fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
-        let m = Self::primary_monitor(monitors);
-        (m.work_rect.right - card_w - margin, m.work_rect.top + margin)
-    }
-
-    /// Prepares scale and computes scaled dimensions and top-right position `(card_w, card_h, x, y)` on the primary monitor.
-    fn compute_top_right_placement(
-        &mut self,
-        monitors: &[MonitorBounds],
-        w: f32,
-        h: f32,
-        margin_logical: f32,
-    ) -> (i32, i32, i32, i32) {
-        let primary_m = Self::primary_monitor(monitors);
-        let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
-        let (card_w, card_h, margin) = scale_card_bounds(scale, w, h, margin_logical);
-        let (x, y) = Self::primary_top_right(monitors, card_w, margin);
-        (card_w, card_h, x, y)
-    }
-
-    /// Positions window `idx` onto `(target_x, target_y)` before reading its DPI scale factor,
-    /// ensuring HUD overlays are never sized using a secondary monitor's stale scale factor.
-    fn prepare_target_scale(&mut self, idx: usize, target_x: i32, target_y: i32) -> f32 {
-        if let Some(win) = self.windows.get(idx) {
-            win.window()
-                .set_position(slint::PhysicalPosition::new(target_x, target_y));
-            if let Some(hwnd) = Self::extract_hwnd(win) {
-                unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        target_x,
-                        target_y,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-                    );
-                }
-            }
-            win.window().scale_factor().max(1.0)
-        } else {
-            1.0
-        }
-    }
-
-    /// Updates the stored `OverlayConfig` and immediately applies the new colors/opacity to all managed windows.
-    pub fn update_overlay_config(&mut self, config: OverlayConfig) {
-        self.overlay_config = config;
-        for win in &self.windows {
-            Self::apply_theme_to_window(win, &self.overlay_config);
-        }
-    }
-
-    /// Pushes opacity, accent color, backdrop color, and text color from `OverlayConfig` to a single `OverlayWindow`.
-    fn apply_theme_to_window(win: &OverlayWindow, cfg: &OverlayConfig) {
-        win.set_overlay_opacity(cfg.opacity.clamp(0.1, 1.0));
-        if let Some(accent) = formatter::parse_hex_color(&cfg.accent_color) {
-            win.set_accent_color(accent);
-        }
-        if let Some(backdrop) = formatter::parse_hex_color(&cfg.background_color) {
-            win.set_backdrop_color(backdrop);
-        }
-        if let Some(text) = formatter::parse_hex_color(&cfg.text_color) {
-            win.set_text_color(text);
-        }
-    }
-
-    /// Records the desired `Win32Placement` for window `idx`, marking it pending if changed.
-    pub fn set_desired_placement(&mut self, idx: usize, placement: Win32Placement) {
-        if idx >= self.desired_placements.len() {
-            self.desired_placements.resize(idx + 1, None);
-        }
-        if idx >= self.applied_placements.len() {
-            self.applied_placements.resize(idx + 1, None);
-        }
-        if self.desired_placements[idx].as_ref() != Some(&placement) {
-            self.desired_placements[idx] = Some(placement);
-            self.applied_placements[idx] = None;
-        }
-    }
-
-    /// Positions and shows overlay window `idx`, then applies its Win32 extended styles and DWM composition attributes.
-    fn apply_win32_overlay_styles(
-        &mut self,
-        idx: usize,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-        click_through: bool,
-        no_activate: bool,
-        extend_dwm_frame: bool,
-    ) {
-        let safe_w = width.max(1);
-        let safe_h = height.max(1);
-
-        self.set_desired_placement(
-            idx,
-            Win32Placement {
-                x,
-                y,
-                width: safe_w,
-                height: safe_h,
-                click_through,
-                no_activate,
-                extend_dwm_frame,
-            },
-        );
-    }
-
-    /// Applies any unapplied `Win32Placement` styles (`WS_POPUP`, `WS_EX_TOPMOST`, click-through, and DWM blur-behind) to native HWNDs.
-    pub fn apply_pending_win32_styles(&mut self) {
-        if matches!(self.current_mode, OverlayMode::Hidden) {
-            return;
-        }
-        if !self.is_updating_placements && matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
-            let current_monitors = Self::enumerate_monitors();
-            let active_placements_count = self.desired_placements.iter().filter(|p| p.is_some()).count();
-            let mut monitors_changed = current_monitors.len() != active_placements_count;
-            if !monitors_changed {
-                for (idx, mon) in current_monitors.iter().enumerate() {
-                    let (width, height) = mon.work_area_overlay_dimensions();
-
-                    match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
-                        Some(p) => {
-                            if p.x != mon.work_rect.left
-                                || p.y != mon.work_rect.top
-                                || p.width != width
-                                || p.height != height
-                            {
-                                monitors_changed = true;
-                                break;
-                            }
-                        }
-                        None => {
-                            monitors_changed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if monitors_changed {
-                let mode = self.current_mode.clone();
-                self.show_mode(mode);
-                return;
-            }
-        }
-
-        for idx in 0..self.windows.len() {
-            let desired = match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
-                Some(d) => d.clone(),
-                None => continue,
-            };
-
-            if self.applied_placements.get(idx).and_then(|p| p.as_ref()) == Some(&desired) {
-                continue;
-            }
-
-            let win = &self.windows[idx];
-            win.show().ok();
-            if let Some(hwnd) = Self::extract_hwnd(win) {
-                let safe_w = desired.width.max(1);
-                let safe_h = desired.height.max(1);
-
-                unsafe {
-                    // Strip standard caption/borders while keeping winit's frameless style intact
-                    let mut style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-                    style &= !(WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-                    style |= WS_POPUP;
-                    SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
-
-                    let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-                    ex_style |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-
-                    if desired.click_through {
-                        // Win32 requires WS_EX_LAYERED | WS_EX_TRANSPARENT for mouse click-through
-                        ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
-                    } else {
-                        // CRITICAL: Clear WS_EX_LAYERED when not click-through so Windows DWM
-                        // composites the OpenGL alpha channel directly on secondary monitors
-                        // instead of falling back to an opaque GDI redirection bitmap.
-                        ex_style &= !(WS_EX_LAYERED | WS_EX_TRANSPARENT);
-                        if desired.no_activate {
-                            ex_style |= WS_EX_NOACTIVATE;
-                        } else {
-                            ex_style &= !WS_EX_NOACTIVATE;
-                        }
-                    }
-
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
-
-                    if desired.click_through {
-                        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-                    }
-
-                    // Re-enable DWM per-pixel alpha composition for OpenGL (winit trick:
-                    // DwmEnableBlurBehindWindow with an empty 0,0,-1,-1 region).
-                    let hrgn = CreateRectRgn(0, 0, -1, -1);
-                    let bb = DWM_BLURBEHIND {
-                        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-                        fEnable: 1,
-                        hRgnBlur: hrgn,
-                        fTransitionOnMaximized: 0,
-                    };
-                    DwmEnableBlurBehindWindow(hwnd, &bb);
-                    if !hrgn.is_null() {
-                        DeleteObject(hrgn as _);
-                    }
-
-                    let val = if desired.extend_dwm_frame { -1 } else { 0 };
-                    let margins = MARGINS {
-                        cxLeftWidth: val,
-                        cxRightWidth: val,
-                        cyTopHeight: val,
-                        cyBottomHeight: val,
-                    };
-                    DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-                    let inactive = desired.click_through || desired.no_activate;
-                    let swp_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | if inactive { SWP_NOACTIVATE } else { 0 };
-                    SetWindowPos(hwnd, HWND_TOPMOST, desired.x, desired.y, safe_w, safe_h, swp_flags);
-                    ShowWindow(hwnd, if inactive { SW_SHOWNOACTIVATE } else { SW_SHOW });
-                    win.window()
-                        .set_position(slint::PhysicalPosition::new(desired.x, desired.y));
-                    win.window()
-                        .set_size(slint::PhysicalSize::new(safe_w as u32, safe_h as u32));
-                    let mut r_final: RECT = std::mem::zeroed();
-                    GetWindowRect(hwnd, &mut r_final);
-                    tracing::debug!(
-                        "Overlay window {idx} applied: requested ({}, {}, {}x{}), actual ({}, {}) to ({}, {}) [{}x{}]",
-                        desired.x, desired.y, safe_w, safe_h,
-                        r_final.left, r_final.top, r_final.right, r_final.bottom,
-                        r_final.right - r_final.left, r_final.bottom - r_final.top
-                    );
-                }
-
-                if idx < self.applied_placements.len() {
-                    self.applied_placements[idx] = Some(desired);
-                }
-            }
-        }
-    }
-
-    /// Enumerates all connected display monitors via Win32 `EnumDisplayMonitors`, falling back to a 1080p primary bounds rect.
-    pub fn enumerate_monitors() -> Vec<MonitorBounds> {
-        let mut monitors: Vec<MonitorBounds> = Vec::new();
-
-        unsafe extern "system" fn monitor_enum_proc(
-            hmonitor: HMONITOR,
-            _hdc: HDC,
-            _rect: *mut RECT,
-            lparam: LPARAM,
-        ) -> BOOL {
-            let list = &mut *(lparam as *mut Vec<MonitorBounds>);
-            let mut info: MONITORINFO = std::mem::zeroed();
-            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-
-            if GetMonitorInfoW(hmonitor, &mut info) != 0 {
-                list.push(MonitorBounds {
-                    monitor_rect: info.rcMonitor,
-                    work_rect: info.rcWork,
-                    is_primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
-                });
-            }
-            1
-        }
-
-        unsafe {
-            EnumDisplayMonitors(
-                0 as HDC,
-                ptr::null(),
-                Some(monitor_enum_proc),
-                &mut monitors as *mut _ as LPARAM,
-            );
-        }
-
-        if monitors.is_empty() {
-            monitors.push(MonitorBounds {
-                monitor_rect: RECT {
-                    left: 0,
-                    top: 0,
-                    right: 1920,
-                    bottom: 1080,
-                },
-                work_rect: RECT {
-                    left: 0,
-                    top: 0,
-                    right: 1920,
-                    bottom: 1040,
-                },
-                is_primary: true,
-            });
-        }
-
-        monitors
-    }
-
-    /// Extracts the underlying Win32 `HWND` from any Slint window.
-    pub fn extract_window_hwnd(window: &slint::Window) -> Option<HWND> {
-        let handle = window.window_handle();
-        if let Ok(raw_handle) = handle.window_handle() {
-            if let RawWindowHandle::Win32(win32) = raw_handle.as_raw() {
-                return Some(win32.hwnd.get() as HWND);
-            }
-        }
-        None
-    }
-
-    /// Extracts the underlying Win32 `HWND` from a Slint `OverlayWindow`.
-    pub fn extract_hwnd(window: &OverlayWindow) -> Option<HWND> {
-        Self::extract_window_hwnd(window.window())
-    }
-
-    /// Lazily instantiates Slint `OverlayWindow` instances and wires UI callbacks until `self.windows.len() >= required`.
-    pub fn ensure_window_count(&mut self, required: usize) {
-        while self.windows.len() < required {
-            if let Ok(win) = OverlayWindow::new() {
-                win.hide().ok();
-                Self::apply_theme_to_window(&win, &self.overlay_config);
-
-                let win_weak = win.as_weak();
-                let pos_ref = self.status_pos.clone();
-                win.on_drag_status_window(move || {
-                    if let Some(w) = win_weak.upgrade() {
-                        if let Some(hwnd) = Self::extract_hwnd(&w) {
-                            unsafe {
-                                ReleaseCapture();
-                                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
-                                let mut r: RECT = std::mem::zeroed();
-                                if GetWindowRect(hwnd, &mut r) != 0 {
-                                    *pos_ref.borrow_mut() = Some((r.left, r.top));
-                                }
-
-                                // Modal Win32 drag loop swallows WM_LBUTTONUP. Synthesize mouse release and move
-                                // to release Slint's internal pointer capture and immediately restore cursor and clickability.
-                                let mut pt: POINT = std::mem::zeroed();
-                                GetCursorPos(&mut pt);
-                                ScreenToClient(hwnd, &mut pt);
-                                let lparam = ((pt.x as u32) & 0xFFFF) | (((pt.y as u32) & 0xFFFF) << 16);
-                                PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam as isize);
-                                PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam as isize);
-                            }
-                        }
-                    }
-                });
-
-                if let Some(ref tx) = self.command_tx {
-                    let t1 = tx.clone();
-                    win.on_snooze_clicked(move |rid, mins| {
-                        // Engine handles both BreakRule and AppRule IDs on SnoozeBreak
-                        t1.send(crate::engine::DaemonCommand::SnoozeBreak {
-                            rule_id: rid.to_string(),
-                            minutes: mins as u32,
-                        })
-                        .ok();
-                    });
-                    let t2 = tx.clone();
-                    win.on_skip_break_clicked(move |rid| {
-                        t2.send(crate::engine::DaemonCommand::SkipBreak {
-                            rule_id: rid.to_string(),
-                        })
-                        .ok();
-                    });
-                    let t3 = tx.clone();
-                    win.on_acknowledge_toast_clicked(move |rid| {
-                        t3.send(crate::engine::DaemonCommand::AcknowledgeAppWarning {
-                            rule_id: rid.to_string(),
-                        })
-                        .ok();
-                    });
-                    let t4 = tx.clone();
-                    win.on_close_status_clicked(move || {
-                        t4.send(crate::engine::DaemonCommand::CloseOverlay).ok();
-                    });
-                }
-                self.windows.push(win);
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Hides all managed overlay windows and resets placement state.
-    /// If `destroy_windows_on_hide` is true, window instances are cleared from memory.
-    pub fn hide_all(&mut self) {
-        self.current_mode = OverlayMode::Hidden;
-        self.desired_placements.clear();
-        self.applied_placements.clear();
-        *self.status_pos.borrow_mut() = None;
-        for win in &self.windows {
-            hide_overlay_window(win);
-        }
-        if self.destroy_windows_on_hide {
-            self.windows.clear();
-        }
-    }
-
     /// Configures and displays the overlay windows according to the given `OverlayMode`.
     pub fn show_mode(&mut self, mode: OverlayMode) {
         let monitors = Self::enumerate_monitors();
@@ -829,35 +395,440 @@ impl OverlayManager {
             win.set_is_user_idle(is_user_idle);
         }
     }
-}
 
-/// Formats remaining seconds as either `"15s"` (for HUDs under 60s) or `"MM:SS"`.
-fn format_countdown(remaining_seconds: u32, is_hud: bool) -> String {
-    if is_hud && remaining_seconds < 60 {
-        format!("{}s", remaining_seconds)
-    } else {
-        let mins = remaining_seconds / 60;
-        let secs = remaining_seconds % 60;
-        format!("{:02}:{:02}", mins, secs)
+    /// Hides all managed overlay windows and resets placement state.
+    /// If `destroy_windows_on_hide` is true, window instances are cleared from memory.
+    pub fn hide_all(&mut self) {
+        self.current_mode = OverlayMode::Hidden;
+        self.desired_placements.clear();
+        self.applied_placements.clear();
+        *self.status_pos.borrow_mut() = None;
+        for win in &self.windows {
+            hide_overlay_window(win);
+        }
+        if self.destroy_windows_on_hide {
+            self.windows.clear();
+        }
     }
-}
 
-/// Computes the ratio of remaining to total duration safely clamped between 0.0 and 1.0.
-fn compute_progress_ratio(remaining_seconds: u32, total_seconds: u32) -> f32 {
-    if total_seconds > 0 {
-        remaining_seconds as f32 / total_seconds as f32
-    } else {
-        0.0
+    /// Updates the stored `OverlayConfig` and immediately applies the new colors/opacity to all managed windows.
+    pub fn update_overlay_config(&mut self, config: OverlayConfig) {
+        self.overlay_config = config;
+        for win in &self.windows {
+            Self::apply_theme_to_window(win, &self.overlay_config);
+        }
     }
-}
 
-/// Computes scaled DPI-aware card dimensions `(width, height, margin)` from logical measurements.
-fn scale_card_bounds(scale: f32, w: f32, h: f32, margin: f32) -> (i32, i32, i32) {
-    (
-        (w * scale).round() as i32,
-        (h * scale).round() as i32,
-        (margin * scale).round() as i32,
-    )
+    /// Sets whether overlay windows are destroyed when hidden or kept in memory.
+    pub fn set_destroy_windows_on_hide(&mut self, destroy: bool) {
+        self.destroy_windows_on_hide = destroy;
+        if destroy && matches!(self.current_mode, OverlayMode::Hidden) {
+            self.windows.clear();
+        }
+    }
+
+    /// Ensures at least `active_count` overlay windows exist and hides or destroys any surplus windows.
+    fn prepare_windows(&mut self, active_count: usize) {
+        self.ensure_window_count(active_count);
+        for i in 0..active_count {
+            if i < self.windows.len() {
+                self.windows[i].show().ok();
+            }
+        }
+        for i in active_count..self.windows.len() {
+            hide_overlay_window(&self.windows[i]);
+            if !self.destroy_windows_on_hide && i < self.desired_placements.len() {
+                self.desired_placements[i] = None;
+                self.applied_placements[i] = None;
+            }
+        }
+        if self.destroy_windows_on_hide {
+            self.windows.truncate(active_count);
+            self.desired_placements.truncate(active_count);
+            self.applied_placements.truncate(active_count);
+        }
+    }
+
+    /// Lazily instantiates Slint `OverlayWindow` instances and wires UI callbacks until `self.windows.len() >= required`.
+    pub fn ensure_window_count(&mut self, required: usize) {
+        while self.windows.len() < required {
+            if let Ok(win) = OverlayWindow::new() {
+                win.hide().ok();
+                Self::apply_theme_to_window(&win, &self.overlay_config);
+
+                let win_weak = win.as_weak();
+                let pos_ref = self.status_pos.clone();
+                win.on_drag_status_window(move || {
+                    if let Some(w) = win_weak.upgrade() {
+                        if let Some(hwnd) = Self::extract_hwnd(&w) {
+                            unsafe {
+                                ReleaseCapture();
+                                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+                                let mut r: RECT = std::mem::zeroed();
+                                if GetWindowRect(hwnd, &mut r) != 0 {
+                                    *pos_ref.borrow_mut() = Some((r.left, r.top));
+                                }
+
+                                // Modal Win32 drag loop swallows WM_LBUTTONUP. Synthesize mouse release and move
+                                // to release Slint's internal pointer capture and immediately restore cursor and clickability.
+                                let mut pt: POINT = std::mem::zeroed();
+                                GetCursorPos(&mut pt);
+                                ScreenToClient(hwnd, &mut pt);
+                                let lparam = ((pt.x as u32) & 0xFFFF) | (((pt.y as u32) & 0xFFFF) << 16);
+                                PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam as isize);
+                                PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam as isize);
+                            }
+                        }
+                    }
+                });
+
+                if let Some(ref tx) = self.command_tx {
+                    let t1 = tx.clone();
+                    win.on_snooze_clicked(move |rid, mins| {
+                        // Engine handles both BreakRule and AppRule IDs on SnoozeBreak
+                        t1.send(crate::engine::DaemonCommand::SnoozeBreak {
+                            rule_id: rid.to_string(),
+                            minutes: mins as u32,
+                        })
+                        .ok();
+                    });
+                    let t2 = tx.clone();
+                    win.on_skip_break_clicked(move |rid| {
+                        t2.send(crate::engine::DaemonCommand::SkipBreak {
+                            rule_id: rid.to_string(),
+                        })
+                        .ok();
+                    });
+                    let t3 = tx.clone();
+                    win.on_acknowledge_toast_clicked(move |rid| {
+                        t3.send(crate::engine::DaemonCommand::AcknowledgeAppWarning {
+                            rule_id: rid.to_string(),
+                        })
+                        .ok();
+                    });
+                    let t4 = tx.clone();
+                    win.on_close_status_clicked(move || {
+                        t4.send(crate::engine::DaemonCommand::CloseOverlay).ok();
+                    });
+                }
+                self.windows.push(win);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Pushes opacity, accent color, backdrop color, and text color from `OverlayConfig` to a single `OverlayWindow`.
+    fn apply_theme_to_window(win: &OverlayWindow, cfg: &OverlayConfig) {
+        win.set_overlay_opacity(cfg.opacity.clamp(0.1, 1.0));
+        if let Some(accent) = formatter::parse_hex_color(&cfg.accent_color) {
+            win.set_accent_color(accent);
+        }
+        if let Some(backdrop) = formatter::parse_hex_color(&cfg.background_color) {
+            win.set_backdrop_color(backdrop);
+        }
+        if let Some(text) = formatter::parse_hex_color(&cfg.text_color) {
+            win.set_text_color(text);
+        }
+    }
+
+    /// Prepares scale and computes scaled dimensions and top-right position `(card_w, card_h, x, y)` on the primary monitor.
+    fn compute_top_right_placement(
+        &mut self,
+        monitors: &[MonitorBounds],
+        w: f32,
+        h: f32,
+        margin_logical: f32,
+    ) -> (i32, i32, i32, i32) {
+        let primary_m = Self::primary_monitor(monitors);
+        let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
+        let (card_w, card_h, margin) = scale_card_bounds(scale, w, h, margin_logical);
+        let (x, y) = Self::primary_top_right(monitors, card_w, margin);
+        (card_w, card_h, x, y)
+    }
+
+    /// Positions window `idx` onto `(target_x, target_y)` before reading its DPI scale factor,
+    /// ensuring HUD overlays are never sized using a secondary monitor's stale scale factor.
+    fn prepare_target_scale(&mut self, idx: usize, target_x: i32, target_y: i32) -> f32 {
+        if let Some(win) = self.windows.get(idx) {
+            win.window()
+                .set_position(slint::PhysicalPosition::new(target_x, target_y));
+            if let Some(hwnd) = Self::extract_hwnd(win) {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        target_x,
+                        target_y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                }
+            }
+            win.window().scale_factor().max(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Computes top-right coordinates `(x, y)` inset by `margin` inside the primary monitor's work area.
+    pub fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
+        let m = Self::primary_monitor(monitors);
+        (m.work_rect.right - card_w - margin, m.work_rect.top + margin)
+    }
+
+    /// Returns the primary monitor, or the first monitor if no primary monitor is designated.
+    pub fn primary_monitor(monitors: &[MonitorBounds]) -> &MonitorBounds {
+        monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0])
+    }
+
+    /// Positions and shows overlay window `idx`, then applies its Win32 extended styles and DWM composition attributes.
+    fn apply_win32_overlay_styles(
+        &mut self,
+        idx: usize,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        click_through: bool,
+        no_activate: bool,
+        extend_dwm_frame: bool,
+    ) {
+        let safe_w = width.max(1);
+        let safe_h = height.max(1);
+
+        self.set_desired_placement(
+            idx,
+            Win32Placement {
+                x,
+                y,
+                width: safe_w,
+                height: safe_h,
+                click_through,
+                no_activate,
+                extend_dwm_frame,
+            },
+        );
+    }
+
+    /// Records the desired `Win32Placement` for window `idx`, marking it pending if changed.
+    pub fn set_desired_placement(&mut self, idx: usize, placement: Win32Placement) {
+        if idx >= self.desired_placements.len() {
+            self.desired_placements.resize(idx + 1, None);
+        }
+        if idx >= self.applied_placements.len() {
+            self.applied_placements.resize(idx + 1, None);
+        }
+        if self.desired_placements[idx].as_ref() != Some(&placement) {
+            self.desired_placements[idx] = Some(placement);
+            self.applied_placements[idx] = None;
+        }
+    }
+
+    /// Applies any unapplied `Win32Placement` styles (`WS_POPUP`, `WS_EX_TOPMOST`, click-through, and DWM blur-behind) to native HWNDs.
+    pub fn apply_pending_win32_styles(&mut self) {
+        if matches!(self.current_mode, OverlayMode::Hidden) {
+            return;
+        }
+        if !self.is_updating_placements && matches!(self.current_mode, OverlayMode::BreakEnforcer { .. }) {
+            let current_monitors = Self::enumerate_monitors();
+            let active_placements_count = self.desired_placements.iter().filter(|p| p.is_some()).count();
+            let mut monitors_changed = current_monitors.len() != active_placements_count;
+            if !monitors_changed {
+                for (idx, mon) in current_monitors.iter().enumerate() {
+                    let (width, height) = mon.work_area_overlay_dimensions();
+
+                    match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
+                        Some(p) => {
+                            if p.x != mon.work_rect.left
+                                || p.y != mon.work_rect.top
+                                || p.width != width
+                                || p.height != height
+                            {
+                                monitors_changed = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            monitors_changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if monitors_changed {
+                let mode = self.current_mode.clone();
+                self.show_mode(mode);
+                return;
+            }
+        }
+
+        for idx in 0..self.windows.len() {
+            let desired = match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+
+            if self.applied_placements.get(idx).and_then(|p| p.as_ref()) == Some(&desired) {
+                continue;
+            }
+
+            let win = &self.windows[idx];
+            win.show().ok();
+            if let Some(hwnd) = Self::extract_hwnd(win) {
+                let safe_w = desired.width.max(1);
+                let safe_h = desired.height.max(1);
+
+                unsafe {
+                    // Strip standard caption/borders while keeping winit's frameless style intact
+                    let mut style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                    style &= !(WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+                    style |= WS_POPUP;
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
+
+                    let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                    ex_style |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+
+                    if desired.click_through {
+                        // Win32 requires WS_EX_LAYERED | WS_EX_TRANSPARENT for mouse click-through
+                        ex_style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+                    } else {
+                        // CRITICAL: Clear WS_EX_LAYERED when not click-through so Windows DWM
+                        // composites the OpenGL alpha channel directly on secondary monitors
+                        // instead of falling back to an opaque GDI redirection bitmap.
+                        ex_style &= !(WS_EX_LAYERED | WS_EX_TRANSPARENT);
+                        if desired.no_activate {
+                            ex_style |= WS_EX_NOACTIVATE;
+                        } else {
+                            ex_style &= !WS_EX_NOACTIVATE;
+                        }
+                    }
+
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style as isize);
+
+                    if desired.click_through {
+                        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+                    }
+
+                    // Re-enable DWM per-pixel alpha composition for OpenGL (winit trick:
+                    // DwmEnableBlurBehindWindow with an empty 0,0,-1,-1 region).
+                    let hrgn = CreateRectRgn(0, 0, -1, -1);
+                    let bb = DWM_BLURBEHIND {
+                        dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                        fEnable: 1,
+                        hRgnBlur: hrgn,
+                        fTransitionOnMaximized: 0,
+                    };
+                    DwmEnableBlurBehindWindow(hwnd, &bb);
+                    if !hrgn.is_null() {
+                        DeleteObject(hrgn as _);
+                    }
+
+                    let val = if desired.extend_dwm_frame { -1 } else { 0 };
+                    let margins = MARGINS {
+                        cxLeftWidth: val,
+                        cxRightWidth: val,
+                        cyTopHeight: val,
+                        cyBottomHeight: val,
+                    };
+                    DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+                    let inactive = desired.click_through || desired.no_activate;
+                    let swp_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | if inactive { SWP_NOACTIVATE } else { 0 };
+                    SetWindowPos(hwnd, HWND_TOPMOST, desired.x, desired.y, safe_w, safe_h, swp_flags);
+                    ShowWindow(hwnd, if inactive { SW_SHOWNOACTIVATE } else { SW_SHOW });
+                    win.window()
+                        .set_position(slint::PhysicalPosition::new(desired.x, desired.y));
+                    win.window()
+                        .set_size(slint::PhysicalSize::new(safe_w as u32, safe_h as u32));
+                    let mut r_final: RECT = std::mem::zeroed();
+                    GetWindowRect(hwnd, &mut r_final);
+                    tracing::debug!(
+                        "Overlay window {idx} applied: requested ({}, {}, {}x{}), actual ({}, {}) to ({}, {}) [{}x{}]",
+                        desired.x, desired.y, safe_w, safe_h,
+                        r_final.left, r_final.top, r_final.right, r_final.bottom,
+                        r_final.right - r_final.left, r_final.bottom - r_final.top
+                    );
+                }
+
+                if idx < self.applied_placements.len() {
+                    self.applied_placements[idx] = Some(desired);
+                }
+            }
+        }
+    }
+
+    /// Enumerates all connected display monitors via Win32 `EnumDisplayMonitors`, falling back to a 1080p primary bounds rect.
+    pub fn enumerate_monitors() -> Vec<MonitorBounds> {
+        let mut monitors: Vec<MonitorBounds> = Vec::new();
+
+        unsafe extern "system" fn monitor_enum_proc(
+            hmonitor: HMONITOR,
+            _hdc: HDC,
+            _rect: *mut RECT,
+            lparam: LPARAM,
+        ) -> BOOL {
+            let list = &mut *(lparam as *mut Vec<MonitorBounds>);
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+
+            if GetMonitorInfoW(hmonitor, &mut info) != 0 {
+                list.push(MonitorBounds {
+                    monitor_rect: info.rcMonitor,
+                    work_rect: info.rcWork,
+                    is_primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                });
+            }
+            1
+        }
+
+        unsafe {
+            EnumDisplayMonitors(
+                0 as HDC,
+                ptr::null(),
+                Some(monitor_enum_proc),
+                &mut monitors as *mut _ as LPARAM,
+            );
+        }
+
+        if monitors.is_empty() {
+            monitors.push(MonitorBounds {
+                monitor_rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+                work_rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+                is_primary: true,
+            });
+        }
+
+        monitors
+    }
+
+    /// Extracts the underlying Win32 `HWND` from a Slint `OverlayWindow`.
+    pub fn extract_hwnd(window: &OverlayWindow) -> Option<HWND> {
+        Self::extract_window_hwnd(window.window())
+    }
+
+    /// Extracts the underlying Win32 `HWND` from any Slint window.
+    pub fn extract_window_hwnd(window: &slint::Window) -> Option<HWND> {
+        let handle = window.window_handle();
+        if let Ok(raw_handle) = handle.window_handle() {
+            if let RawWindowHandle::Win32(win32) = raw_handle.as_raw() {
+                return Some(win32.hwnd.get() as HWND);
+            }
+        }
+        None
+    }
 }
 
 /// Checks whether a card rectangle at `pos` has a visible intersection of at least 100x60 pixels
@@ -898,6 +869,41 @@ pub fn clamp_or_reset_status_pos(
     }
 }
 
+/// Computes scaled DPI-aware card dimensions `(width, height, margin)` from logical measurements.
+fn scale_card_bounds(scale: f32, w: f32, h: f32, margin: f32) -> (i32, i32, i32) {
+    (
+        (w * scale).round() as i32,
+        (h * scale).round() as i32,
+        (margin * scale).round() as i32,
+    )
+}
+
+/// Computes the ratio of remaining to total duration safely clamped between 0.0 and 1.0.
+fn compute_progress_ratio(remaining_seconds: u32, total_seconds: u32) -> f32 {
+    if total_seconds > 0 {
+        remaining_seconds as f32 / total_seconds as f32
+    } else {
+        0.0
+    }
+}
+
+/// Formats remaining seconds as either `"15s"` (for HUDs under 60s) or `"MM:SS"`.
+fn format_countdown(remaining_seconds: u32, is_hud: bool) -> String {
+    if is_hud && remaining_seconds < 60 {
+        format!("{}s", remaining_seconds)
+    } else {
+        let mins = remaining_seconds / 60;
+        let secs = remaining_seconds % 60;
+        format!("{:02}:{:02}", mins, secs)
+    }
+}
+
+/// Sets formatted message paragraphs on an `OverlayWindow`.
+fn set_window_paragraphs(win: &OverlayWindow, paragraphs: &[FormattedParagraph]) {
+    let para_models = Rc::new(VecModel::from(paragraphs.to_vec()));
+    win.set_message_paragraphs(ModelRc::from(para_models));
+}
+
 /// Hides an overlay window in native Win32 and in Slint.
 fn hide_overlay_window(win: &OverlayWindow) {
     if let Some(hwnd) = OverlayManager::extract_hwnd(win) {
@@ -906,12 +912,6 @@ fn hide_overlay_window(win: &OverlayWindow) {
         }
     }
     win.hide().ok();
-}
-
-/// Sets formatted message paragraphs on an `OverlayWindow`.
-fn set_window_paragraphs(win: &OverlayWindow, paragraphs: &[FormattedParagraph]) {
-    let para_models = Rc::new(VecModel::from(paragraphs.to_vec()));
-    win.set_message_paragraphs(ModelRc::from(para_models));
 }
 
 #[cfg(test)]
