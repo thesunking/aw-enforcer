@@ -96,11 +96,17 @@ AW-Enforcer automatically loads and saves its configuration to:
 | `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
 | `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, duration/quota bounds clamping, target/schedule normalization, unique rule ID enforcement, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery, thread-safe hostname ranking, and `filter_period_intersect` queries) |
-| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, O(log N) binary-searched interval intersection, single-pass poll interval reuse across wildcard rules and stats overlays, and 3-stage rule evaluation |
-| `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch with UIPI checks, `Ctrl+W` keystroke synthesis with Win/modifier release, AUMID registry branding, shared ToolHelp process iteration, and workstation lock |
+| `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, command dispatch, and 3-stage rule evaluation pipeline |
+| `src/engine/intervals.rs` | Stateless interval coalescing (`merge_overlapping_intervals`), $O(\log N)$ binary-searched overlap calculation (`compute_overlap_from_merged_intervals`), browser window web event intersection, and zero-allocation backward continuous session traversal |
+| `src/engine/matcher.rs` | URL and executable predicates, URL host extraction (`extract_url_host`), recency cutoff and active window lookup, and rule-filtered session/usage calculation |
+| `src/engine/runtime.rs` | Ephemeral per-rule lifecycle state machine (`RuleRuntime`), daily quota rollovers, regex compilation caching, and state-preserving snooze logic |
+| `src/engine/stats_hud.rs` | 24-hour screen time status HUD cache (`StatsHudCache`), bin-start alignment, live rollover shifting, and status overlay presentation |
+| `src/engine/preview.rs` | Synthetic test overlay triggers (`trigger_test_overlay`) and live rule alert previews (`preview_rule_alert`) for the UI editor |
+| `src/enforcer.rs` | Protected Win32 window enumeration (`EnumWindows`), `WM_CLOSE` dispatch with UIPI checks, `Ctrl+W` keystroke synthesis with Win/modifier release, AUMID registry branding, ToolHelp process iteration, workstation lock, and physical input idle tracking (`GetLastInputInfo`, `GetTickCount`) |
 | `src/overlay.rs` | Multi-monitor Slint `OverlayWindow` lifecycle, priority hierarchy, Win32 extended styles (`WS_EX_TOPMOST`, `WS_EX_TRANSPARENT`), and DWM composition |
-| `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, and line-level attribute/heading parser |
+| `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, line-level attribute/heading parser, fallback rule templates, and UI snooze badge formatting (`format_snooze_badge`) |
 | `src/autostart.rs` | Windows Registry (`HKCU\...\Run`) startup registration |
+| `ui/main.slint` | Slint component root exporting `SettingsWindow`, `OverlayWindow`, `RuleView`, and `FormattedParagraph` |
 | `ui/settings.slint` | Settings window, sidebar navigation, 5-section rule editor, and interactive 7×24 schedule matrix |
 | `ui/overlay.slint` | Full-screen break enforcer, HUD toast, HUD grace countdown timer, and 24-hour screen time histogram cards |
 | `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component with alignment-aware text underlines |
