@@ -296,6 +296,7 @@ pub struct RuleRuntime {
     pub pending_break_since: Option<DateTime<Local>>,
     pub active_break: Option<(u32, u32)>,    // (remaining_secs, total_secs)
     pub grace_countdown: Option<(u32, u32)>, // (remaining_secs, total_secs)
+    pub grace_dismissed: bool,
     pub action_executed_today: bool,
     pub snoozed_until: Option<DateTime<Local>>,
     pub live_status_badge: String,
@@ -320,6 +321,7 @@ impl RuleRuntime {
             pending_break_since: None,
             active_break: None,
             grace_countdown: None,
+            grace_dismissed: false,
             action_executed_today: false,
             snoozed_until: None,
             live_status_badge: String::new(),
@@ -356,6 +358,7 @@ impl RuleRuntime {
         self.warned_current_cycle = false;
         self.action_executed_today = false;
         self.grace_countdown = None;
+        self.grace_dismissed = false;
         self.snoozed_until = None;
         self.pending_break_since = None;
         self.daily_usage_seconds = 0;
@@ -391,6 +394,7 @@ impl RuleRuntime {
         self.current_session_seconds = 0;
         self.active_break = None;
         self.grace_countdown = None;
+        self.grace_dismissed = false;
         self.warned_current_cycle = false;
         self.pending_break_since = None;
     }
@@ -398,6 +402,7 @@ impl RuleRuntime {
     /// Marks a rule cycle as completed at `now`, resetting timers and recording execution.
     pub fn complete_cycle(&mut self, now: DateTime<Local>) {
         self.reset_active_timers();
+        self.grace_dismissed = false;
         self.snoozed_until = None;
         self.prev_completed_at = self.last_completed_at;
         self.last_completed_at = Some(now);
@@ -409,6 +414,7 @@ impl RuleRuntime {
     /// Resets the rule's active session or daily quota, clearing timers, snooze, and daily limit locks.
     pub fn reset_session(&mut self, now: DateTime<Local>) {
         self.reset_active_timers();
+        self.grace_dismissed = false;
         self.snoozed_until = None;
         self.prev_completed_at = Some(now);
         self.last_completed_at = Some(now);
@@ -726,8 +732,7 @@ impl Engine {
                     && self
                         .runtimes
                         .get(&r.id)
-                        .and_then(|rt| rt.grace_countdown)
-                        .map(|(rem, _)| rem > 0)
+                        .map(|rt| !rt.grace_dismissed && rt.grace_countdown.map(|(rem, _)| rem > 0).unwrap_or(false))
                         .unwrap_or(false)
             })
             .max_by_key(|r| {
@@ -833,6 +838,7 @@ impl Engine {
                     if rt.grace_countdown.is_some() {
                         if is_destructive {
                             destructive_grace_dismissed = true;
+                            rt.grace_dismissed = true;
                         } else {
                             rt.complete_cycle(Local::now());
                         }
@@ -841,9 +847,7 @@ impl Engine {
                 }
 
                 if destructive_grace_dismissed {
-                    if self.is_rule_displayed(&rule_id) {
-                        self.hide_overlay();
-                    }
+                    self.transition_to_active_countdown_or_hide();
                 } else if self.is_rule_displayed(&rule_id) || !self.any_countdown_active() {
                     self.transition_to_active_countdown_or_hide();
                 }
@@ -1194,6 +1198,7 @@ impl Engine {
 
                     if *rem == 0 {
                         rt.grace_countdown = None;
+                        rt.grace_dismissed = false;
                         completed_enforcements.push(rule_id.clone());
                         if is_displayed {
                             grace_displayed_finished = true;
@@ -1740,13 +1745,21 @@ impl Engine {
             let dur = rule.notification_duration.to_seconds().max(1);
             self.show_overlay(OverlayMode::HudToast {
                 rule_id: rule.id.clone(),
-                title: warn_title,
+                title: warn_title.clone(),
                 paragraphs,
                 snooze_options_minutes: if rule.strict_mode { Vec::new() } else { vec![5, 10, 15] },
                 duration_seconds: dur,
                 remaining_seconds: dur,
                 show_time_remaining: rule.show_remaining_time,
             });
+            if !self.is_rule_displayed(&rule.id) {
+                let warn_body = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
+                    formatter::format_plain_message(&rule.message, ctx)
+                } else {
+                    default_body
+                };
+                enforcer::send_system_notification(&warn_title, &warn_body);
+            }
         }
     }
 
@@ -2018,6 +2031,7 @@ impl Engine {
             if effective_grace > 0 {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
                     rt.grace_countdown = Some((effective_grace, effective_grace));
+                    rt.grace_dismissed = false;
                 }
                 let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, effective_grace);
                 let mode = self.build_hud_timer_overlay(rule, &ctx, effective_grace, effective_grace);
@@ -2082,21 +2096,7 @@ impl Engine {
                         enforcer::send_system_notification(&rule.name, &formatter::format_plain_message(raw_msg, &ctx));
                     }
                     NotificationMethod::Hud => {
-                        if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                            rt.can_rollback_completion = true;
-                        }
                         let raw_msg = self.get_effective_rule_message(rule);
-                        let is_current_test = self
-                            .active_overlay_mode
-                            .rule_id()
-                            .map(|id| id.starts_with("test_"))
-                            .unwrap_or(false);
-                        if self.active_overlay_mode.priority() > 2 && !is_current_test {
-                            enforcer::send_system_notification(
-                                &rule.name,
-                                &formatter::format_plain_message(raw_msg, &ctx),
-                            );
-                        }
                         let paragraphs = self.parse_rule_message(
                             raw_msg,
                             &ctx,
@@ -2112,6 +2112,16 @@ impl Engine {
                             remaining_seconds: dur,
                             show_time_remaining: rule.show_remaining_time,
                         });
+                        if self.is_rule_displayed(&rule.id) {
+                            if let Some(rt) = self.runtimes.get_mut(&rule.id) {
+                                rt.can_rollback_completion = true;
+                            }
+                        } else {
+                            enforcer::send_system_notification(
+                                &rule.name,
+                                &formatter::format_plain_message(raw_msg, &ctx),
+                            );
+                        }
                     }
                 }
             }
@@ -7191,5 +7201,163 @@ mod tests {
 
         let rt_after = engine.runtimes.get("rule-repeat-lock").unwrap();
         assert!(rt_after.grace_countdown.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_destructive_grace_timer_transitions_and_prevents_resurrection() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut r_kill = Rule::default_template(0);
+        r_kill.id = "rule-kill-dismiss".to_string();
+        r_kill.action = RuleAction::KillProcess;
+        r_kill.target_executables = vec!["badapp.exe".to_string()];
+        r_kill.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+
+        let mut r_close = Rule::default_template(1);
+        r_close.id = "rule-close-dismiss".to_string();
+        r_close.action = RuleAction::CloseWindow;
+        r_close.target_executables = vec!["game.exe".to_string()];
+        r_close.grace_duration = DurationConfig::new(10, TimeUnit::Sec);
+
+        cfg.rules = vec![r_kill.clone(), r_close.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // Set grace_countdown on both rules (5s on kill, 10s on close)
+        engine.runtimes.get_mut("rule-kill-dismiss").unwrap().grace_countdown = Some((5, 5));
+        engine.runtimes.get_mut("rule-close-dismiss").unwrap().grace_countdown = Some((10, 10));
+
+        // transition_to_active_countdown_or_hide picks rule-kill-dismiss (shortest remaining)
+        engine.transition_to_active_countdown_or_hide();
+        assert!(engine.is_rule_displayed("rule-kill-dismiss"));
+
+        // User dismisses rule-kill-dismiss
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-kill-dismiss".to_string(),
+            })
+            .await;
+
+        let rt_kill = engine.runtimes.get("rule-kill-dismiss").unwrap();
+        assert!(rt_kill.grace_dismissed, "grace_dismissed must be true");
+        assert!(rt_kill.grace_countdown.is_some(), "grace countdown must continue in background");
+
+        // Engine should have transitioned to the other active countdown (rule-close-dismiss)
+        assert!(engine.is_rule_displayed("rule-close-dismiss"));
+
+        // Calling transition_to_active_countdown_or_hide again does not resurrect rule-kill-dismiss
+        engine.transition_to_active_countdown_or_hide();
+        assert!(engine.is_rule_displayed("rule-close-dismiss"));
+
+        // User dismisses rule-close-dismiss
+        engine
+            .handle_command(DaemonCommand::AcknowledgeAppWarning {
+                rule_id: "rule-close-dismiss".to_string(),
+            })
+            .await;
+
+        let rt_close = engine.runtimes.get("rule-close-dismiss").unwrap();
+        assert!(rt_close.grace_dismissed, "grace_dismissed must be true");
+        assert!(rt_close.grace_countdown.is_some());
+
+        // Both dismissed: overlay should be hidden
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+
+        // Calling transition_to_active_countdown_or_hide again does not resurrect either dismissed timer
+        engine.transition_to_active_countdown_or_hide();
+        assert!(matches!(engine.active_overlay_mode, OverlayMode::Hidden));
+    }
+
+    #[tokio::test]
+    async fn test_show_notification_hud_blocked_by_break_keeps_rollback_false() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut break_rule = Rule::default_template(0);
+        break_rule.id = "rule-break-active".to_string();
+        break_rule.action = RuleAction::ShowOverlay;
+
+        let mut notify_rule = Rule::default_template(1);
+        notify_rule.id = "rule-notify-hud".to_string();
+        notify_rule.action = RuleAction::ShowNotification;
+        notify_rule.notification_method = NotificationMethod::Hud;
+
+        cfg.rules = vec![break_rule.clone(), notify_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+
+        // Simulate an active BreakEnforcer overlay on screen
+        let break_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-break-active".into(),
+            title: "Active Break".into(),
+            paragraphs: Vec::new(),
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+            remaining_seconds: 60,
+            duration_seconds: 60,
+        };
+        engine.active_overlay_mode = break_mode;
+        assert!(engine.is_rule_displayed("rule-break-active"));
+
+        // Execute notify rule action (ShowNotification via Hud)
+        engine
+            .execute_rule_action(&notify_rule, None, now, "work.exe", 3600, 3600)
+            .await;
+
+        // BreakEnforcer is priority 4, HudToast is priority 2, so HudToast was rejected
+        assert!(engine.is_rule_displayed("rule-break-active"));
+        assert!(!engine.is_rule_displayed("rule-notify-hud"));
+
+        // can_rollback_completion must remain false because the toast was blocked
+        let rt_notify = engine.runtimes.get("rule-notify-hud").unwrap();
+        assert!(
+            !rt_notify.can_rollback_completion,
+            "can_rollback_completion must remain false when HudToast is blocked by BreakEnforcer"
+        );
+        assert!(rt_notify.last_completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_pre_action_warning_hud_blocked_by_break_falls_back_to_windows() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.suppress_fullscreen_d3d = false;
+
+        let mut break_rule = Rule::default_template(0);
+        break_rule.id = "rule-break-active-warn".to_string();
+        break_rule.action = RuleAction::ShowOverlay;
+
+        let mut warn_rule = Rule::default_template(1);
+        warn_rule.id = "rule-warn-hud".to_string();
+        warn_rule.name = "Warning Rule".to_string();
+        warn_rule.notification_method = NotificationMethod::Hud;
+
+        cfg.rules = vec![break_rule.clone(), warn_rule.clone()];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // BreakEnforcer is active
+        engine.active_overlay_mode = OverlayMode::BreakEnforcer {
+            rule_id: "rule-break-active-warn".into(),
+            title: "Active Break".into(),
+            paragraphs: Vec::new(),
+            allow_snooze: true,
+            strict_mode: false,
+            click_through: false,
+            remaining_seconds: 60,
+            duration_seconds: 60,
+        };
+
+        let ctx = MessageContext::sample();
+        // Dispatches pre-action warning; since BreakEnforcer is priority 4, show_overlay is rejected
+        engine.dispatch_pre_action_warning(&warn_rule, &ctx, 60);
+
+        // Toast was blocked, BreakEnforcer is still displayed
+        assert!(engine.is_rule_displayed("rule-break-active-warn"));
+        assert!(!engine.is_rule_displayed("rule-warn-hud"));
     }
 }
