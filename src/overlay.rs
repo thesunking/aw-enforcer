@@ -48,6 +48,25 @@ impl std::fmt::Debug for MonitorBounds {
     }
 }
 
+impl MonitorBounds {
+    /// Returns true if the monitor's work area spans the entire monitor bounds (no taskbar).
+    pub fn is_full_monitor(&self) -> bool {
+        self.work_rect.left == self.monitor_rect.left
+            && self.work_rect.top == self.monitor_rect.top
+            && self.work_rect.right == self.monitor_rect.right
+            && self.work_rect.bottom == self.monitor_rect.bottom
+    }
+
+    /// Computes safe overlay dimensions `(width, height)` within the work area.
+    /// If work_rect matches monitor_rect 1:1, subtracts 1px from height so Windows DWM
+    /// does not promote the window into an opaque Fullscreen Direct Flip exclusive surface.
+    pub fn work_area_overlay_dimensions(&self) -> (i32, i32) {
+        let width = (self.work_rect.right - self.work_rect.left).max(1);
+        let height = ((self.work_rect.bottom - self.work_rect.top) - if self.is_full_monitor() { 1 } else { 0 }).max(1);
+        (width, height)
+    }
+}
+
 /// Active display mode and payload for the overlay window manager.
 #[derive(Debug, Clone)]
 pub enum OverlayMode {
@@ -177,12 +196,7 @@ impl OverlayManager {
             }
         }
         for i in active_count..self.windows.len() {
-            if let Some(hwnd) = Self::extract_hwnd(&self.windows[i]) {
-                unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-            }
-            self.windows[i].hide().ok();
+            hide_overlay_window(&self.windows[i]);
             if !self.destroy_windows_on_hide && i < self.desired_placements.len() {
                 self.desired_placements[i] = None;
                 self.applied_placements[i] = None;
@@ -195,10 +209,30 @@ impl OverlayManager {
         }
     }
 
+    /// Returns the primary monitor, or the first monitor if no primary monitor is designated.
+    pub fn primary_monitor(monitors: &[MonitorBounds]) -> &MonitorBounds {
+        monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0])
+    }
+
     /// Computes top-right coordinates `(x, y)` inset by `margin` inside the primary monitor's work area.
     pub fn primary_top_right(monitors: &[MonitorBounds], card_w: i32, margin: i32) -> (i32, i32) {
-        let m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
+        let m = Self::primary_monitor(monitors);
         (m.work_rect.right - card_w - margin, m.work_rect.top + margin)
+    }
+
+    /// Prepares scale and computes scaled dimensions and top-right position `(card_w, card_h, x, y)` on the primary monitor.
+    fn compute_top_right_placement(
+        &mut self,
+        monitors: &[MonitorBounds],
+        w: f32,
+        h: f32,
+        margin_logical: f32,
+    ) -> (i32, i32, i32, i32) {
+        let primary_m = Self::primary_monitor(monitors);
+        let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
+        let (card_w, card_h, margin) = scale_card_bounds(scale, w, h, margin_logical);
+        let (x, y) = Self::primary_top_right(monitors, card_w, margin);
+        (card_w, card_h, x, y)
     }
 
     /// Positions window `idx` onto `(target_x, target_y)` before reading its DPI scale factor,
@@ -302,12 +336,7 @@ impl OverlayManager {
             let mut monitors_changed = current_monitors.len() != active_placements_count;
             if !monitors_changed {
                 for (idx, mon) in current_monitors.iter().enumerate() {
-                    let is_full_monitor = mon.work_rect.left == mon.monitor_rect.left
-                        && mon.work_rect.top == mon.monitor_rect.top
-                        && mon.work_rect.right == mon.monitor_rect.right
-                        && mon.work_rect.bottom == mon.monitor_rect.bottom;
-                    let width = (mon.work_rect.right - mon.work_rect.left).max(1);
-                    let height = ((mon.work_rect.bottom - mon.work_rect.top) - if is_full_monitor { 1 } else { 0 }).max(1);
+                    let (width, height) = mon.work_area_overlay_dimensions();
 
                     match self.desired_placements.get(idx).and_then(|p| p.as_ref()) {
                         Some(p) => {
@@ -396,38 +425,19 @@ impl OverlayManager {
                         DeleteObject(hrgn as _);
                     }
 
-                    if desired.extend_dwm_frame {
-                        let margins = MARGINS {
-                            cxLeftWidth: -1,
-                            cxRightWidth: -1,
-                            cyTopHeight: -1,
-                            cyBottomHeight: -1,
-                        };
-                        DwmExtendFrameIntoClientArea(hwnd, &margins);
-                    } else {
-                        let margins = MARGINS {
-                            cxLeftWidth: 0,
-                            cxRightWidth: 0,
-                            cyTopHeight: 0,
-                            cyBottomHeight: 0,
-                        };
-                        DwmExtendFrameIntoClientArea(hwnd, &margins);
-                    }
-
-                    let swp_flags = if desired.click_through || desired.no_activate {
-                        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW
-                    } else {
-                        SWP_FRAMECHANGED | SWP_SHOWWINDOW
+                    let val = if desired.extend_dwm_frame { -1 } else { 0 };
+                    let margins = MARGINS {
+                        cxLeftWidth: val,
+                        cxRightWidth: val,
+                        cyTopHeight: val,
+                        cyBottomHeight: val,
                     };
+                    DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+                    let inactive = desired.click_through || desired.no_activate;
+                    let swp_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW | if inactive { SWP_NOACTIVATE } else { 0 };
                     SetWindowPos(hwnd, HWND_TOPMOST, desired.x, desired.y, safe_w, safe_h, swp_flags);
-                    ShowWindow(
-                        hwnd,
-                        if desired.click_through || desired.no_activate {
-                            SW_SHOWNOACTIVATE
-                        } else {
-                            SW_SHOW
-                        },
-                    );
+                    ShowWindow(hwnd, if inactive { SW_SHOWNOACTIVATE } else { SW_SHOW });
                     win.window()
                         .set_position(slint::PhysicalPosition::new(desired.x, desired.y));
                     win.window()
@@ -596,12 +606,7 @@ impl OverlayManager {
         self.applied_placements.clear();
         *self.status_pos.borrow_mut() = None;
         for win in &self.windows {
-            if let Some(hwnd) = Self::extract_hwnd(win) {
-                unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-            }
-            win.hide().ok();
+            hide_overlay_window(win);
         }
         if self.destroy_windows_on_hide {
             self.windows.clear();
@@ -654,15 +659,7 @@ impl OverlayManager {
                         set_window_paragraphs(win, paragraphs);
                     }
 
-                    let width = mon.work_rect.right - mon.work_rect.left;
-                    let is_full_monitor = mon.work_rect.left == mon.monitor_rect.left
-                        && mon.work_rect.top == mon.monitor_rect.top
-                        && mon.work_rect.right == mon.monitor_rect.right
-                        && mon.work_rect.bottom == mon.monitor_rect.bottom;
-                    // Position within work_rect so the break overlay does not cover the Windows taskbar.
-                    // If work_rect matches monitor_rect 1:1 (e.g. secondary monitor with no taskbar),
-                    // subtract 1px from height so DWM does not promote it to an opaque Fullscreen Direct Flip surface.
-                    let height = (mon.work_rect.bottom - mon.work_rect.top) - if is_full_monitor { 1 } else { 0 };
+                    let (width, height) = mon.work_area_overlay_dimensions();
                     tracing::debug!(
                         "BreakEnforcer monitor {idx}: monitor_rect={:?}, work_rect={:?}, target_w={width}, target_h={height}",
                         (mon.monitor_rect.left, mon.monitor_rect.top, mon.monitor_rect.right, mon.monitor_rect.bottom),
@@ -719,11 +716,7 @@ impl OverlayManager {
                     win.set_selected_snooze_index(0);
                 }
 
-                let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
-                let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
-                let (card_w, card_h, margin) = scale_card_bounds(scale, 480.0, 280.0, 20.0);
-                let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
-
+                let (card_w, card_h, x, y) = self.compute_top_right_placement(&monitors, 480.0, 280.0, 20.0);
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, false, true, false);
             }
             OverlayMode::HudTimer {
@@ -753,11 +746,7 @@ impl OverlayManager {
                     set_window_paragraphs(win, paragraphs);
                 }
 
-                let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
-                let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
-                let (card_w, card_h, margin) = scale_card_bounds(scale, 420.0, 220.0, 20.0);
-                let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
-
+                let (card_w, card_h, x, y) = self.compute_top_right_placement(&monitors, 420.0, 220.0, 20.0);
                 self.apply_win32_overlay_styles(0, x, y, card_w, card_h, false, true, false);
             }
             OverlayMode::HudStatus {
@@ -772,30 +761,22 @@ impl OverlayManager {
             } => {
                 self.prepare_windows(1);
 
-                let (card_w, card_h, _margin, x, y) = if was_hud_status {
+                let active_pos = was_hud_status.then(|| {
                     let visible_pos = self.windows.first().and_then(Self::extract_hwnd).and_then(|hwnd| unsafe {
                         let mut r: RECT = std::mem::zeroed();
                         (IsWindowVisible(hwnd) != 0 && GetWindowRect(hwnd, &mut r) != 0 && r.right > r.left)
                             .then_some((r.left, r.top))
                     });
-                    if let Some((target_x, target_y)) = visible_pos.or_else(|| *self.status_pos.borrow()) {
-                        let scale = self.prepare_target_scale(0, target_x, target_y);
-                        let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
-                        let (x, y) = clamp_or_reset_status_pos((target_x, target_y), card_w, card_h, margin, &monitors);
-                        (card_w, card_h, margin, x, y)
-                    } else {
-                        let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
-                        let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
-                        let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
-                        let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
-                        (card_w, card_h, margin, x, y)
-                    }
-                } else {
-                    let primary_m = monitors.iter().find(|m| m.is_primary).unwrap_or(&monitors[0]);
-                    let scale = self.prepare_target_scale(0, primary_m.work_rect.left, primary_m.work_rect.top);
+                    visible_pos.or_else(|| *self.status_pos.borrow())
+                }).flatten();
+
+                let (card_w, card_h, x, y) = if let Some((target_x, target_y)) = active_pos {
+                    let scale = self.prepare_target_scale(0, target_x, target_y);
                     let (card_w, card_h, margin) = scale_card_bounds(scale, 540.0, 270.0, 20.0);
-                    let (x, y) = Self::primary_top_right(&monitors, card_w, margin);
-                    (card_w, card_h, margin, x, y)
+                    let (x, y) = clamp_or_reset_status_pos((target_x, target_y), card_w, card_h, margin, &monitors);
+                    (card_w, card_h, x, y)
+                } else {
+                    self.compute_top_right_placement(&monitors, 540.0, 270.0, 20.0)
                 };
 
                 *self.status_pos.borrow_mut() = Some((x, y));
@@ -917,6 +898,16 @@ pub fn clamp_or_reset_status_pos(
     }
 }
 
+/// Hides an overlay window in native Win32 and in Slint.
+fn hide_overlay_window(win: &OverlayWindow) {
+    if let Some(hwnd) = OverlayManager::extract_hwnd(win) {
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    win.hide().ok();
+}
+
 /// Sets formatted message paragraphs on an `OverlayWindow`.
 fn set_window_paragraphs(win: &OverlayWindow, paragraphs: &[FormattedParagraph]) {
     let para_models = Rc::new(VecModel::from(paragraphs.to_vec()));
@@ -934,6 +925,27 @@ mod tests {
             work_rect: RECT { left, top, right, bottom },
             is_primary,
         }
+    }
+
+    #[test]
+    fn test_monitor_bounds_work_area_dimensions() {
+        // Monitor with taskbar (work_rect height 1040 vs monitor 1080)
+        let mon_with_taskbar = MonitorBounds {
+            monitor_rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            work_rect: RECT { left: 0, top: 0, right: 1920, bottom: 1040 },
+            is_primary: true,
+        };
+        assert!(!mon_with_taskbar.is_full_monitor());
+        assert_eq!(mon_with_taskbar.work_area_overlay_dimensions(), (1920, 1040));
+
+        // Monitor without taskbar (work_rect matches monitor_rect 1:1) -> 1px subtracted from height
+        let mon_full = MonitorBounds {
+            monitor_rect: RECT { left: 1920, top: 0, right: 3840, bottom: 1080 },
+            work_rect: RECT { left: 1920, top: 0, right: 3840, bottom: 1080 },
+            is_primary: false,
+        };
+        assert!(mon_full.is_full_monitor());
+        assert_eq!(mon_full.work_area_overlay_dimensions(), (1920, 1079));
     }
 
     #[test]
