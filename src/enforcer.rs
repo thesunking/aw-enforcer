@@ -101,48 +101,10 @@ pub fn close_active_browser_tab<S: AsRef<str>>(
     if find_matching_foreground_window(target_executables, compiled_regex).is_some() {
         unsafe {
             let hwnd = GetForegroundWindow();
-            let make_key = |vk: u16, flags: u32| INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: vk,
-                        wScan: 0,
-                        dwFlags: flags,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
-            };
-            let inputs = [
-                make_key(VK_SHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_LSHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_RSHIFT, KEYEVENTF_KEYUP),
-                make_key(VK_MENU, KEYEVENTF_KEYUP),
-                make_key(VK_LMENU, KEYEVENTF_KEYUP),
-                make_key(VK_RMENU, KEYEVENTF_KEYUP),
-                make_key(VK_LWIN, KEYEVENTF_KEYUP),
-                make_key(VK_RWIN, KEYEVENTF_KEYUP),
-                make_key(VK_CONTROL, 0),
-                make_key(b'W' as u16, 0),
-                make_key(b'W' as u16, KEYEVENTF_KEYUP),
-                make_key(VK_CONTROL, KEYEVENTF_KEYUP),
-                make_key(VK_LCONTROL, KEYEVENTF_KEYUP),
-                make_key(VK_RCONTROL, KEYEVENTF_KEYUP),
-            ];
-            let sent = SendInput(
-                inputs.len() as u32,
-                inputs.as_ptr(),
-                std::mem::size_of::<INPUT>() as i32,
-            );
-            if sent == 0 {
-                tracing::warn!(
-                    "SendInput(Ctrl+W) failed or was blocked by UIPI on HWND {:?}",
-                    hwnd
-                );
-                return false;
+            if send_ctrl_w_keystroke(hwnd) {
+                tracing::info!("Sent Ctrl+W to close active tab on HWND {:?}", hwnd);
+                return true;
             }
-            tracing::info!("Sent Ctrl+W to close active tab on HWND {:?}", hwnd);
-            return true;
         }
     }
     false
@@ -216,22 +178,11 @@ pub fn send_system_notification(title: &str, message: &str) {
     {
         ensure_app_user_model_id_registered();
 
-        let res = winrt_notification::Toast::new(APP_AUMID)
-            .title(title)
-            .text1(message)
-            .duration(winrt_notification::Duration::Short)
-            .show();
-
-        if let Err(e) = res {
+        if let Err(e) = show_toast(APP_AUMID, title, message) {
             tracing::warn!(
                 "Failed to send WinRT notification with custom AUMID '{APP_AUMID}': {e}. Falling back to PowerShell AUMID."
             );
-            if let Err(e2) = winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
-                .title(title)
-                .text1(message)
-                .duration(winrt_notification::Duration::Short)
-                .show()
-            {
+            if let Err(e2) = show_toast(winrt_notification::Toast::POWERSHELL_APP_ID, title, message) {
                 tracing::warn!("Failed to send WinRT notification with fallback AUMID: {e2}");
             }
         }
@@ -348,11 +299,7 @@ pub fn find_matching_foreground_window<S: AsRef<str>>(
         let has_exe_targets = has_specific_targets(target_executables);
 
         let window_title = get_window_title(hwnd);
-
-        let title_matches = match compiled_regex {
-            Some(re) => !window_title.is_empty() && re.is_match(&window_title),
-            None => false,
-        };
+        let title_matches = matches_title_regex(&window_title, compiled_regex);
 
         if compiled_regex.is_some() && !title_matches {
             return None;
@@ -526,10 +473,7 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
         String::new()
     };
 
-    let title_matches = match ctx.compiled_regex {
-        Some(re) => !title.is_empty() && re.is_match(&title),
-        None => false,
-    };
+    let title_matches = matches_title_regex(&title, ctx.compiled_regex);
 
     if ctx.compiled_regex.is_some() && !title_matches {
         return 1;
@@ -574,6 +518,14 @@ unsafe extern "system" fn enum_windows_callback<S: AsRef<str>>(hwnd: HWND, lpara
     }
 
     1
+}
+
+/// Helper checking whether `title` is non-empty and matches `compiled_regex`.
+pub fn matches_title_regex(title: &str, compiled_regex: Option<&Regex>) -> bool {
+    match compiled_regex {
+        Some(re) => !title.is_empty() && re.is_match(title),
+        None => false,
+    }
 }
 
 /// Returns true if the window is protected, invisible, owned by current process, a shell surface, or minimized.
@@ -662,8 +614,7 @@ pub fn exe_name_matches_targets<S: AsRef<str>>(
         if t.is_empty() || t == "*" || t.starts_with('!') {
             continue;
         }
-        let (t_base, t_stem) = normalize_exe_stem(t);
-        if !t_base.is_empty() && stem_or_base_matches(exe_base, exe_stem, t_base, t_stem) {
+        if target_matches_exe(t, exe_base, exe_stem) {
             return true;
         }
     }
@@ -676,18 +627,18 @@ pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &
     if exe_base.is_empty() {
         return false;
     }
-    for target in target_executables {
+    target_executables.iter().any(|target| {
         let t = target.as_ref().trim();
-        if let Some(rest) = t.strip_prefix('!') {
-            let (target_base, target_stem) = normalize_exe_stem(rest);
-            if !target_base.is_empty()
-                && stem_or_base_matches(exe_base, exe_stem, target_base, target_stem)
-            {
-                return true;
-            }
-        }
-    }
-    false
+        t.strip_prefix('!')
+            .is_some_and(|rest| target_matches_exe(rest, exe_base, exe_stem))
+    })
+}
+
+/// Returns true if `target_pattern` matches the normalized executable base or stem.
+#[inline]
+fn target_matches_exe(target_pattern: &str, exe_base: &str, exe_stem: &str) -> bool {
+    let (t_base, t_stem) = normalize_exe_stem(target_pattern);
+    !t_base.is_empty() && stem_or_base_matches(exe_base, exe_stem, t_base, t_stem)
 }
 
 #[inline]
@@ -849,6 +800,68 @@ unsafe fn post_wm_close(hwnd: HWND, title: Option<&str>) -> bool {
     }
 }
 
+/// Sends the synthetic keystroke Ctrl+W to `hwnd` via `SendInput`, returning true if delivered.
+unsafe fn send_ctrl_w_keystroke(hwnd: HWND) -> bool {
+    let inputs = [
+        make_keyboard_input(VK_SHIFT, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_LSHIFT, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_RSHIFT, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_MENU, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_LMENU, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_RMENU, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_LWIN, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_RWIN, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_CONTROL, 0),
+        make_keyboard_input(b'W' as u16, 0),
+        make_keyboard_input(b'W' as u16, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_LCONTROL, KEYEVENTF_KEYUP),
+        make_keyboard_input(VK_RCONTROL, KEYEVENTF_KEYUP),
+    ];
+    let sent = SendInput(
+        inputs.len() as u32,
+        inputs.as_ptr(),
+        std::mem::size_of::<INPUT>() as i32,
+    );
+    if sent == 0 {
+        tracing::warn!(
+            "SendInput(Ctrl+W) failed or was blocked by UIPI on HWND {:?}",
+            hwnd
+        );
+        false
+    } else {
+        true
+    }
+}
+
+/// Constructs a Win32 `INPUT` keyboard event record.
+#[inline]
+fn make_keyboard_input(vk: u16, flags: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+#[cfg(not(test))]
+/// Dispatches a WinRT toast notification with the specified AUMID and short duration.
+fn show_toast(aumid: &str, title: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    winrt_notification::Toast::new(aumid)
+        .title(title)
+        .text1(message)
+        .duration(winrt_notification::Duration::Short)
+        .show()
+        .map_err(|e| e.into())
+}
+
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -1004,5 +1017,14 @@ mod tests {
     fn test_get_idle_time_millis() {
         // Safe query returning physical idle milliseconds without panic
         let _idle = get_idle_time_millis();
+    }
+
+    #[test]
+    fn test_matches_title_regex() {
+        let re = Regex::new(r"(?i)youtube").unwrap();
+        assert!(matches_title_regex("YouTube - Watch Videos", Some(&re)));
+        assert!(!matches_title_regex("Google Search", Some(&re)));
+        assert!(!matches_title_regex("", Some(&re)));
+        assert!(!matches_title_regex("YouTube", None));
     }
 }
