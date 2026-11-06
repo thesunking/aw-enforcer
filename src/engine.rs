@@ -353,6 +353,44 @@ impl RuleRuntime {
         self.last_matched_title = normalized;
     }
 
+    /// Clears all matched window/tab metadata and cached title regex.
+    pub fn clear_matched_metadata(&mut self) {
+        self.last_matched_app = None;
+        self.last_matched_url = None;
+        self.set_last_matched_title(None);
+    }
+
+    /// Resets all state for a rule on a new logical day rollover.
+    pub fn reset_for_new_day(&mut self) {
+        self.warned_current_cycle = false;
+        self.action_executed_today = false;
+        self.grace_countdown = None;
+        self.snoozed_until = None;
+        self.pending_break_since = None;
+        self.daily_usage_seconds = 0;
+        self.daily_reset_at = None;
+        self.can_rollback_completion = false;
+        self.clear_matched_metadata();
+    }
+
+    /// Updates matched metadata (`last_matched_url`, `last_matched_app`, and `last_matched_title`)
+    /// from an ActivityWatch event, or clears them if `ev` is `None` for a URL rule.
+    pub fn update_matched_metadata(&mut self, ev: Option<&AwEvent>, is_urls_rule: bool) {
+        if let Some(ev) = ev {
+            if is_urls_rule {
+                self.last_matched_url = ev.data.url.clone();
+                if let Some(url_str) = ev.data.url.as_deref() {
+                    self.last_matched_app = Some(extract_url_host(url_str));
+                }
+            } else if let Some(ref app) = ev.data.app {
+                self.last_matched_app = Some(app.clone());
+            }
+            self.set_last_matched_title(ev.data.title.clone());
+        } else if is_urls_rule {
+            self.clear_matched_metadata();
+        }
+    }
+
     /// Clears active break, grace countdown, pending break, and warning flags for the current cycle.
     pub fn reset_active_timers(&mut self) {
         if self.active_break.is_some() {
@@ -374,10 +412,7 @@ impl RuleRuntime {
         self.last_completed_at = Some(now);
         self.can_rollback_completion = false;
         self.action_executed_today = true;
-        self.last_matched_app = None;
-        self.last_matched_url = None;
-        self.last_matched_title = None;
-        self.last_matched_title_regex = None;
+        self.clear_matched_metadata();
     }
 
     /// Resets the rule's active session or daily quota, clearing timers, snooze, and daily limit locks.
@@ -390,9 +425,7 @@ impl RuleRuntime {
         self.can_rollback_completion = false;
         self.action_executed_today = false;
         self.daily_usage_seconds = 0;
-        self.last_matched_app = None;
-        self.last_matched_url = None;
-        self.set_last_matched_title(None);
+        self.clear_matched_metadata();
     }
 
     /// Snoozes the rule until `until`. For `Period` rules, preserves `last_completed_at` if before
@@ -679,23 +712,9 @@ impl Engine {
             let elapsed = self.rule_elapsed_seconds(&rule);
             let threshold = rule.trigger_threshold_seconds();
             let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, 0);
-            let raw_msg = self.get_effective_rule_message(&rule);
-            let paragraphs = self.parse_rule_message(
-                raw_msg,
-                &ctx,
-                TextHorizontalAlignment::Center,
-            );
+            let mode = self.build_break_enforcer_overlay(&rule, &ctx, total, rem);
             self.active_overlay_mode = OverlayMode::Hidden;
-            self.show_overlay(OverlayMode::BreakEnforcer {
-                rule_id: rule.id.clone(),
-                title: rule.name.clone(),
-                paragraphs,
-                duration_seconds: total,
-                remaining_seconds: rem,
-                allow_snooze: !rule.strict_mode,
-                strict_mode: rule.strict_mode,
-                click_through: rule.click_through,
-            });
+            self.show_overlay(mode);
             self.overlay_tx
                 .send(OverlayAction::UpdateCountdown {
                     remaining: rem,
@@ -751,31 +770,9 @@ impl Engine {
             let elapsed = self.rule_elapsed_seconds(&rule);
             let threshold = rule.trigger_threshold_seconds();
             let ctx = self.build_message_context(&rule, &matched_app, elapsed, threshold, rem);
-            let default_msg = format!(
-                "[color=#f87171 bold] {} in {}s.",
-                rule.action.as_str(),
-                total
-            );
-            let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
-                &rule.message
-            } else {
-                &default_msg
-            };
-            let paragraphs = self.parse_rule_message(
-                raw_msg,
-                &ctx,
-                TextHorizontalAlignment::Left,
-            );
+            let mode = self.build_hud_timer_overlay(&rule, &ctx, total, rem);
             self.active_overlay_mode = OverlayMode::Hidden;
-            self.show_overlay(OverlayMode::HudTimer {
-                rule_id: rule.id.clone(),
-                title: format!("{}: {}", rule.action.as_str(), rule.name),
-                paragraphs,
-                duration_seconds: total,
-                remaining_seconds: rem,
-                allow_snooze: !rule.strict_mode,
-                strict_mode: rule.strict_mode,
-            });
+            self.show_overlay(mode);
             self.overlay_tx
                 .send(OverlayAction::UpdateCountdown {
                     remaining: rem,
@@ -1120,21 +1117,8 @@ impl Engine {
                     rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
-                let paragraphs = self.parse_rule_message(
-                    raw_msg,
-                    &ctx,
-                    TextHorizontalAlignment::Center,
-                );
-                self.show_overlay(OverlayMode::BreakEnforcer {
-                    rule_id: rule.id.clone(),
-                    title: rule.name.clone(),
-                    paragraphs,
-                    duration_seconds: break_secs,
-                    remaining_seconds: break_secs,
-                    allow_snooze: !rule.strict_mode,
-                    strict_mode: rule.strict_mode,
-                    click_through: rule.click_through,
-                });
+                let mode = self.build_break_enforcer_overlay(&rule, &ctx, break_secs, break_secs);
+                self.show_overlay(mode);
             }
         }
 
@@ -1319,18 +1303,7 @@ impl Engine {
         if logical_now.date_naive() != self.last_reset_date {
             self.last_reset_date = logical_now.date_naive();
             for rt in self.runtimes.values_mut() {
-                rt.warned_current_cycle = false;
-                rt.action_executed_today = false;
-                rt.grace_countdown = None;
-                rt.snoozed_until = None;
-                rt.pending_break_since = None;
-                rt.daily_usage_seconds = 0;
-                rt.daily_reset_at = None;
-                rt.can_rollback_completion = false;
-                rt.last_matched_app = None;
-                rt.last_matched_url = None;
-                rt.last_matched_title = None;
-                rt.last_matched_title_regex = None;
+                rt.reset_for_new_day();
             }
         }
 
@@ -1412,19 +1385,10 @@ impl Engine {
         let mut should_transition_after_eval = false;
 
         if self.config.general.pause_all_rules || is_globally_snoozed {
-            for rule in &self.config.rules {
-                if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    if rt.pending_break_since.is_some()
-                        || rt.grace_countdown.is_some()
-                        || rt.active_break.is_some()
-                    {
-                        rt.reset_active_timers();
-                        if self.is_rule_displayed(&rule.id) {
-                            should_transition_after_eval = true;
-                        }
-                    } else {
-                        rt.current_session_seconds = 0;
-                    }
+            for idx in 0..self.config.rules.len() {
+                let rule_id = self.config.rules[idx].id.clone();
+                if self.deactivate_rule_runtime(&rule_id) {
+                    should_transition_after_eval = true;
                 }
             }
         } else {
@@ -1432,19 +1396,9 @@ impl Engine {
                 if !self.config.rules[idx].enabled
                     || !self.config.rules[idx].schedule.is_active(day_index, hour_index)
                 {
-                    let rule_id = &self.config.rules[idx].id;
-                    if let Some(rt) = self.runtimes.get_mut(rule_id) {
-                        if rt.pending_break_since.is_some()
-                            || rt.grace_countdown.is_some()
-                            || rt.active_break.is_some()
-                        {
-                            rt.reset_active_timers();
-                            if self.is_rule_displayed(rule_id) {
-                                should_transition_after_eval = true;
-                            }
-                        } else {
-                            rt.current_session_seconds = 0;
-                        }
+                    let rule_id = self.config.rules[idx].id.clone();
+                    if self.deactivate_rule_runtime(&rule_id) {
+                        should_transition_after_eval = true;
                     }
                     continue;
                 }
@@ -1563,26 +1517,16 @@ impl Engine {
             rule_statuses.push((rule.id.clone(), badge));
         }
 
+        let today_hm = format!("{}h {}m", total_today_mins / 60, total_today_mins % 60);
         let strict_lock_active = self.is_strict_lock_active(now);
         let tray_tooltip = if self.config.general.pause_all_rules {
-            format!(
-                "AW-Enforcer (Paused) — Today: {}h {}m",
-                total_today_mins / 60,
-                total_today_mins % 60
-            )
+            format!("AW-Enforcer (Paused) — Today: {today_hm}")
         } else if let Some(until) = self.global_snoozed_until.filter(|&u| u > now) {
             let rem_mins = ((until - now).num_seconds().max(1) + 59) / 60;
-            format!(
-                "AW-Enforcer (Snoozed {}m) — Today: {}h {}m",
-                rem_mins,
-                total_today_mins / 60,
-                total_today_mins % 60
-            )
+            format!("AW-Enforcer (Snoozed {rem_mins}m) — Today: {today_hm}")
         } else {
             format!(
-                "AW-Enforcer — Today: {}h {}m | Session: {}m",
-                total_today_mins / 60,
-                total_today_mins % 60,
+                "AW-Enforcer — Today: {today_hm} | Session: {}m",
                 max_session_secs / 60
             )
         };
@@ -1601,7 +1545,7 @@ impl Engine {
         self.overlay_tx
             .send(OverlayAction::UpdateLiveStatus {
                 session_duration_text: format!("{}m", max_session_secs / 60),
-                screentime_text: format!("{}h {}m", total_today_mins / 60, total_today_mins % 60),
+                screentime_text: today_hm,
                 active_app,
                 strict_lock_active,
                 rule_statuses,
@@ -1631,6 +1575,83 @@ impl Engine {
         alignment: TextHorizontalAlignment,
     ) -> Vec<FormattedParagraph> {
         formatter::parse_message(raw_msg, ctx, self.default_text_color(), alignment)
+    }
+
+    /// Deactivates a rule's active timers, pending breaks, or grace countdowns (e.g. when paused or off-schedule).
+    /// Returns true if the deactivated rule was actively displayed on screen.
+    fn deactivate_rule_runtime(&mut self, rule_id: &str) -> bool {
+        if let Some(rt) = self.runtimes.get_mut(rule_id) {
+            if rt.pending_break_since.is_some()
+                || rt.grace_countdown.is_some()
+                || rt.active_break.is_some()
+            {
+                rt.reset_active_timers();
+                return self.is_rule_displayed(rule_id);
+            } else {
+                rt.current_session_seconds = 0;
+            }
+        }
+        false
+    }
+
+    /// Constructs an `OverlayMode::BreakEnforcer` mode for the given rule and context.
+    fn build_break_enforcer_overlay(
+        &self,
+        rule: &Rule,
+        ctx: &MessageContext,
+        duration_seconds: u32,
+        remaining_seconds: u32,
+    ) -> OverlayMode {
+        let raw_msg = self.get_effective_rule_message(rule);
+        let paragraphs = self.parse_rule_message(
+            raw_msg,
+            ctx,
+            TextHorizontalAlignment::Center,
+        );
+        OverlayMode::BreakEnforcer {
+            rule_id: rule.id.clone(),
+            title: rule.name.clone(),
+            paragraphs,
+            duration_seconds,
+            remaining_seconds,
+            allow_snooze: !rule.strict_mode,
+            strict_mode: rule.strict_mode,
+            click_through: rule.click_through,
+        }
+    }
+
+    /// Constructs an `OverlayMode::HudTimer` mode for the given rule and context.
+    fn build_hud_timer_overlay(
+        &self,
+        rule: &Rule,
+        ctx: &MessageContext,
+        duration_seconds: u32,
+        remaining_seconds: u32,
+    ) -> OverlayMode {
+        let default_msg = format!(
+            "[color=#f87171 bold] {} in {}s.",
+            rule.action.as_str(),
+            duration_seconds
+        );
+        let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
+            &rule.message
+        } else {
+            &default_msg
+        };
+        let paragraphs = self.parse_rule_message(
+            raw_msg,
+            ctx,
+            TextHorizontalAlignment::Left,
+        );
+        OverlayMode::HudTimer {
+            rule_id: rule.id.clone(),
+            title: format!("{}: {}", rule.action.as_str(), rule.name),
+            paragraphs,
+            duration_seconds,
+            remaining_seconds,
+            allow_snooze: !rule.strict_mode,
+            strict_mode: rule.strict_mode,
+        }
     }
 
     /// Returns the last matched application name for `rule_id`, falling back to `"Active Application"`.
@@ -1756,40 +1777,9 @@ impl Engine {
             }
             if rt.grace_countdown.is_some() {
                 if rule.monitor_selection == MonitorSelection::Urls {
-                    let recency_cutoff = now_utc
-                        - Duration::seconds(
-                            (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
-                        );
-                    let latest_ev = events
-                        .iter()
-                        .filter(|ev| event_end_utc(ev) >= recency_cutoff)
-                        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp));
-
-                    if let Some(ev) = latest_ev {
-                        if event_matches_rule(ev, rule, compiled_re) {
-                            rt.last_matched_url = ev.data.url.clone();
-                            if let Some(url_str) = ev.data.url.as_deref() {
-                                rt.last_matched_app = Some(extract_url_host(url_str));
-                            }
-                            if let Some(ref title) = ev.data.title {
-                                if !title.trim().is_empty() {
-                                    rt.set_last_matched_title(Some(title.clone()));
-                                } else {
-                                    rt.set_last_matched_title(None);
-                                }
-                            } else {
-                                rt.set_last_matched_title(None);
-                            }
-                        } else {
-                            rt.last_matched_app = None;
-                            rt.last_matched_url = None;
-                            rt.set_last_matched_title(None);
-                        }
-                    } else {
-                        rt.last_matched_app = None;
-                        rt.last_matched_url = None;
-                        rt.set_last_matched_title(None);
-                    }
+                    let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
+                    let matching_ev = find_latest_matching_event(events, rule, compiled_re, recency_cutoff);
+                    rt.update_matched_metadata(matching_ev, true);
                 }
                 return false;
             }
@@ -1894,51 +1884,9 @@ impl Engine {
 
         if !should_warn && !should_trigger {
             if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                let recency_cutoff = now_utc
-                    - Duration::seconds(
-                        (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
-                    );
-                let matching_ev = events
-                    .iter()
-                    .filter(|ev| {
-                        let ev_end = event_end_utc(ev);
-                        ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
-                    })
-                    .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-                    .or_else(|| {
-                        if rule.monitor_selection == MonitorSelection::Urls {
-                            None
-                        } else {
-                            events
-                                .iter()
-                                .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                                .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-                        }
-                    });
-
-                if let Some(ev) = matching_ev {
-                    if rule.monitor_selection == MonitorSelection::Urls {
-                        rt.last_matched_url = ev.data.url.clone();
-                        if let Some(url_str) = ev.data.url.as_deref() {
-                            rt.last_matched_app = Some(extract_url_host(url_str));
-                        }
-                    } else if let Some(ref app) = ev.data.app {
-                        rt.last_matched_app = Some(app.clone());
-                    }
-                    if let Some(ref title) = ev.data.title {
-                        if !title.trim().is_empty() {
-                            rt.set_last_matched_title(Some(title.clone()));
-                        } else {
-                            rt.set_last_matched_title(None);
-                        }
-                    } else {
-                        rt.set_last_matched_title(None);
-                    }
-                } else if rule.monitor_selection == MonitorSelection::Urls {
-                    rt.last_matched_url = None;
-                    rt.last_matched_app = None;
-                    rt.set_last_matched_title(None);
-                }
+                let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
+                let matching_ev = find_latest_matching_event(events, rule, compiled_re, recency_cutoff);
+                rt.update_matched_metadata(matching_ev, rule.monitor_selection == MonitorSelection::Urls);
             }
             return true;
         }
@@ -1953,9 +1901,7 @@ impl Engine {
         let Some(matched_app_name) = matched_window else {
             if rule.monitor_selection == MonitorSelection::Urls {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
-                    rt.last_matched_url = None;
-                    rt.last_matched_app = None;
-                    rt.set_last_matched_title(None);
+                    rt.clear_matched_metadata();
                 }
             }
             return true;
@@ -1964,44 +1910,9 @@ impl Engine {
         if let Some(rt) = self.runtimes.get_mut(&rule.id) {
             rt.last_matched_app = Some(matched_app_name.clone());
 
-            let recency_cutoff = now_utc
-                - Duration::seconds(
-                    (self.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5,
-                );
-            let matching_ev = events
-                .iter()
-                .filter(|ev| {
-                    let ev_end = event_end_utc(ev);
-                    ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
-                })
-                .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-                .or_else(|| {
-                    if rule.monitor_selection == MonitorSelection::Urls {
-                        None
-                    } else {
-                        events
-                            .iter()
-                            .filter(|ev| event_matches_rule(ev, rule, compiled_re))
-                            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-                    }
-                });
-
-            if let Some(ev) = matching_ev {
-                if rule.monitor_selection == MonitorSelection::Urls {
-                    rt.last_matched_url = ev.data.url.clone();
-                }
-                if let Some(ref title) = ev.data.title {
-                    if !title.trim().is_empty() {
-                        rt.set_last_matched_title(Some(title.clone()));
-                    } else {
-                        rt.set_last_matched_title(None);
-                    }
-                } else {
-                    rt.set_last_matched_title(None);
-                }
-            } else if rule.monitor_selection == MonitorSelection::Urls {
-                rt.last_matched_url = None;
-            }
+            let recency_cutoff = calculate_recency_cutoff(now_utc, self.config.general.poll_interval_seconds);
+            let matching_ev = find_latest_matching_event(events, rule, compiled_re, recency_cutoff);
+            rt.update_matched_metadata(matching_ev, rule.monitor_selection == MonitorSelection::Urls);
         }
 
         let grace_secs = rule.grace_duration.to_seconds();
@@ -2072,30 +1983,8 @@ impl Engine {
                     rt.grace_countdown = Some((effective_grace, effective_grace));
                 }
                 let ctx = self.build_message_context(rule, &matched_app_name, elapsed_secs, threshold_secs, effective_grace);
-                let default_msg = format!(
-                    "[color=#f87171 bold] {} in {}s.",
-                    rule.action.as_str(),
-                    effective_grace
-                );
-                let raw_msg = if rule.action != RuleAction::ShowOverlay && !rule.message.trim().is_empty() {
-                    &rule.message
-                } else {
-                    &default_msg
-                };
-                let paragraphs = self.parse_rule_message(
-                    raw_msg,
-                    &ctx,
-                    TextHorizontalAlignment::Left,
-                );
-                self.show_overlay(OverlayMode::HudTimer {
-                    rule_id: rule.id.clone(),
-                    title: format!("{}: {}", rule.action.as_str(), rule.name),
-                    paragraphs,
-                    duration_seconds: effective_grace,
-                    remaining_seconds: effective_grace,
-                    allow_snooze: !rule.strict_mode,
-                    strict_mode: rule.strict_mode,
-                });
+                let mode = self.build_hud_timer_overlay(rule, &ctx, effective_grace, effective_grace);
+                self.show_overlay(mode);
             } else {
                 self.execute_rule_action(rule, compiled_re, now, &matched_app_name, elapsed_secs, threshold_secs).await;
             }
@@ -2143,22 +2032,8 @@ impl Engine {
                     rt.can_rollback_completion = true;
                     rt.action_executed_today = true;
                 }
-                let raw_msg = self.get_effective_rule_message(rule);
-                let paragraphs = self.parse_rule_message(
-                    raw_msg,
-                    &ctx,
-                    TextHorizontalAlignment::Center,
-                );
-                self.show_overlay(OverlayMode::BreakEnforcer {
-                    rule_id: rule.id.clone(),
-                    title: rule.name.clone(),
-                    paragraphs,
-                    duration_seconds: break_secs,
-                    remaining_seconds: break_secs,
-                    allow_snooze: !rule.strict_mode,
-                    strict_mode: rule.strict_mode,
-                    click_through: rule.click_through,
-                });
+                let mode = self.build_break_enforcer_overlay(rule, &ctx, break_secs, break_secs);
+                self.show_overlay(mode);
             }
             RuleAction::ShowNotification => {
                 if let Some(rt) = self.runtimes.get_mut(&rule.id) {
@@ -2770,6 +2645,37 @@ pub fn event_matches_rule(ev: &AwEvent, rule: &Rule, compiled_re: Option<&Regex>
             false
         }
     }
+}
+
+/// Computes the recency cutoff timestamp based on the polling interval.
+pub fn calculate_recency_cutoff(now_utc: DateTime<Utc>, poll_interval_seconds: u64) -> DateTime<Utc> {
+    now_utc - Duration::seconds((poll_interval_seconds.max(2) as i64) * 2 + 5)
+}
+
+/// Finds the most recent matching event within `recency_cutoff` (or historical fallback for non-URL rules).
+pub fn find_latest_matching_event<'a>(
+    events: &'a [AwEvent],
+    rule: &Rule,
+    compiled_re: Option<&Regex>,
+    recency_cutoff: DateTime<Utc>,
+) -> Option<&'a AwEvent> {
+    events
+        .iter()
+        .filter(|ev| {
+            let ev_end = event_end_utc(ev);
+            ev_end >= recency_cutoff && event_matches_rule(ev, rule, compiled_re)
+        })
+        .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+        .or_else(|| {
+            if rule.monitor_selection == MonitorSelection::Urls {
+                None
+            } else {
+                events
+                    .iter()
+                    .filter(|ev| event_matches_rule(ev, rule, compiled_re))
+                    .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
+            }
+        })
 }
 
 /// Helper to check if a visible matching window exists for this rule and return the matched title/process name.
@@ -4275,32 +4181,13 @@ mod tests {
 
         let re = Regex::new(&rule.url_regex).ok();
 
-        // Populate runtime's last_matched_title using the new logic
-        let recency_cutoff = now_utc
-            - Duration::seconds((engine.config.general.poll_interval_seconds.max(2) as i64) * 2 + 5);
+        // Populate runtime's last_matched_title using the helper logic
+        let recency_cutoff = calculate_recency_cutoff(now_utc, engine.config.general.poll_interval_seconds);
         let events = [ev_older, ev_newer];
-        let matching_ev = events
-            .iter()
-            .filter(|ev| {
-                let ev_end = event_end_utc(ev);
-                ev_end >= recency_cutoff && event_matches_rule(ev, &rule, re.as_ref())
-            })
-            .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-            .or_else(|| {
-                events
-                    .iter()
-                    .filter(|ev| event_matches_rule(ev, &rule, re.as_ref()))
-                    .max_by_key(|ev| (event_end_utc(ev), ev.timestamp))
-            });
+        let matching_ev = find_latest_matching_event(&events, &rule, re.as_ref(), recency_cutoff);
 
         let rt = engine.runtimes.get_mut("rule-urls-newest-title").unwrap();
-        if let Some(ev) = matching_ev {
-            if let Some(ref title) = ev.data.title {
-                if !title.trim().is_empty() {
-                    rt.set_last_matched_title(Some(title.clone()));
-                }
-            }
-        }
+        rt.update_matched_metadata(matching_ev, true);
 
         assert_eq!(
             engine.runtimes.get("rule-urls-newest-title").unwrap().last_matched_title.as_deref(),

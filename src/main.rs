@@ -382,6 +382,48 @@ fn load_rule_into_editor(win: &SettingsWindow, rule: &RuleView, rm: &VecModel<Ru
     refresh_rule_regex_validation(win, rm);
 }
 
+/// Extracts all editable rule settings from the `SettingsWindow` into the provided `RuleView`.
+fn sync_editor_to_rule_view(win: &SettingsWindow, rule: &mut RuleView) {
+    rule.enabled = win.get_rule_enabled();
+    rule.name = win.get_rule_name();
+    rule.monitor_selection = win.get_rule_monitor_selection();
+    rule.title_regex = win.get_rule_title_regex();
+    rule.url_regex = win.get_rule_url_regex();
+    rule.trigger = win.get_rule_trigger();
+    rule.period_val = win.get_rule_period_val();
+    rule.period_unit = win.get_rule_period_unit();
+    rule.reset_afk_val = win.get_rule_reset_afk_val();
+    rule.reset_afk_unit = win.get_rule_reset_afk_unit();
+    rule.limit_val = win.get_rule_limit_val();
+    rule.limit_unit = win.get_rule_limit_unit();
+    rule.action = win.get_rule_action();
+    rule.notification_method = win.get_rule_notification_method();
+    rule.notification_duration_val = win.get_rule_notification_duration_val();
+    rule.notification_duration_unit = win.get_rule_notification_duration_unit();
+    rule.show_remaining_time = win.get_rule_show_remaining_time();
+    rule.warn_before_val = win.get_rule_warn_before_val();
+    rule.warn_before_unit = win.get_rule_warn_before_unit();
+    rule.grace_val = win.get_rule_grace_val();
+    rule.grace_unit = win.get_rule_grace_unit();
+    rule.break_val = win.get_rule_break_val();
+    rule.break_unit = win.get_rule_break_unit();
+    rule.click_through = win.get_rule_click_through();
+    rule.strict_mode = win.get_rule_strict_mode();
+}
+
+/// Finds the next available non-conflicting `rule-{n}` identifier.
+fn next_available_rule_id(rm: &VecModel<RuleView>) -> String {
+    let mut n = rm.row_count() + 1;
+    while (0..rm.row_count()).any(|i| {
+        rm.row_data(i)
+            .map(|r| r.id.as_str() == format!("rule-{n}"))
+            .unwrap_or(false)
+    }) {
+        n += 1;
+    }
+    format!("rule-{n}")
+}
+
 /// Extracts the current configuration from `SettingsWindow` and `rules_model`, applying safety sanitization.
 fn config_from_ui(win: &SettingsWindow, base_cfg: &AppConfig) -> AppConfig {
     let mut updated_config = base_cfg.clone();
@@ -976,15 +1018,9 @@ fn open_settings_window(
                 if is_ui_locked_by_strict(&win) {
                     return;
                 }
-                let mut n = rm.row_count() + 1;
-                while (0..rm.row_count()).any(|i| {
-                    rm.row_data(i)
-                        .map(|r| r.id.as_str() == format!("rule-{n}"))
-                        .unwrap_or(false)
-                }) {
-                    n += 1;
-                }
-                let new_rule = Rule::default_template(n - 1);
+                let rule_id = next_available_rule_id(&rm);
+                let num: usize = rule_id.trim_start_matches("rule-").parse().unwrap_or(1);
+                let new_rule = Rule::default_template(num.saturating_sub(1));
                 let rv = rule_to_view(&new_rule);
                 let idx = rm.row_count();
                 rm.push(rv.clone());
@@ -1042,16 +1078,9 @@ fn open_settings_window(
                 let u = idx as usize;
                 if u < rm.row_count() {
                     if let Some(target) = rm.row_data(u) {
-                        let mut n = rm.row_count() + 1;
-                        while (0..rm.row_count()).any(|i| {
-                            rm.row_data(i)
-                                .map(|r| r.id.as_str() == format!("rule-{n}"))
-                                .unwrap_or(false)
-                        }) {
-                            n += 1;
-                        }
+                        let rule_id = next_available_rule_id(&rm);
                         let target_rule = view_to_rule(&target);
-                        let duplicated = target_rule.duplicate(format!("rule-{n}"));
+                        let duplicated = target_rule.duplicate(rule_id);
                         let rv = rule_to_view(&duplicated);
                         let new_idx = rm.row_count();
                         rm.push(rv.clone());
@@ -1195,31 +1224,7 @@ fn open_settings_window(
                 let u = idx as usize;
                 if idx >= 0 && u < rm.row_count() {
                     if let Some(mut rule) = rm.row_data(u) {
-                        rule.enabled = win.get_rule_enabled();
-                        rule.name = win.get_rule_name();
-                        rule.monitor_selection = win.get_rule_monitor_selection();
-                        rule.title_regex = win.get_rule_title_regex();
-                        rule.url_regex = win.get_rule_url_regex();
-                        rule.trigger = win.get_rule_trigger();
-                        rule.period_val = win.get_rule_period_val();
-                        rule.period_unit = win.get_rule_period_unit();
-                        rule.reset_afk_val = win.get_rule_reset_afk_val();
-                        rule.reset_afk_unit = win.get_rule_reset_afk_unit();
-                        rule.limit_val = win.get_rule_limit_val();
-                        rule.limit_unit = win.get_rule_limit_unit();
-                        rule.action = win.get_rule_action();
-                        rule.notification_method = win.get_rule_notification_method();
-                        rule.notification_duration_val = win.get_rule_notification_duration_val();
-                        rule.notification_duration_unit = win.get_rule_notification_duration_unit();
-                        rule.show_remaining_time = win.get_rule_show_remaining_time();
-                        rule.warn_before_val = win.get_rule_warn_before_val();
-                        rule.warn_before_unit = win.get_rule_warn_before_unit();
-                        rule.grace_val = win.get_rule_grace_val();
-                        rule.grace_unit = win.get_rule_grace_unit();
-                        rule.break_val = win.get_rule_break_val();
-                        rule.break_unit = win.get_rule_break_unit();
-                        rule.click_through = win.get_rule_click_through();
-                        rule.strict_mode = win.get_rule_strict_mode();
+                        sync_editor_to_rule_view(&win, &mut rule);
 
                         let has_specific_exe = rule.monitor_selection.as_str() == "Executables"
                             && first_specific_executable(&rule.target_executables).is_some();
