@@ -1,4 +1,7 @@
 use regex::Regex;
+use std::sync::Once;
+use winreg::enums::HKEY_CURRENT_USER;
+use winreg::RegKey;
 use windows_sys::Win32::Foundation::{
     CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM,
 };
@@ -199,15 +202,61 @@ pub fn is_fullscreen_or_presentation_active() -> bool {
     }
 }
 
-/// Sends a passive native Windows notification via WinRT.
+/// Application User Model ID (AUMID) used for native Windows Action Center notifications.
+pub const APP_AUMID: &str = "AW-Enforcer";
+/// Display name associated with the AUMID shown in Windows notification headers.
+pub const APP_DISPLAY_NAME: &str = "AW-Enforcer";
+const AUMID_REG_PATH: &str = r"Software\Classes\AppUserModelId\AW-Enforcer";
+
+static AUMID_REGISTERED: Once = Once::new();
+
+/// Registers the application user model ID (AUMID) in the Windows Registry under
+/// `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` so that native Action Center
+/// toast notifications display "AW-Enforcer" as the header instead of "Windows PowerShell".
+pub fn register_app_user_model_id() -> Result<(), Box<dyn std::error::Error>> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(AUMID_REG_PATH)?;
+    key.set_value("DisplayName", &APP_DISPLAY_NAME)?;
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_str) = exe_path.to_str() {
+            let _ = key.set_value("IconUri", &exe_str);
+        }
+    }
+    tracing::info!("Registered AUMID '{}' in Windows Registry", APP_AUMID);
+    Ok(())
+}
+
+/// Ensures the application user model ID (AUMID) has been registered in the Windows Registry at least once.
+pub fn ensure_app_user_model_id_registered() {
+    AUMID_REGISTERED.call_once(|| {
+        if let Err(e) = register_app_user_model_id() {
+            tracing::warn!("Failed to register AUMID '{APP_AUMID}' in registry: {e}");
+        }
+    });
+}
+
+/// Sends a passive native Windows notification via WinRT using the branded AUMID.
 pub fn send_system_notification(title: &str, message: &str) {
-    if let Err(e) = winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
+    ensure_app_user_model_id_registered();
+
+    let res = winrt_notification::Toast::new(APP_AUMID)
         .title(title)
         .text1(message)
         .duration(winrt_notification::Duration::Short)
-        .show()
-    {
-        tracing::warn!("Failed to send WinRT notification: {e}");
+        .show();
+
+    if let Err(e) = res {
+        tracing::warn!(
+            "Failed to send WinRT notification with custom AUMID '{APP_AUMID}': {e}. Falling back to PowerShell AUMID."
+        );
+        if let Err(e2) = winrt_notification::Toast::new(winrt_notification::Toast::POWERSHELL_APP_ID)
+            .title(title)
+            .text1(message)
+            .duration(winrt_notification::Duration::Short)
+            .show()
+        {
+            tracing::warn!("Failed to send WinRT notification with fallback AUMID: {e2}");
+        }
     }
 }
 
@@ -756,5 +805,20 @@ mod tests {
         if let Some(name) = explorer {
             assert!(name.eq_ignore_ascii_case("explorer.exe") || name.eq_ignore_ascii_case("explorer"));
         }
+    }
+
+    #[test]
+    fn test_register_app_user_model_id() {
+        let res = register_app_user_model_id();
+        assert!(res.is_ok(), "register_app_user_model_id should succeed: {:?}", res);
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = hkcu.open_subkey(AUMID_REG_PATH).expect("AUMID registry key should exist");
+        let display_name: String = key.get_value("DisplayName").expect("DisplayName should exist");
+        assert_eq!(display_name, APP_DISPLAY_NAME);
+
+        // Ensure repeated calls succeed idempotently
+        let res2 = register_app_user_model_id();
+        assert!(res2.is_ok(), "Repeated register_app_user_model_id calls should succeed");
     }
 }

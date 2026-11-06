@@ -1580,6 +1580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = autostart::set_autostart(config.general.autostart) {
         tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
     }
+    enforcer::ensure_app_user_model_id_registered();
     let current_config = Rc::new(RefCell::new(config.clone()));
 
     // 4. Initialize ActivityWatch REST Client
