@@ -7,200 +7,7 @@ use crate::engine::intervals::{
 use crate::engine::Engine;
 use crate::overlay::OverlayMode;
 
-/// Aligns a timestamp down to the start of its current statistics histogram bin.
-pub fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
-    let bin_size = bin_size_mins.max(1);
-    let midnight = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(resolve_local_ndt)
-        .unwrap_or(now);
-    let elapsed_mins = (now - midnight).num_minutes().max(0);
-    let aligned_mins = (elapsed_mins / bin_size) * bin_size;
-    midnight + Duration::minutes(aligned_mins)
-}
-
-/// Cached 24-hour histogram bins used to live-update `OverlayMode::HudStatus` on each `poll_tick`
-/// without re-querying historical ActivityWatch bins.
-#[derive(Debug, Clone)]
-pub struct StatsHudCache {
-    pub current_bin_start: DateTime<Local>,
-    pub bin_size_mins: i64,
-    pub bin_seconds: Vec<f32>,
-    pub click_through: bool,
-}
-
-impl StatsHudCache {
-    /// Computes and returns a populated `StatsHudCache` from pre-merged intervals.
-    pub fn from_intervals(
-        now: DateTime<Local>,
-        stats_cfg: &StatsConfig,
-        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
-        click_through: bool,
-    ) -> Self {
-        let bin_count = stats_cfg.histogram_bin_count.max(1) as usize;
-        let bin_size_mins = stats_cfg.histogram_bin_size_minutes.max(1) as i64;
-        let current_bin_start = align_stats_bin_start(now, bin_size_mins);
-
-        let start_time =
-            current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
-        let mut bin_seconds = vec![0.0f32; bin_count];
-
-        for i in 0..bin_count {
-            let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
-            let b_end = b_start + Duration::minutes(bin_size_mins);
-            let b_start_utc = b_start.with_timezone(&Utc);
-            let b_end_utc = b_end.with_timezone(&Utc);
-
-            bin_seconds[i] =
-                compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc)
-                    as f32;
-        }
-
-        Self {
-            current_bin_start,
-            bin_size_mins,
-            bin_seconds,
-            click_through,
-        }
-    }
-
-    /// Builds an `OverlayMode::HudStatus` from the cached histogram data without showing the loading spinner.
-    pub fn build_hud_status(&self, stats_cfg: &StatsConfig) -> OverlayMode {
-        let bin_count = self.bin_seconds.len().max(1);
-        let bin_size_mins = self.bin_size_mins.max(1);
-        let start_time =
-            self.current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
-        let time_fmt = &stats_cfg.histogram_time_format;
-
-        let label_step = (bin_count / 6).max(1);
-        let mut bin_labels = Vec::with_capacity(bin_count);
-        for i in 0..bin_count {
-            let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
-            let label = if i % label_step == 0 || i == bin_count - 1 {
-                b_start.format(time_fmt).to_string()
-            } else {
-                String::new()
-            };
-            bin_labels.push(label);
-        }
-
-        let max_bin_capacity = (bin_size_mins * 60) as f32;
-        let bin_values: Vec<f32> = self
-            .bin_seconds
-            .iter()
-            .map(|&s| (s / max_bin_capacity).clamp(0.0, 1.0))
-            .collect();
-
-        let total_active_seconds: f32 = self.bin_seconds.iter().sum();
-        let total_active_minutes = (total_active_seconds / 60.0).round() as u32;
-
-        let status_level = if total_active_minutes <= stats_cfg.daily_screentime_target_minutes {
-            "Great"
-        } else if total_active_minutes <= stats_cfg.threshold_excessive_minutes {
-            "Okay"
-        } else {
-            "Excessive"
-        };
-
-        OverlayMode::HudStatus {
-            title: "24-Hour Screen Time Summary".into(),
-            status_level: status_level.into(),
-            total_active_minutes,
-            target_minutes: stats_cfg.daily_screentime_target_minutes,
-            bin_values,
-            bin_labels,
-            is_loading: false,
-            click_through: self.click_through,
-        }
-    }
-
-    /// Incrementally updates the cached bins using `merged_intervals`, handling bin rollovers and dimension changes.
-    pub fn refresh_from_events(
-        &mut self,
-        now: DateTime<Local>,
-        stats_cfg: &StatsConfig,
-        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
-    ) {
-        let bin_count = stats_cfg.histogram_bin_count.max(1) as usize;
-        let bin_size_mins = stats_cfg.histogram_bin_size_minutes.max(1) as i64;
-        let new_bin_start = align_stats_bin_start(now, bin_size_mins);
-
-        if self.bin_seconds.len() != bin_count || self.bin_size_mins != bin_size_mins {
-            *self = Self::from_intervals(now, stats_cfg, merged_intervals, self.click_through);
-        } else if new_bin_start > self.current_bin_start {
-            let elapsed_bins =
-                ((new_bin_start - self.current_bin_start).num_minutes() / bin_size_mins).max(0)
-                    as usize;
-            let old_bin_start = self.current_bin_start;
-            let shift = elapsed_bins.min(bin_count);
-            self.bin_seconds.drain(0..shift);
-            self.bin_seconds.resize(bin_count, 0.0);
-            self.current_bin_start = new_bin_start;
-
-            for i in 0..elapsed_bins {
-                let b_start = old_bin_start + Duration::minutes((i as i64) * bin_size_mins);
-                let b_end = b_start + Duration::minutes(bin_size_mins);
-                let b_start_utc = b_start.with_timezone(&Utc);
-                let b_end_utc = b_end.with_timezone(&Utc);
-                let bin_idx = (bin_count as isize) - 1 - (elapsed_bins as isize) + (i as isize);
-                if bin_idx >= 0 && (bin_idx as usize) < bin_count {
-                    let secs =
-                        compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc)
-                            as f32;
-                    self.bin_seconds[bin_idx as usize] = secs;
-                }
-            }
-        }
-
-        // Recompute only the current (latest) bin from poll_tick's events
-        let cur_start_utc = self.current_bin_start.with_timezone(&Utc);
-        let cur_end_utc =
-            (self.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
-        let cur_secs =
-            compute_overlap_from_merged_intervals(merged_intervals, cur_start_utc, cur_end_utc)
-                as f32;
-        if let Some(last) = self.bin_seconds.last_mut() {
-            *last = cur_secs;
-        }
-    }
-}
-
 impl Engine {
-    /// Builds an `OverlayMode::HudStatus` from the current `stats_cache` without showing the loading spinner.
-    pub(crate) fn build_hud_status_from_cache(&self) -> Option<OverlayMode> {
-        self.stats_cache
-            .as_ref()
-            .map(|cache| cache.build_hud_status(&self.config.stats))
-    }
-
-    /// Incrementally updates the open 24-Hour Statistics HUD using the `merged_intervals` already merged by `poll_tick`.
-    pub(crate) fn refresh_stats_overlay_from_events(
-        &mut self,
-        now: DateTime<Local>,
-        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
-    ) {
-        if !matches!(
-            self.active_overlay_mode,
-            OverlayMode::HudStatus {
-                is_loading: false,
-                ..
-            }
-        ) {
-            return;
-        }
-
-        let Some(ref mut cache) = self.stats_cache else {
-            return;
-        };
-
-        cache.refresh_from_events(now, &self.config.stats, merged_intervals);
-
-        if let Some(mode) = self.build_hud_status_from_cache() {
-            self.show_overlay(mode);
-        }
-    }
-
     /// Prepares and displays the 24-hour activity status overlay.
     pub async fn display_stats_overlay(&mut self, click_through: bool) {
         // Immediately pop up the HUD window in loading state so the user gets instant feedback
@@ -253,6 +60,199 @@ impl Engine {
             self.show_overlay(mode);
         }
     }
+
+    /// Incrementally updates the open 24-Hour Statistics HUD using the `merged_intervals` already merged by `poll_tick`.
+    pub(crate) fn refresh_stats_overlay_from_events(
+        &mut self,
+        now: DateTime<Local>,
+        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+    ) {
+        if !matches!(
+            self.active_overlay_mode,
+            OverlayMode::HudStatus {
+                is_loading: false,
+                ..
+            }
+        ) {
+            return;
+        }
+
+        let Some(ref mut cache) = self.stats_cache else {
+            return;
+        };
+
+        cache.refresh_from_events(now, &self.config.stats, merged_intervals);
+
+        if let Some(mode) = self.build_hud_status_from_cache() {
+            self.show_overlay(mode);
+        }
+    }
+
+    /// Builds an `OverlayMode::HudStatus` from the current `stats_cache` without showing the loading spinner.
+    pub(crate) fn build_hud_status_from_cache(&self) -> Option<OverlayMode> {
+        self.stats_cache
+            .as_ref()
+            .map(|cache| cache.build_hud_status(&self.config.stats))
+    }
+}
+
+/// Cached 24-hour histogram bins used to live-update `OverlayMode::HudStatus` on each `poll_tick`
+/// without re-querying historical ActivityWatch bins.
+#[derive(Debug, Clone)]
+pub struct StatsHudCache {
+    pub current_bin_start: DateTime<Local>,
+    pub bin_size_mins: i64,
+    pub bin_seconds: Vec<f32>,
+    pub click_through: bool,
+}
+
+impl StatsHudCache {
+    /// Computes and returns a populated `StatsHudCache` from pre-merged intervals.
+    pub fn from_intervals(
+        now: DateTime<Local>,
+        stats_cfg: &StatsConfig,
+        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+        click_through: bool,
+    ) -> Self {
+        let bin_count = stats_cfg.histogram_bin_count.max(1) as usize;
+        let bin_size_mins = stats_cfg.histogram_bin_size_minutes.max(1) as i64;
+        let current_bin_start = align_stats_bin_start(now, bin_size_mins);
+
+        let start_time =
+            current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+        let mut bin_seconds = vec![0.0f32; bin_count];
+
+        for i in 0..bin_count {
+            let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
+            let b_end = b_start + Duration::minutes(bin_size_mins);
+            let b_start_utc = b_start.with_timezone(&Utc);
+            let b_end_utc = b_end.with_timezone(&Utc);
+
+            bin_seconds[i] =
+                compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc)
+                    as f32;
+        }
+
+        Self {
+            current_bin_start,
+            bin_size_mins,
+            bin_seconds,
+            click_through,
+        }
+    }
+
+    /// Incrementally updates the cached bins using `merged_intervals`, handling bin rollovers and dimension changes.
+    pub fn refresh_from_events(
+        &mut self,
+        now: DateTime<Local>,
+        stats_cfg: &StatsConfig,
+        merged_intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+    ) {
+        let bin_count = stats_cfg.histogram_bin_count.max(1) as usize;
+        let bin_size_mins = stats_cfg.histogram_bin_size_minutes.max(1) as i64;
+        let new_bin_start = align_stats_bin_start(now, bin_size_mins);
+
+        if self.bin_seconds.len() != bin_count || self.bin_size_mins != bin_size_mins {
+            *self = Self::from_intervals(now, stats_cfg, merged_intervals, self.click_through);
+        } else if new_bin_start > self.current_bin_start {
+            let elapsed_bins =
+                ((new_bin_start - self.current_bin_start).num_minutes() / bin_size_mins).max(0)
+                    as usize;
+            let old_bin_start = self.current_bin_start;
+            let shift = elapsed_bins.min(bin_count);
+            self.bin_seconds.drain(0..shift);
+            self.bin_seconds.resize(bin_count, 0.0);
+            self.current_bin_start = new_bin_start;
+
+            for i in 0..elapsed_bins {
+                let b_start = old_bin_start + Duration::minutes((i as i64) * bin_size_mins);
+                let b_end = b_start + Duration::minutes(bin_size_mins);
+                let b_start_utc = b_start.with_timezone(&Utc);
+                let b_end_utc = b_end.with_timezone(&Utc);
+                let bin_idx = (bin_count as isize) - 1 - (elapsed_bins as isize) + (i as isize);
+                if bin_idx >= 0 && (bin_idx as usize) < bin_count {
+                    let secs =
+                        compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc)
+                            as f32;
+                    self.bin_seconds[bin_idx as usize] = secs;
+                }
+            }
+        }
+
+        // Recompute only the current (latest) bin from poll_tick's events
+        let cur_start_utc = self.current_bin_start.with_timezone(&Utc);
+        let cur_end_utc =
+            (self.current_bin_start + Duration::minutes(bin_size_mins)).with_timezone(&Utc);
+        let cur_secs =
+            compute_overlap_from_merged_intervals(merged_intervals, cur_start_utc, cur_end_utc)
+                as f32;
+        if let Some(last) = self.bin_seconds.last_mut() {
+            *last = cur_secs;
+        }
+    }
+
+    /// Builds an `OverlayMode::HudStatus` from the cached histogram data without showing the loading spinner.
+    pub fn build_hud_status(&self, stats_cfg: &StatsConfig) -> OverlayMode {
+        let bin_count = self.bin_seconds.len().max(1);
+        let bin_size_mins = self.bin_size_mins.max(1);
+        let start_time =
+            self.current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+        let time_fmt = &stats_cfg.histogram_time_format;
+
+        let label_step = (bin_count / 6).max(1);
+        let mut bin_labels = Vec::with_capacity(bin_count);
+        for i in 0..bin_count {
+            let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
+            let label = if i % label_step == 0 || i == bin_count - 1 {
+                b_start.format(time_fmt).to_string()
+            } else {
+                String::new()
+            };
+            bin_labels.push(label);
+        }
+
+        let max_bin_capacity = (bin_size_mins * 60) as f32;
+        let bin_values: Vec<f32> = self
+            .bin_seconds
+            .iter()
+            .map(|&s| (s / max_bin_capacity).clamp(0.0, 1.0))
+            .collect();
+
+        let total_active_seconds: f32 = self.bin_seconds.iter().sum();
+        let total_active_minutes = (total_active_seconds / 60.0).round() as u32;
+
+        let status_level = if total_active_minutes <= stats_cfg.daily_screentime_target_minutes {
+            "Great"
+        } else if total_active_minutes <= stats_cfg.threshold_excessive_minutes {
+            "Okay"
+        } else {
+            "Excessive"
+        };
+
+        OverlayMode::HudStatus {
+            title: "24-Hour Screen Time Summary".into(),
+            status_level: status_level.into(),
+            total_active_minutes,
+            target_minutes: stats_cfg.daily_screentime_target_minutes,
+            bin_values,
+            bin_labels,
+            is_loading: false,
+            click_through: self.click_through,
+        }
+    }
+}
+
+/// Aligns a timestamp down to the start of its current statistics histogram bin.
+pub fn align_stats_bin_start(now: DateTime<Local>, bin_size_mins: i64) -> DateTime<Local> {
+    let bin_size = bin_size_mins.max(1);
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(resolve_local_ndt)
+        .unwrap_or(now);
+    let elapsed_mins = (now - midnight).num_minutes().max(0);
+    let aligned_mins = (elapsed_mins / bin_size) * bin_size;
+    midnight + Duration::minutes(aligned_mins)
 }
 
 #[cfg(test)]
