@@ -33,7 +33,7 @@ use config::{
     AppConfig, DurationConfig, MonitorSelection, NotificationMethod, Rule, RuleAction,
     RuleSchedule, TimeUnit, TriggerType,
 };
-use engine::{DaemonCommand, Engine, OverlayAction};
+use engine::{DaemonCommand, Engine, OverlayAction, TrayIconState};
 use formatter::{MessageContext, TextHorizontalAlignment};
 use overlay::OverlayManager;
 
@@ -174,13 +174,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tray_menu.append(&PredefinedMenuItem::separator())?;
     tray_menu.append(&item_quit)?;
 
+    let initial_tray_state = if config.general.pause_all_rules {
+        TrayIconState::Paused
+    } else {
+        TrayIconState::Normal
+    };
+    let initial_icon = match initial_tray_state {
+        TrayIconState::Paused => create_paused_tray_icon(),
+        _ => create_default_tray_icon(),
+    };
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("AW-Enforcer")
-        .with_icon(create_default_tray_icon())
+        .with_icon(initial_icon)
         .build()
         .ok();
     let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
+    let current_tray_state = Rc::new(RefCell::new(initial_tray_state));
 
     // 10. Event-driven overlay action dispatch
     {
@@ -189,6 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rules_model_ref = rules_model.clone();
         let live_state_ref = live_ui_state.clone();
         let tray_icon_ref = tray_icon_cell.clone();
+        let current_tray_state_ref = current_tray_state.clone();
         let item_dismiss = item_dismiss.clone();
         let item_snooze = item_snooze.clone();
         let item_pause = item_pause.clone();
@@ -219,6 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rule_statuses,
                         tray_tooltip,
                         any_snoozed,
+                        tray_state,
                     } => {
                         {
                             let mut ls = live_state_ref.borrow_mut();
@@ -260,6 +272,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         if let Some(ref ti) = *tray_icon_ref.borrow() {
                             let _ = ti.set_tooltip(Some(&tray_tooltip));
+                            let mut state_cell = current_tray_state_ref.borrow_mut();
+                            if *state_cell != tray_state {
+                                *state_cell = tray_state;
+                                let icon = match tray_state {
+                                    TrayIconState::Normal => create_default_tray_icon(),
+                                    TrayIconState::Paused => create_paused_tray_icon(),
+                                    TrayIconState::Alert => create_alert_tray_icon(),
+                                };
+                                let _ = ti.set_icon(Some(icon));
+                            }
                         }
                     }
                     OverlayAction::Hide => mgr.hide_all(),
@@ -531,11 +553,25 @@ impl Drop for SingleInstanceLock {
     }
 }
 
-/// Loads the official Fluent ClockPause 32x32 RGBA system tray icon.
+/// Loads the official Fluent ClockPause 32x32 RGBA system tray icon (Normal / Blue).
 fn create_default_tray_icon() -> tray_icon::Icon {
     const TRAY_ICON_RGBA: &[u8] = include_bytes!("../assets/tray_icon_32.rgba");
     tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), 32, 32)
         .expect("Failed to create Fluent ClockPause tray icon")
+}
+
+/// Loads the paused Fluent ClockPause 32x32 RGBA system tray icon (Paused / Gray).
+fn create_paused_tray_icon() -> tray_icon::Icon {
+    const TRAY_ICON_PAUSED_RGBA: &[u8] = include_bytes!("../assets/tray_icon_paused_32.rgba");
+    tray_icon::Icon::from_rgba(TRAY_ICON_PAUSED_RGBA.to_vec(), 32, 32)
+        .expect("Failed to create Fluent ClockPause paused tray icon")
+}
+
+/// Loads the alert Fluent ClockPause 32x32 RGBA system tray icon (Alert / Red).
+fn create_alert_tray_icon() -> tray_icon::Icon {
+    const TRAY_ICON_ALERT_RGBA: &[u8] = include_bytes!("../assets/tray_icon_alert_32.rgba");
+    tray_icon::Icon::from_rgba(TRAY_ICON_ALERT_RGBA.to_vec(), 32, 32)
+        .expect("Failed to create Fluent ClockPause alert tray icon")
 }
 
 /// Lazily instantiates, populates, wires, and displays the `SettingsWindow` (or focuses it if already open).

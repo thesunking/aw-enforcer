@@ -49,6 +49,14 @@ pub enum DaemonCommand {
     ClearSnoozeAll,
 }
 
+/// Tri-state indicator for the system tray icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIconState {
+    Normal,
+    Paused,
+    Alert,
+}
+
 /// Actions dispatched from the engine to the Slint UI thread.
 #[derive(Debug, Clone)]
 pub enum OverlayAction {
@@ -67,6 +75,7 @@ pub enum OverlayAction {
         rule_statuses: Vec<(String, String)>,
         tray_tooltip: String,
         any_snoozed: bool,
+        tray_state: TrayIconState,
     },
     Hide,
 }
@@ -413,6 +422,8 @@ impl Engine {
                         .is_some()
             });
 
+        let tray_state = self.current_tray_state(now);
+
         self.overlay_tx
             .send(OverlayAction::UpdateLiveStatus {
                 session_duration_text: format!("{}m", max_session_secs / 60),
@@ -422,6 +433,7 @@ impl Engine {
                 rule_statuses,
                 tray_tooltip,
                 any_snoozed,
+                tray_state,
             })
             .ok();
 
@@ -625,8 +637,8 @@ impl Engine {
             self.active_overlay_mode = OverlayMode::Hidden;
         }
 
-        for rule_id in completed_enforcements {
-            if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id).cloned() {
+        for rule_id in &completed_enforcements {
+            if let Some(rule) = self.config.rules.iter().find(|r| r.id == *rule_id).cloned() {
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let target_window = if rule.monitor_selection == MonitorSelection::Urls {
                     let maybe_title_re = self
@@ -1822,6 +1834,65 @@ impl Engine {
             }
         }
         false
+    }
+
+
+    /// Evaluates the current system tray icon state based on global pause and active rule alerts.
+    pub fn current_tray_state(&self, now: DateTime<Local>) -> TrayIconState {
+        if self.config.general.pause_all_rules {
+            return TrayIconState::Paused;
+        }
+
+        let day_index = now.weekday().num_days_from_monday() as usize;
+        let hour_index = now.hour() as usize;
+
+        let is_alert = self.config.rules.iter().any(|rule| {
+            if !rule.enabled {
+                return false;
+            }
+            if !rule.schedule.is_active(day_index, hour_index) {
+                return false;
+            }
+
+            let is_snoozed = self
+                .global_snoozed_until
+                .filter(|&u| u > now)
+                .is_some()
+                || self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|rt| rt.snoozed_until)
+                    .filter(|&u| u > now)
+                    .is_some();
+
+            if is_snoozed {
+                return false;
+            }
+
+            if let Some(rt) = self.runtimes.get(&rule.id) {
+                if rt.warned_current_cycle {
+                    return true;
+                }
+                if rt.grace_countdown.is_some() {
+                    return true;
+                }
+                if rt.active_break.is_some() || rt.pending_break_since.is_some() {
+                    return true;
+                }
+            }
+
+            if self.is_rule_displayed(&rule.id) {
+                return true;
+            }
+
+            false
+        });
+
+        if is_alert {
+            TrayIconState::Alert
+        } else {
+            TrayIconState::Normal
+        }
     }
 }
 
@@ -5273,5 +5344,203 @@ mod tests {
         let rt = engine.runtimes.get("rule-period-global-snooze").unwrap();
         assert_eq!(rt.current_session_seconds, 0, "AFK during global snooze should reset current_session_seconds to 0");
         assert_eq!(rt.warned_current_cycle, false, "AFK during global snooze should reset warned_current_cycle");
+    }
+
+    // ========================================================================
+    // System Tray Icon Tri-State Unit Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tray_icon_assets_integrity() {
+        let normal_bytes = include_bytes!("../assets/tray_icon_32.rgba");
+        let paused_bytes = include_bytes!("../assets/tray_icon_paused_32.rgba");
+        let alert_bytes = include_bytes!("../assets/tray_icon_alert_32.rgba");
+
+        assert_eq!(normal_bytes.len(), 4096);
+        assert_eq!(paused_bytes.len(), 4096);
+        assert_eq!(alert_bytes.len(), 4096);
+
+        for i in (0..4096).step_by(4) {
+            let a = normal_bytes[i + 3];
+            assert_eq!(paused_bytes[i + 3], a);
+            assert_eq!(alert_bytes[i + 3], a);
+
+            if a > 0 {
+                assert_eq!(paused_bytes[i], 148);
+                assert_eq!(paused_bytes[i + 1], 163);
+                assert_eq!(paused_bytes[i + 2], 184);
+
+                assert_eq!(alert_bytes[i], 239);
+                assert_eq!(alert_bytes[i + 1], 68);
+                assert_eq!(alert_bytes[i + 2], 68);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_normal_during_active_monitoring() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-normal".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let engine = Engine::new(cfg, aw_client, overlay_tx);
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_paused_overrides_alerts_and_breaks() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        cfg.general.pause_all_rules = true;
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-paused".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.runtimes.get_mut("rule-paused").unwrap().active_break = Some((60, 60));
+        engine.runtimes.get_mut("rule-paused").unwrap().warned_current_cycle = true;
+
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Paused);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_alert_during_warning_period() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-warn".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.runtimes.get_mut("rule-warn").unwrap().warned_current_cycle = true;
+
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Alert);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_alert_during_grace_period() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-grace".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.runtimes.get_mut("rule-grace").unwrap().grace_countdown = Some((30, 30));
+
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Alert);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_alert_during_active_break() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-break".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.runtimes.get_mut("rule-break").unwrap().active_break = Some((120, 120));
+
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Alert);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_alert_during_pending_break() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-pending".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.runtimes.get_mut("rule-pending").unwrap().pending_break_since = Some(Local::now());
+
+        assert_eq!(engine.current_tray_state(Local::now()), TrayIconState::Alert);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_normal_when_rule_snoozed() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-snoozed".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        let now = Local::now();
+        let rt = engine.runtimes.get_mut("rule-snoozed").unwrap();
+        rt.warned_current_cycle = true;
+        rt.snoozed_until = Some(now + Duration::minutes(15));
+
+        assert_eq!(engine.current_tray_state(now), TrayIconState::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_tray_state_normal_when_off_schedule() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-off-sched".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[false; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        let now = Local::now();
+        engine.runtimes.get_mut("rule-off-sched").unwrap().warned_current_cycle = true;
+
+        assert_eq!(engine.current_tray_state(now), TrayIconState::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_update_live_status_emits_tray_state() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(5600, ""));
+        let mut cfg = AppConfig::default();
+        let mut rule = Rule::default_template(0);
+        rule.id = "rule-live-tray".to_string();
+        rule.schedule = RuleSchedule::from_bool_array(&[true; 168]);
+        cfg.rules = vec![rule];
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.poll_tick().await;
+
+        let mut last_tray_state = None;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::UpdateLiveStatus { tray_state, .. } = action {
+                last_tray_state = Some(tray_state);
+            }
+        }
+
+        assert_eq!(last_tray_state, Some(TrayIconState::Normal));
+
+        // Now pause all rules and verify tray state transitions to Paused
+        engine.handle_command(DaemonCommand::SetPauseAll { paused: true }).await;
+
+        let mut paused_tray_state = None;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::UpdateLiveStatus { tray_state, .. } = action {
+                paused_tray_state = Some(tray_state);
+            }
+        }
+
+        assert_eq!(paused_tray_state, Some(TrayIconState::Paused));
     }
 }
