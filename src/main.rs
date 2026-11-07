@@ -8,10 +8,6 @@ use std::time::Duration;
 
 use slint::{ComponentHandle, VecModel};
 use tokio::sync::mpsc;
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    MouseButton, TrayIconBuilder, TrayIconEvent,
-};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
 };
@@ -27,15 +23,17 @@ mod engine;
 mod formatter;
 mod overlay;
 mod settings_window;
+mod tray;
 
 use aw_client::AwClient;
 use config::AppConfig;
-use engine::{DaemonCommand, Engine, OverlayAction, TrayIconState};
+use engine::{DaemonCommand, Engine, OverlayAction};
 use overlay::OverlayManager;
 use settings_window::{
     open_settings_window, spawn_aw_connection_check, update_rules_model_statuses, LiveUiState,
     SettingsContext,
 };
+use tray::{TrayAction, TrayManager};
 
 slint::include_modules!();
 
@@ -152,45 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aw_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
 
-    // 9. Build System Tray Menu
-    let item_settings = MenuItem::with_id("open_settings", "Open Settings", true, None);
-    let item_stats = MenuItem::with_id("show_stats", "Show Activity Stats", true, None);
-    let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
-    let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
-    let initial_pause_label = if config.general.pause_all_rules {
-        "Resume All Rules"
-    } else {
-        "Pause All Rules"
-    };
-    let item_pause = MenuItem::with_id("toggle_pause_all", initial_pause_label, true, None);
-    let item_quit = MenuItem::with_id("quit", "Quit", true, None);
-
-    let tray_menu = Menu::new();
-    tray_menu.append(&item_settings)?;
-    tray_menu.append(&item_stats)?;
-    tray_menu.append(&item_dismiss)?;
-    tray_menu.append(&item_snooze)?;
-    tray_menu.append(&item_pause)?;
-    tray_menu.append(&PredefinedMenuItem::separator())?;
-    tray_menu.append(&item_quit)?;
-
-    let initial_tray_state = if config.general.pause_all_rules {
-        TrayIconState::Paused
-    } else {
-        TrayIconState::Normal
-    };
-    let initial_icon = match initial_tray_state {
-        TrayIconState::Paused => create_paused_tray_icon(),
-        _ => create_default_tray_icon(),
-    };
-    let _tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_tooltip("AW-Enforcer")
-        .with_icon(initial_icon)
-        .build()
-        .ok();
-    let tray_icon_cell = Rc::new(RefCell::new(_tray_icon));
-    let current_tray_state = Rc::new(RefCell::new(initial_tray_state));
+    // 9. Build System Tray Manager
+    let tray_manager = Rc::new(RefCell::new(TrayManager::new(config.general.pause_all_rules)?));
 
     // 10. Event-driven overlay action dispatch
     {
@@ -198,11 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let settings_slot_ref = settings_slot.clone();
         let rules_model_ref = rules_model.clone();
         let live_state_ref = live_ui_state.clone();
-        let tray_icon_ref = tray_icon_cell.clone();
-        let current_tray_state_ref = current_tray_state.clone();
-        let item_dismiss = item_dismiss.clone();
-        let item_snooze = item_snooze.clone();
-        let item_pause = item_pause.clone();
+        let tray_mgr_ref = tray_manager.clone();
 
         OVERLAY_ACTION_HANDLER.with(|cell| {
             *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
@@ -253,14 +210,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        item_dismiss.set_enabled(!strict_lock_active);
-                        item_snooze.set_enabled(!strict_lock_active);
-                        item_snooze.set_text(if any_snoozed {
-                            "Resume Snoozed Rules"
-                        } else {
-                            "Snooze All (15m)"
-                        });
-                        item_pause.set_enabled(!strict_lock_active);
+                        tray_mgr_ref.borrow_mut().sync_live_status(
+                            strict_lock_active,
+                            any_snoozed,
+                            &tray_tooltip,
+                            tray_state,
+                        );
 
                         if settings_slot_ref
                             .borrow()
@@ -268,20 +223,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .is_some_and(|w| w.window().is_visible())
                         {
                             update_rules_model_statuses(&rules_model_ref, &rule_statuses);
-                        }
-
-                        if let Some(ref ti) = *tray_icon_ref.borrow() {
-                            let _ = ti.set_tooltip(Some(&tray_tooltip));
-                            let mut state_cell = current_tray_state_ref.borrow_mut();
-                            if *state_cell != tray_state {
-                                *state_cell = tray_state;
-                                let icon = match tray_state {
-                                    TrayIconState::Normal => create_default_tray_icon(),
-                                    TrayIconState::Paused => create_paused_tray_icon(),
-                                    TrayIconState::Alert => create_alert_tray_icon(),
-                                };
-                                let _ = ti.set_icon(Some(icon));
-                            }
                         }
                     }
                     OverlayAction::Hide => mgr.hide_all(),
@@ -315,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         aw_connected_flag: aw_connected_flag.clone(),
         command_tx: command_tx.clone(),
         rt_handle: rt_handle.clone(),
-        item_pause: item_pause.clone(),
+        item_pause: tray_manager.borrow().item_pause(),
         overlay_manager: overlay_manager.clone(),
     };
     {
@@ -328,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cfg_cell = current_config.clone();
         let ui_client_cell = ui_aw_client.clone();
         let handle = rt_handle.clone();
-        let item_pause = item_pause.clone();
+        let tray_mgr = tray_manager.clone();
 
         let mut conn_check_counter = 0u32;
         let mut unlock_counter = 0u32;
@@ -365,39 +306,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
                 overlay_mgr.borrow_mut().apply_pending_win32_styles();
 
-                // Process System Tray Icon Double-Click Events
-                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    if let TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    } = event
-                    {
+                // Process System Tray Events (Double-clicks and context menu actions)
+                tray_mgr.borrow().process_events(|action| match action {
+                    TrayAction::OpenSettings => {
                         if let Err(e) = open_settings(true) {
-                            tracing::error!("Failed to open SettingsWindow on tray double-click: {e}");
+                            tracing::error!("Failed to open SettingsWindow on tray action: {e}");
                         }
                     }
-                }
-
-                // Process System Tray Menu Events
-                while let Ok(event) = MenuEvent::receiver().try_recv() {
-                    tracing::info!("Received system tray menu event: {}", event.id.0);
-                    match event.id.0.as_str() {
-                        "open_settings" => {
-                            if let Err(e) = open_settings(true) {
-                                tracing::error!("Failed to open SettingsWindow: {e}");
-                            }
-                        }
-                        "show_stats" => {
-                            cmd_tx.send(DaemonCommand::ShowStatsOverlay).ok();
-                        }
-                        "dismiss_break" => {
-                            cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
-                        }
-                        "snooze_15m" => {
-                            let is_locked = live_state_ref.borrow().strict_lock_active;
-                            if is_locked {
-                                continue;
-                            }
+                    TrayAction::ShowStats => {
+                        cmd_tx.send(DaemonCommand::ShowStatsOverlay).ok();
+                    }
+                    TrayAction::DismissBreak => {
+                        cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
+                    }
+                    TrayAction::ToggleSnoozeAll => {
+                        let is_locked = live_state_ref.borrow().strict_lock_active;
+                        if !is_locked {
                             let was_snoozed = live_state_ref.borrow().any_snoozed;
                             if was_snoozed {
                                 cmd_tx.send(DaemonCommand::ClearSnoozeAll).ok();
@@ -405,11 +329,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
                             }
                         }
-                        "toggle_pause_all" => {
-                            let is_locked = live_state_ref.borrow().strict_lock_active;
-                            if is_locked {
-                                continue;
-                            }
+                    }
+                    TrayAction::TogglePauseAll => {
+                        let is_locked = live_state_ref.borrow().strict_lock_active;
+                        if !is_locked {
                             let new_paused = {
                                 let mut cfg = cfg_cell.borrow_mut();
                                 cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
@@ -418,11 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 cfg.general.pause_all_rules
                             };
-                            item_pause.set_text(if new_paused {
-                                "Resume All Rules"
-                            } else {
-                                "Pause All Rules"
-                            });
+                            tray_mgr.borrow().set_pause_label(new_paused);
                             if let Some(ref win) = *settings_slot_ref.borrow() {
                                 win.set_pause_all_rules(new_paused);
                             }
@@ -430,12 +349,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .send(DaemonCommand::SetPauseAll { paused: new_paused })
                                 .ok();
                         }
-                        "quit" => {
-                            slint::quit_event_loop().ok();
-                        }
-                        _ => {}
                     }
-                }
+                    TrayAction::Quit => {
+                        slint::quit_event_loop().ok();
+                    }
+                });
 
                 // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
                 conn_check_counter += 1;
@@ -535,27 +453,6 @@ impl Drop for SingleInstanceLock {
             }
         }
     }
-}
-
-/// Loads the official Fluent ClockPause 32x32 RGBA system tray icon (Normal / Blue).
-fn create_default_tray_icon() -> tray_icon::Icon {
-    const TRAY_ICON_RGBA: &[u8] = include_bytes!("../assets/tray_icon_32.rgba");
-    tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), 32, 32)
-        .expect("Failed to create Fluent ClockPause tray icon")
-}
-
-/// Loads the paused Fluent ClockPause 32x32 RGBA system tray icon (Paused / Gray).
-fn create_paused_tray_icon() -> tray_icon::Icon {
-    const TRAY_ICON_PAUSED_RGBA: &[u8] = include_bytes!("../assets/tray_icon_paused_32.rgba");
-    tray_icon::Icon::from_rgba(TRAY_ICON_PAUSED_RGBA.to_vec(), 32, 32)
-        .expect("Failed to create Fluent ClockPause paused tray icon")
-}
-
-/// Loads the alert Fluent ClockPause 32x32 RGBA system tray icon (Alert / Red).
-fn create_alert_tray_icon() -> tray_icon::Icon {
-    const TRAY_ICON_ALERT_RGBA: &[u8] = include_bytes!("../assets/tray_icon_alert_32.rgba");
-    tray_icon::Icon::from_rgba(TRAY_ICON_ALERT_RGBA.to_vec(), 32, 32)
-        .expect("Failed to create Fluent ClockPause alert tray icon")
 }
 
 #[cfg(test)]
