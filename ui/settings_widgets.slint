@@ -1,0 +1,311 @@
+import { LineEdit } from "std-widgets.slint";
+
+export struct RuleView {
+    id: string,
+    enabled: bool,
+    name: string,
+    monitor-selection: string, // "Executables" | "Titles" | "Urls"
+    target-executables: [string],
+    title-regex: string,
+    url-regex: string,
+    trigger: string, // "Period" | "Limit"
+    period-val: int,
+    period-unit: string,
+    reset-afk-val: int,
+    reset-afk-unit: string,
+    limit-val: int,
+    limit-unit: string,
+    action: string, // "Show Overlay" | "Show Notification" | "Show Statistics" | "Lock Workstation" | "Close Tab" | "Close Window" | "Kill Process"
+    warn-before-val: int,
+    warn-before-unit: string,
+    grace-val: int,
+    grace-unit: string,
+    break-val: int,
+    break-unit: string,
+    click-through: bool,
+    strict-mode: bool,
+    notification-method: string, // "HUD" | "Windows"
+    notification-duration-val: int,
+    notification-duration-unit: string,
+    show-remaining-time: bool,
+    message: string,
+    schedule-slots: [bool],
+    status-text: string,
+}
+
+export component FormatToggleBtn inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-active;
+    in property <bool> is-italic: false;
+    in property <length> btn-width: 48px;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: root.btn-width;
+    height: 28px;
+    border-radius: 4px;
+    background: !root.enabled ? #1e293b.with-alpha(0.5) : (root.is-active ? #2563eb : (touch.has-hover ? #334155 : #0f172a));
+    border-width: 1px;
+    border-color: !root.enabled ? #334155 : (root.is-active ? #60a5fa : #475569);
+
+    Text {
+        text: root.text;
+        font-weight: 700;
+        font-italic: root.is-italic;
+        font-size: 12px;
+        color: !root.enabled ? #64748b : (root.is-active ? #ffffff : #cbd5e1);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component InfoBadge inherits Rectangle {
+    in property <bool> is-active: true;
+    in-out property <bool> is-open: (touch.has-hover || self.clicked-open) && root.is-active;
+    property <bool> clicked-open: false;
+
+    width: root.is-active ? 18px : 0px;
+    height: root.is-active ? 18px : 0px;
+    border-radius: 9px;
+    background: root.is-open ? #2563eb : (touch.has-hover ? #3b82f6 : #334155);
+    border-width: root.is-active ? 1px : 0px;
+    border-color: root.is-open ? #60a5fa : #475569;
+    visible: root.is-active;
+
+    Text {
+        visible: root.is-active;
+        text: "ℹ";
+        font-size: 11px;
+        font-weight: 700;
+        color: root.is-open ? #ffffff : #94a3b8;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.is-active;
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked-open = !root.clicked-open;
+        }
+    }
+}
+
+export component SectionCard inherits Rectangle {
+    in property <length> card-padding: 16px;
+    in property <length> card-spacing: 14px;
+    background: #1e293b;
+    border-radius: 8px;
+
+    VerticalLayout {
+        padding: root.card-padding;
+        spacing: root.card-spacing;
+        @children
+    }
+}
+
+export component FormRow inherits Rectangle {
+    in property <string> label;
+    in property <length> label-width: 190px;
+    in property <string> info-tip: "";
+    in property <length> tip-width: 380px;
+    height: row-content.preferred-height;
+    property <bool> tip-is-open: root.info-tip != "" && tip.is-open;
+    z: root.tip-is-open ? 1000 : 0;
+
+    row-content := HorizontalLayout {
+        spacing: 12px;
+
+        HorizontalLayout {
+            width: root.label-width;
+            spacing: root.info-tip != "" ? 8px : 0px;
+            alignment: start;
+
+            Text {
+                text: root.label;
+                color: #cbd5e1;
+                vertical-alignment: center;
+            }
+
+            tip := InfoBadge {
+                is-active: root.info-tip != "";
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        @children
+    }
+
+    if root.tip-is-open : Rectangle {
+        x: root.label-width + 8px;
+        y: -4px;
+        width: root.tip-width;
+        height: tip-layout.preferred-height;
+        background: #020617;
+        border-radius: 8px;
+        border-width: 1.5px;
+        border-color: #3b82f6;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000;
+        z: 2000;
+
+        tip-layout := VerticalLayout {
+            padding: 12px;
+            Text {
+                text: root.info-tip;
+                font-size: 12px;
+                color: #f8fafc;
+                wrap: word-wrap;
+            }
+        }
+
+        card-touch := TouchArea {}
+    }
+}
+
+export component SidebarNavItem inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <bool> highlight-text: root.active;
+    callback clicked <=> touch.clicked;
+
+    height: 38px;
+    border-radius: 6px;
+    background: root.active ? #3b82f6.with-alpha(0.25) : (touch.has-hover ? #334155 : transparent);
+    border-width: root.active ? 1px : 0px;
+    border-color: #3b82f6;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        spacing: 10px;
+        Text {
+            text: root.text;
+            font-size: 14px;
+            font-weight: root.active ? 700 : 500;
+            color: root.highlight-text ? #60a5fa : #cbd5e1;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {}
+}
+
+export component StatusBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> badge-color: #38bdf8;
+
+    visible: root.text != "";
+    background: root.badge-color.with-alpha(0.2);
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: root.badge-color.with-alpha(0.4);
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.text;
+            font-size: 11px;
+            font-weight: 600;
+            color: root.badge-color;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component ColorSettingRow inherits FormRow {
+    in property <string> hex-placeholder;
+    in-out property <string> hex-value;
+    in property <color> preview-color;
+    in property <bool> enabled: true;
+    callback edited(string /* hex */);
+
+    label-width: 220px;
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        LineEdit {
+            width: 160px;
+            text <=> root.hex-value;
+            placeholder-text: root.hex-placeholder;
+            enabled: root.enabled;
+            edited(val) => { root.edited(val); }
+        }
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            background: root.preview-color;
+            border-width: 1px;
+            border-color: #475569;
+        }
+    }
+}
+
+export component RegexValidationStatus inherits Text {
+    in property <bool> is-valid;
+    in property <string> error-text;
+
+    text: root.is-valid ? "✓ Valid regular expression" : root.error-text;
+    color: root.is-valid ? #10b981 : #ef4444;
+    font-size: 12px;
+    font-weight: 500;
+    wrap: word-wrap;
+}
+
+export component SubTabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> is-active: false;
+    in property <bool> show-indicator: false;
+    in property <color> indicator-color: #10b981;
+    callback clicked();
+
+    height: 38px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    background: root.is-active ? #1e293b : (tab_touch.has-hover ? #1e293b.with-alpha(0.5) : #0f172a);
+    border-width: 1px;
+    border-color: root.is-active ? #3b82f6 : #334155;
+
+    if root.is-active : Rectangle {
+        y: 0px;
+        height: 3px;
+        background: #3b82f6;
+        border-top-left-radius: 5px;
+        border-top-right-radius: 5px;
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 8px;
+
+        if root.show-indicator : Rectangle {
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: root.indicator-color;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.text;
+            color: root.is-active ? #ffffff : #94a3b8;
+            font-weight: root.is-active ? 700 : 500;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+
+    tab_touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}

@@ -1,0 +1,393 @@
+import { Button, CheckBox, ComboBox, LineEdit, Slider, SpinBox } from "std-widgets.slint";
+import { SectionCard, FormRow, ColorSettingRow } from "settings_widgets.slint";
+
+export component GeneralTab inherits VerticalLayout {
+    in property <bool> ui-locked-by-strict: false;
+    in-out property <int> aw-port: 5600;
+    in-out property <int> poll-interval-seconds: 10;
+    in-out property <bool> autostart: true;
+    in-out property <string> api-key: "";
+    in-out property <int> day-start-hour: 4;
+    in-out property <bool> suppress-fullscreen-d3d: true;
+    in-out property <bool> pause-all-rules: false;
+    in-out property <string> slint-renderer: "femtovg";
+    in-out property <string> slint-renderer-display: "OpenGL (renderer-femtovg)";
+    in-out property <bool> destroy-windows-on-hide: true;
+    in-out property <float> overlay-opacity: 0.9;
+    in-out property <string> accent-color-hex: "#3b82f6";
+    in property <color> accent-color-preview: #3b82f6;
+    in-out property <string> background-color-hex: "#0f172a";
+    in property <color> background-color-preview: #0f172a;
+    in-out property <string> text-color-hex: "#f8fafc";
+    in property <color> text-color-preview: #f8fafc;
+    in-out property <int> daily-target-minutes: 480;
+    in-out property <int> threshold-excessive-minutes: 600;
+    in-out property <int> histogram-bin-size-minutes: 60;
+    in-out property <int> histogram-bin-count: 24;
+    in-out property <string> time-format-code: "%H:%M";
+    in property <string> time-format-preview: "14:30";
+    in property <bool> time-format-valid: true;
+
+    callback has-changes();
+    callback color-hex-edited(string, string);
+    callback test-overlay(string);
+    callback validate-time-format(string);
+    callback show-activity-stats();
+    callback export-config();
+    callback import-config();
+
+    spacing: 18px;
+
+    Text {
+        text: "General Settings";
+        font-size: 22px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 16px;
+
+        FormRow {
+            label: "ActivityWatch Port:";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.aw-port;
+                minimum: 1;
+                maximum: 65535;
+                enabled: !root.ui-locked-by-strict;
+                edited => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Polling Interval (Seconds):";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.poll-interval-seconds;
+                minimum: 2;
+                maximum: 120;
+                enabled: !root.ui-locked-by-strict;
+                edited => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Start on Windows Login:";
+            label-width: 220px;
+            CheckBox {
+                checked <=> root.autostart;
+                text: "Launch minimized to system tray on login";
+                enabled: !root.ui-locked-by-strict;
+                toggled => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "API Key (Optional):";
+            label-width: 220px;
+            LineEdit {
+                text <=> root.api-key;
+                placeholder-text: "Optional Bearer auth token";
+                enabled: !root.ui-locked-by-strict;
+                edited(val) => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Logical Day Start Hour (0–23):";
+            label-width: 220px;
+            SpinBox {
+                width: 140px;
+                value <=> root.day-start-hour;
+                minimum: 0;
+                maximum: 23;
+                enabled: !root.ui-locked-by-strict;
+                edited(val) => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Fullscreen / Presentation DND:";
+            label-width: 220px;
+            CheckBox {
+                text: "Downgrade breaks during fullscreen apps & presentations";
+                checked <=> root.suppress-fullscreen-d3d;
+                enabled: !root.ui-locked-by-strict;
+                toggled => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Pause All Rules:";
+            label-width: 220px;
+            CheckBox {
+                text: "Pause all rule alerts and enforcement indefinitely";
+                checked <=> root.pause-all-rules;
+                enabled: !root.ui-locked-by-strict;
+                toggled => { root.has-changes(); }
+            }
+        }
+    }
+
+    Text {
+        text: "Performance";
+        font-size: 18px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 16px;
+
+        FormRow {
+            label: "Slint Renderer:";
+            label-width: 250px;
+            info-tip: "The OpenGL renderer (renderer-femtovg) is faster and smoother via GPU acceleration, but requires more memory. The CPU renderer (renderer-software) uses less memory, but may be slightly slower.";
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+                ComboBox {
+                    width: 280px;
+                    model: ["OpenGL (renderer-femtovg)", "CPU Software (renderer-software)"];
+                    current-value <=> root.slint-renderer-display;
+                    enabled: !root.ui-locked-by-strict;
+                    selected(val) => {
+                        if val == "CPU Software (renderer-software)" {
+                            root.slint-renderer = "software";
+                        } else {
+                            root.slint-renderer = "femtovg";
+                        }
+                        root.has-changes();
+                    }
+                }
+                Text {
+                    text: "(Requires restart to apply)";
+                    font-size: 13px;
+                    color: #94a3b8;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        FormRow {
+            label: "Destroy Windows when Hidden:";
+            label-width: 250px;
+            info-tip: "Keeping windows alive but hidden makes them appear faster with zero latency, but uses more memory. Destroying windows when hidden frees GPU surfaces and memory when not in use.";
+            CheckBox {
+                text: "Release GPU surfaces and memory when windows are closed or hidden";
+                checked <=> root.destroy-windows-on-hide;
+                enabled: !root.ui-locked-by-strict;
+                toggled => { root.has-changes(); }
+            }
+        }
+    }
+
+    Text {
+        text: "Overlay Theme & Appearance";
+        font-size: 18px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 16px;
+
+        FormRow {
+            label: "Overlay Opacity: " + Math.round(root.overlay-opacity * 100) + "%";
+            label-width: 220px;
+            Slider {
+                value <=> root.overlay-opacity;
+                minimum: 0.1;
+                maximum: 1.0;
+                enabled: !root.ui-locked-by-strict;
+                changed(val) => { root.has-changes(); }
+            }
+        }
+
+        ColorSettingRow {
+            label: "Accent Color (Hex):";
+            hex-value <=> root.accent-color-hex;
+            hex-placeholder: "#3b82f6";
+            preview-color: root.accent-color-preview;
+            enabled: !root.ui-locked-by-strict;
+            edited(val) => {
+                root.has-changes();
+                root.color-hex-edited("accent", val);
+            }
+        }
+
+        ColorSettingRow {
+            label: "Background Color (Hex):";
+            hex-value <=> root.background-color-hex;
+            hex-placeholder: "#0f172a";
+            preview-color: root.background-color-preview;
+            enabled: !root.ui-locked-by-strict;
+            edited(val) => {
+                root.has-changes();
+                root.color-hex-edited("background", val);
+            }
+        }
+
+        ColorSettingRow {
+            label: "Text Color (Hex):";
+            hex-value <=> root.text-color-hex;
+            hex-placeholder: "#f8fafc";
+            preview-color: root.text-color-preview;
+            enabled: !root.ui-locked-by-strict;
+            edited(val) => {
+                root.has-changes();
+                root.color-hex-edited("text", val);
+            }
+        }
+
+        FormRow {
+            label: "Test Overlays:";
+            label-width: 220px;
+            VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Test Break Screen"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("break"); } }
+                    Button { text: "Test HUD Toast"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_toast"); } }
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Test HUD Timer"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_timer"); } }
+                    Button { text: "Test 24h Stats HUD"; enabled: !root.ui-locked-by-strict; clicked => { root.test-overlay("hud_status"); } }
+                }
+            }
+        }
+    }
+
+    Text {
+        text: "Activity Statistics & 24h HUD Configuration";
+        font-size: 18px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 16px;
+
+        FormRow {
+            label: "Daily Target Screen Time (Mins):";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.daily-target-minutes;
+                minimum: 1;
+                maximum: 1440;
+                enabled: !root.ui-locked-by-strict;
+                edited(val) => {
+                    root.has-changes();
+                    if root.threshold-excessive-minutes < val {
+                        root.threshold-excessive-minutes = val;
+                    }
+                }
+            }
+        }
+
+        FormRow {
+            label: "Excessive Threshold (Mins):";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.threshold-excessive-minutes;
+                minimum: root.daily-target-minutes;
+                maximum: 1440;
+                enabled: !root.ui-locked-by-strict;
+                edited => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Histogram Bin Size (Mins):";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.histogram-bin-size-minutes;
+                minimum: 1;
+                maximum: 1440;
+                enabled: !root.ui-locked-by-strict;
+                edited => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Histogram Bin Count:";
+            label-width: 220px;
+            SpinBox {
+                value <=> root.histogram-bin-count;
+                minimum: 1;
+                maximum: 96;
+                enabled: !root.ui-locked-by-strict;
+                edited => { root.has-changes(); }
+            }
+        }
+
+        FormRow {
+            label: "Histogram Time Format (Strftime):";
+            label-width: 220px;
+            LineEdit {
+                text <=> root.time-format-code;
+                enabled: !root.ui-locked-by-strict;
+                edited(val) => {
+                    root.validate-time-format(val);
+                    root.has-changes();
+                }
+            }
+            Text {
+                text: root.time-format-preview;
+                color: root.time-format-valid ? #10b981 : #ef4444;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
+        FormRow {
+            label: "Show Activity Stats Overlay:";
+            label-width: 220px;
+            Button {
+                text: "Open 24-Hour Activity HUD";
+                clicked => { root.show-activity-stats(); }
+            }
+        }
+    }
+
+    Text {
+        text: "Configuration Backup & Transfer";
+        font-size: 18px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 16px;
+
+        FormRow {
+            label: "Import / Export:";
+            label-width: 220px;
+            HorizontalLayout {
+                spacing: 12px;
+                alignment: start;
+                Button {
+                    text: "Export Config...";
+                    enabled: !root.ui-locked-by-strict;
+                    clicked => { root.export-config(); }
+                }
+                Button {
+                    text: "Import Config...";
+                    enabled: !root.ui-locked-by-strict;
+                    clicked => { root.import-config(); }
+                }
+            }
+        }
+    }
+}
+

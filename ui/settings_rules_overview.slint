@@ -1,0 +1,187 @@
+import { Button, CheckBox } from "std-widgets.slint";
+import { RuleView, StatusBadge } from "settings_widgets.slint";
+
+export component RulesOverview inherits VerticalLayout {
+    in property <bool> ui-locked-by-strict: false;
+    in property <bool> strict-lock-active: false;
+    in property <[RuleView]> rules: [];
+
+    callback add-rule();
+    callback toggle-rule-enabled(int, bool);
+    callback move-rule(int, int);
+    callback snooze-rule(int, int);
+    callback reset-rule-session(int);
+    callback select-rule(int);
+    callback duplicate-rule(int);
+    callback delete-rule(int);
+    callback has-changes();
+
+    spacing: 16px;
+
+    HorizontalLayout {
+        alignment: space-between;
+
+        Text {
+            text: "Configured Rules";
+            font-size: 22px;
+            font-weight: 700;
+            color: #f8fafc;
+            vertical-alignment: center;
+        }
+
+        Button {
+            text: "+ Add Rule";
+            primary: true;
+            enabled: !root.ui-locked-by-strict;
+            clicked => { root.add-rule(); }
+        }
+    }
+
+    if root.rules.length == 0 : Rectangle {
+        background: #1e293b;
+        border-radius: 8px;
+        height: 140px;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 10px;
+
+            Text {
+                text: "No rules configured yet.";
+                font-size: 16px;
+                color: #94a3b8;
+                horizontal-alignment: center;
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                Button {
+                    text: "+ Create Your First Rule";
+                    enabled: !root.ui-locked-by-strict;
+                    clicked => { root.add-rule(); }
+                }
+            }
+        }
+    }
+
+    for r[i] in root.rules : Rectangle {
+        background: #1e293b;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #334155;
+
+        HorizontalLayout {
+            padding: 16px;
+            spacing: 14px;
+            alignment: space-between;
+
+            HorizontalLayout {
+                spacing: 14px;
+                alignment: start;
+
+                CheckBox {
+                    checked: r.enabled;
+                    enabled: !root.ui-locked-by-strict;
+                    toggled => {
+                        root.toggle-rule-enabled(i, self.checked);
+                        root.has-changes();
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        Text {
+                            text: r.name != "" ? r.name : ("Rule " + (i + 1));
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: r.enabled ? #f8fafc : #64748b;
+                            vertical-alignment: center;
+                        }
+
+                        StatusBadge {
+                            text: r.status-text;
+                        }
+                    }
+
+                    Text {
+                        text: "Monitor: " + r.monitor-selection + "  •  Trigger: " +
+                            (r.trigger == "Period"
+                                ? ("Every " + r.period-val + " " + r.period-unit)
+                                : ("Daily Limit " + r.limit-val + " " + r.limit-unit)) +
+                            "  •  Action: " + r.action;
+                        font-size: 12px;
+                        color: #94a3b8;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+
+                Button {
+                    text: "↑";
+                    enabled: !root.ui-locked-by-strict && i > 0;
+                    clicked => {
+                        root.move-rule(i, i - 1);
+                    }
+                }
+
+                Button {
+                    text: "↓";
+                    enabled: !root.ui-locked-by-strict && i < root.rules.length - 1;
+                    clicked => {
+                        root.move-rule(i, i + 1);
+                    }
+                }
+
+                Button {
+                    text: "Snooze 15m";
+                    enabled: !root.ui-locked-by-strict && r.enabled && !r.strict-mode;
+                    clicked => {
+                        root.snooze-rule(i, 15);
+                    }
+                }
+
+                Button {
+                    text: "Reset Timer";
+                    enabled: !root.strict-lock-active && r.enabled;
+                    clicked => {
+                        root.reset-rule-session(i);
+                    }
+                }
+
+                Button {
+                    text: "Configure";
+                    clicked => {
+                        root.select-rule(i);
+                    }
+                }
+
+                Button {
+                    text: "Duplicate";
+                    enabled: !root.ui-locked-by-strict;
+                    clicked => {
+                        root.duplicate-rule(i);
+                    }
+                }
+
+                Button {
+                    text: "Delete";
+                    enabled: !root.ui-locked-by-strict;
+                    clicked => {
+                        root.delete-rule(i);
+                    }
+                }
+            }
+        }
+    }
+}
+

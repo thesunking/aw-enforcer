@@ -1,0 +1,625 @@
+import { Button, CheckBox, ComboBox, LineEdit, TextEdit } from "std-widgets.slint";
+import { ScheduleGrid } from "schedule_grid.slint";
+import { ExecutableSelector } from "executable_selector.slint";
+import { DurationInput } from "duration_input.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { RuleView, SectionCard, FormRow, FormatToggleBtn, StatusBadge, RegexValidationStatus } from "settings_widgets.slint";
+
+export component RuleEditor inherits VerticalLayout {
+    in property <bool> ui-locked-by-strict: false;
+    in property <bool> strict-lock-active: false;
+    in property <int> selected-rule-idx: -1;
+    in property <[RuleView]> rules: [];
+    in property <[string]> known-apps: [];
+    in-out property <bool> rule-enabled: true;
+    in-out property <string> rule-name: "";
+    in-out property <string> rule-monitor-selection: "Executables";
+    in-out property <string> rule-title-regex: "";
+    in-out property <string> rule-url-regex: "";
+    in property <bool> rule-regex-valid: true;
+    in property <string> rule-regex-error: "";
+    in-out property <string> rule-trigger: "Period";
+    in-out property <int> rule-period-val: 20;
+    in-out property <string> rule-period-unit: "Min";
+    in-out property <int> rule-reset-afk-val: 5;
+    in-out property <string> rule-reset-afk-unit: "Min";
+    in-out property <int> rule-limit-val: 1;
+    in-out property <string> rule-limit-unit: "Hr";
+    in-out property <string> rule-action: "Show Overlay";
+    in-out property <string> rule-notification-method: "HUD";
+    in-out property <int> rule-notification-duration-val: 5;
+    in-out property <string> rule-notification-duration-unit: "Sec";
+    in-out property <bool> rule-show-remaining-time: false;
+    in-out property <int> rule-warn-before-val: 0;
+    in-out property <string> rule-warn-before-unit: "Min";
+    in property <bool> warn-before-exceeds-threshold: false;
+    in-out property <int> rule-grace-val: 0;
+    in-out property <string> rule-grace-unit: "Sec";
+    in-out property <int> rule-break-val: 5;
+    in-out property <string> rule-break-unit: "Min";
+    in-out property <bool> rule-click-through: false;
+    in-out property <bool> rule-strict-mode: false;
+    in property <float> overlay-opacity: 0.9;
+    in property <bool> line-is-h1: false;
+    in property <bool> line-is-h2: false;
+    in property <bool> line-is-bold: false;
+    in property <bool> line-is-italic: false;
+    in property <bool> line-is-underline: false;
+    in-out property <string> line-color-display: "Color: Default";
+    in-out property <string> line-size-display: "Size: Default";
+    in property <[int]> message-lines: [1, 2, 3];
+    in-out property <int> selected-message-line: 0;
+    in-out property <string> editor-message-text: "";
+    in property <[FormattedParagraph]> preview-paragraphs: [];
+
+    callback snooze-rule(int, int);
+    callback reset-rule-session(int);
+    callback active-rule-edited();
+    callback browse-executable();
+    callback refresh-known-apps();
+    callback add-known-app-to-rule(int, string);
+    callback remove-executable-from-rule(int, int);
+    callback apply-line-style(int, string);
+    callback append-placeholder(int, string);
+    callback select-message-line(int);
+    callback message-text-edited(string);
+    callback preview-rule-alert();
+    callback toggle-schedule-slot(int, int, int, bool);
+    callback toggle-schedule-day(int, int);
+    callback toggle-schedule-hour(int, int);
+    callback apply-schedule-preset(int, string);
+
+    property <string> cur-monitor: root.rule-monitor-selection;
+    property <string> cur-trigger: root.rule-trigger;
+    property <string> cur-action: root.rule-action;
+    property <bool> is-valid-idx: root.selected-rule-idx >= 0 && root.selected-rule-idx < root.rules.length;
+    property <bool> has-target-executables: root.is-valid-idx ? (root.rules[root.selected-rule-idx].target-executables.length > 0) : false;
+
+    spacing: 16px;
+
+    HorizontalLayout {
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: 10px;
+            alignment: start;
+
+            Text {
+                text: root.is-valid-idx ? (root.rules[root.selected-rule-idx].name != "" ? root.rules[root.selected-rule-idx].name : ("Rule " + (root.selected-rule-idx + 1))) : "";
+                font-size: 20px;
+                font-weight: 700;
+                color: #f8fafc;
+                vertical-alignment: center;
+            }
+
+            StatusBadge {
+                text: root.is-valid-idx ? root.rules[root.selected-rule-idx].status-text : "";
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+
+            Button {
+                text: "Snooze 15m";
+                enabled: !root.ui-locked-by-strict && root.rule-enabled && !root.rule-strict-mode;
+                clicked => {
+                    root.snooze-rule(root.selected-rule-idx, 15);
+                }
+            }
+
+            Button {
+                text: "Reset Timer";
+                enabled: !root.strict-lock-active && root.rule-enabled;
+                clicked => {
+                    root.reset-rule-session(root.selected-rule-idx);
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // SECTION 1: GENERAL
+    // ==========================================
+    Text { text: "1. General Settings"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+    SectionCard {
+        FormRow {
+            label: "Rule Enabled:";
+            CheckBox {
+                checked <=> root.rule-enabled;
+                enabled: !root.ui-locked-by-strict;
+                text: "Active during scheduled hours";
+                toggled => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        FormRow {
+            label: "Rule Name:";
+            LineEdit {
+                text <=> root.rule-name;
+                enabled: !root.ui-locked-by-strict;
+                edited(val) => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // SECTION 2: MONITOR
+    // ==========================================
+    Text { text: "2. Monitor Target"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+    SectionCard {
+        FormRow {
+            label: "Selection Mode:";
+            ComboBox {
+                width: 200px;
+                enabled: !root.ui-locked-by-strict;
+                model: ["Executables", "Titles", "Urls"];
+                current-value <=> root.rule-monitor-selection;
+                selected(val) => {
+                    if val != "Executables" && root.rule-action == "Kill Process" {
+                        root.rule-action = "Close Window";
+                    }
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        if root.cur-monitor == "Executables" : VerticalLayout {
+            spacing: 8px;
+            Text { text: "Monitored Executables ('*' = all active screen time):"; font-size: 14px; font-weight: 600; color: #f8fafc; }
+            if root.is-valid-idx : ExecutableSelector {
+                enabled: !root.ui-locked-by-strict;
+                executables: root.rules[root.selected-rule-idx].target-executables;
+                known-apps: root.known-apps;
+                empty-text: "All applications monitored (* wildcard) — add specific .exe names below to restrict.";
+                browse-executable => { root.browse-executable(); }
+                refresh-known-apps => { root.refresh-known-apps(); }
+                add-known-app(app) => { root.add-known-app-to-rule(root.selected-rule-idx, app); }
+                remove-executable(idx) => { root.remove-executable-from-rule(root.selected-rule-idx, idx); }
+            }
+        }
+
+        if root.cur-monitor == "Titles" : FormRow {
+            label: "Window Title Regex:";
+            VerticalLayout {
+                spacing: 4px;
+                LineEdit {
+                    text <=> root.rule-title-regex;
+                    enabled: !root.ui-locked-by-strict;
+                    placeholder-text: "(?i)(youtube|twitch|reddit)";
+                    edited(val) => {
+                        root.active-rule-edited();
+                    }
+                }
+                RegexValidationStatus {
+                    is-valid: root.rule-regex-valid;
+                    error-text: root.rule-regex-error;
+                }
+            }
+        }
+
+        if root.cur-monitor == "Urls" : FormRow {
+            label: "Browser URL Regex:";
+            VerticalLayout {
+                spacing: 4px;
+                LineEdit {
+                    text <=> root.rule-url-regex;
+                    enabled: !root.ui-locked-by-strict;
+                    placeholder-text: "(?i)(youtube\\.com|reddit\\.com|twitter\\.com)";
+                    edited(val) => {
+                        root.active-rule-edited();
+                    }
+                }
+                RegexValidationStatus {
+                    is-valid: root.rule-regex-valid;
+                    error-text: root.rule-regex-error;
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // SECTION 3: TRIGGER
+    // ==========================================
+    Text { text: "3. Trigger"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+    SectionCard {
+        FormRow {
+            label: "Trigger:";
+            ComboBox {
+                width: 220px;
+                enabled: !root.ui-locked-by-strict;
+                model: ["Period", "Limit"];
+                current-value <=> root.rule-trigger;
+                selected(val) => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        if root.cur-trigger == "Period" : DurationInput {
+            label: "Period:";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 1;
+            maximum-value: 3600;
+            value <=> root.rule-period-val;
+            unit <=> root.rule-period-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if root.cur-trigger == "Period" : DurationInput {
+            label: "Reset Session after AFK:";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 1;
+            maximum-value: 3600;
+            value <=> root.rule-reset-afk-val;
+            unit <=> root.rule-reset-afk-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if root.cur-trigger == "Limit" : DurationInput {
+            label: "Daily Limit (0 = immediate):";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 0;
+            maximum-value: 3600;
+            value <=> root.rule-limit-val;
+            unit <=> root.rule-limit-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+    }
+
+    // ==========================================
+    // SECTION 4: ACTION
+    // ==========================================
+    Text { text: "4. Action"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+    SectionCard {
+        FormRow {
+            label: "Action:";
+            ComboBox {
+                width: 220px;
+                enabled: !root.ui-locked-by-strict;
+                model: (root.cur-monitor == "Executables" && root.has-target-executables)
+                    ? ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window", "Kill Process"]
+                    : ["Show Overlay", "Show Notification", "Show Statistics", "Lock Workstation", "Close Tab", "Close Window"];
+                current-value <=> root.rule-action;
+                selected(val) => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        if root.cur-action == "Show Notification" || root.rule-warn-before-val > 0 : FormRow {
+            label: "Notification Method:";
+            HorizontalLayout {
+                spacing: 8px;
+                for method in ["HUD", "Windows"] : Rectangle {
+                    width: 106px;
+                    height: 32px;
+                    border-radius: 6px;
+                    background: root.rule-notification-method == method
+                        ? #2563eb
+                        : ((method_touch.has-hover && !root.ui-locked-by-strict) ? #334155 : #0f172a);
+                    border-width: 1px;
+                    border-color: root.rule-notification-method == method
+                        ? #60a5fa
+                        : #475569;
+
+                    Text {
+                        text: method;
+                        color: root.ui-locked-by-strict ? #64748b : (root.rule-notification-method == method
+                            ? #ffffff
+                            : #cbd5e1);
+                        font-size: 13px;
+                        font-weight: root.rule-notification-method == method ? 700 : 500;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    method_touch := TouchArea {
+                        enabled: !root.ui-locked-by-strict;
+                        mouse-cursor: !root.ui-locked-by-strict ? pointer : default;
+                        clicked => {
+                            root.rule-notification-method = method;
+                            root.active-rule-edited();
+                        }
+                    }
+                }
+            }
+        }
+
+        if (root.cur-action == "Show Notification" || root.rule-warn-before-val > 0) && root.rule-notification-method == "HUD" : DurationInput {
+            label: "Duration:";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 1;
+            maximum-value: 3600;
+            value <=> root.rule-notification-duration-val;
+            unit <=> root.rule-notification-duration-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if (root.cur-action == "Show Notification" || root.rule-warn-before-val > 0) && root.rule-notification-method == "HUD" : FormRow {
+            label: "Show Time Remaining:";
+            CheckBox {
+                text: "Show countdown timer on notification";
+                enabled: !root.ui-locked-by-strict;
+                checked <=> root.rule-show-remaining-time;
+                toggled => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        DurationInput {
+            label: "Warn Before Action (0 = disabled):";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 0;
+            maximum-value: 3600;
+            value <=> root.rule-warn-before-val;
+            unit <=> root.rule-warn-before-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if root.warn-before-exceeds-threshold : Text {
+            text: "⚠ Warn Before Action must be shorter than the trigger Period/Limit to fire before enforcement.";
+            color: #f59e0b;
+            font-size: 13px;
+        }
+
+        DurationInput {
+            label: "Grace Countdown (0 = disabled):";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 0;
+            maximum-value: 3600;
+            value <=> root.rule-grace-val;
+            unit <=> root.rule-grace-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if root.cur-action == "Show Overlay" : DurationInput {
+            label: "Break Duration:";
+            enabled: !root.ui-locked-by-strict;
+            minimum-value: 1;
+            maximum-value: 3600;
+            value <=> root.rule-break-val;
+            unit <=> root.rule-break-unit;
+            edited(val, u) => {
+                root.active-rule-edited();
+            }
+        }
+
+        if root.cur-action == "Show Overlay" || root.cur-action == "Show Statistics" : FormRow {
+            label: "Click-through Overlay:";
+            CheckBox {
+                text: "Pass mouse clicks and keystrokes through overlay";
+                enabled: !root.ui-locked-by-strict;
+                checked <=> root.rule-click-through;
+                toggled => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        FormRow {
+            label: "Strict Mode:";
+            CheckBox {
+                text: "Hide Skip/Snooze controls and lock settings during grace & break enforcement";
+                enabled: !root.ui-locked-by-strict;
+                checked <=> root.rule-strict-mode;
+                toggled => {
+                    root.active-rule-edited();
+                }
+            }
+        }
+
+        // Message Template & Formatting Toolbar Sub-card
+        if root.cur-action == "Show Overlay" || root.cur-action == "Show Notification" || root.rule-warn-before-val > 0 || root.rule-grace-val > 0 : Rectangle {
+            background: #0f172a.with-alpha(0.6);
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #334155;
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 12px;
+
+                Text {
+                    text: "Message Template & Formatting Toolbar:";
+                    font-size: 15px;
+                    font-weight: 600;
+                    color: #f8fafc;
+                }
+
+                // Formatting Toolbar Row 1: Active Styles & Formatting Tools
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    FormatToggleBtn { text: "H1"; btn-width: 36px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-h1; clicked => { root.apply-line-style(root.selected-message-line, "h1"); } }
+                    FormatToggleBtn { text: "H2"; btn-width: 36px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-h2; clicked => { root.apply-line-style(root.selected-message-line, "h2"); } }
+                    FormatToggleBtn { text: "Bold"; btn-width: 48px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-bold; clicked => { root.apply-line-style(root.selected-message-line, "bold"); } }
+                    FormatToggleBtn { text: "Italic"; btn-width: 48px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-italic; is-italic: true; clicked => { root.apply-line-style(root.selected-message-line, "italic"); } }
+                    FormatToggleBtn { text: "Underline"; btn-width: 68px; enabled: !root.ui-locked-by-strict; is-active: root.line-is-underline; clicked => { root.apply-line-style(root.selected-message-line, "underline"); } }
+
+                    ComboBox {
+                        width: 135px;
+                        enabled: !root.ui-locked-by-strict;
+                        model: ["Color: Default", "Color: Sky Blue", "Color: Emerald", "Color: Amber", "Color: Rose", "Color: Purple", "Color: Indigo", "Color: White"];
+                        current-value <=> root.line-color-display;
+                        selected(val) => {
+                            root.apply-line-style(root.selected-message-line, val);
+                        }
+                    }
+
+                    ComboBox {
+                        width: 115px;
+                        enabled: !root.ui-locked-by-strict;
+                        model: ["Size: Default", "Size: 12px", "Size: 14px", "Size: 16px", "Size: 18px", "Size: 20px", "Size: 24px", "Size: 28px", "Size: 32px"];
+                        current-value <=> root.line-size-display;
+                        selected(val) => {
+                            root.apply-line-style(root.selected-message-line, val);
+                        }
+                    }
+                }
+
+                // Formatting Toolbar Row 2: Variable Quick-Insert Chips
+                VerticalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+
+                        Text { text: "Insert Variable:"; color: #94a3b8; vertical-alignment: center; font-size: 12px; }
+                        for chip in ["{rule_name}", "{session_duration}", "{break_time}", "{app}"] : Button {
+                            text: "+ " + chip;
+                            enabled: !root.ui-locked-by-strict;
+                            clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+
+                        Rectangle { width: 88px; }
+                        for chip in ["{used}", "{limit}", "{remaining}"] : Button {
+                            text: "+ " + chip;
+                            enabled: !root.ui-locked-by-strict;
+                            clicked => { root.append-placeholder(root.selected-message-line, chip); }
+                        }
+                    }
+                }
+
+                // Multi-line Message TextEdit with Left Line Selection Column
+                HorizontalLayout {
+                    height: Math.max(120px, root.message-lines.length * 20px + 14px);
+                    spacing: 8px;
+
+                    Rectangle {
+                        width: 44px;
+                        background: #0f172a;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #334155;
+
+                        VerticalLayout {
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            padding-left: 4px;
+                            padding-right: 4px;
+                            spacing: 0px;
+                            alignment: start;
+
+                            for line-num[i] in root.message-lines : Rectangle {
+                                height: 20px;
+                                border-radius: 3px;
+                                background: root.selected-message-line == i ? #1e3a8a : (gutter_touch.has-hover ? #1e293b : transparent);
+
+                                HorizontalLayout {
+                                    padding-left: 4px;
+                                    padding-right: 4px;
+                                    spacing: 3px;
+                                    alignment: start;
+
+                                    Rectangle {
+                                        width: 10px;
+                                        if root.selected-message-line == i : Text {
+                                            text: "▶";
+                                            color: #38bdf8;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: line-num;
+                                        color: root.selected-message-line == i ? #38bdf8 : #64748b;
+                                        font-size: 12px;
+                                        font-weight: root.selected-message-line == i ? 700 : 400;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                gutter_touch := TouchArea {
+                                    enabled: !root.ui-locked-by-strict;
+                                    mouse-cursor: !root.ui-locked-by-strict ? pointer : default;
+                                    clicked => {
+                                        root.selected-message-line = i;
+                                        root.select-message-line(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    TextEdit {
+                        height: Math.max(120px, root.message-lines.length * 20px + 14px);
+                        font-size: 15px;
+                        enabled: !root.ui-locked-by-strict;
+                        text <=> root.editor-message-text;
+                        edited(val) => {
+                            root.message-text-edited(val);
+                        }
+                    }
+                }
+
+                // Live Message Preview Box
+                Text { text: "Live Preview:"; color: #94a3b8; font-size: 12px; }
+                Rectangle {
+                    background: #0f172a.with-alpha(root.overlay-opacity);
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: #334155;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        FormattedText {
+                            paragraphs: root.preview-paragraphs;
+                        }
+                    }
+                }
+            }
+        }
+
+        Button {
+            text: "Preview This Rule's Alert";
+            enabled: !root.ui-locked-by-strict;
+            clicked => {
+                root.preview-rule-alert();
+            }
+        }
+    }
+
+    // ==========================================
+    // SECTION 5: SCHEDULE
+    // ==========================================
+    Text { text: "5. Active Hours Schedule"; font-size: 17px; font-weight: 700; color: #f8fafc; }
+    SectionCard {
+        if root.is-valid-idx : ScheduleGrid {
+            enabled: !root.ui-locked-by-strict;
+            slots: root.rules[root.selected-rule-idx].schedule-slots;
+            toggle-slot(d, h, s) => { root.toggle-schedule-slot(root.selected-rule-idx, d, h, s); }
+            toggle-day(d) => { root.toggle-schedule-day(root.selected-rule-idx, d); }
+            toggle-hour(h) => { root.toggle-schedule-hour(root.selected-rule-idx, h); }
+            apply-preset(p) => { root.apply-schedule-preset(root.selected-rule-idx, p); }
+        }
+    }
+}

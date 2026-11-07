@@ -115,7 +115,12 @@ AW-Enforcer automatically loads and saves its configuration to:
 | `src/formatter.rs` | Message template placeholder interpolation, case-insensitive attribute toggle, grace-aware preview context, line-level attribute/heading parser, fallback rule templates, and UI snooze badge formatting (`format_snooze_badge`) |
 | `src/autostart.rs` | Windows Registry (`HKCU\...\Run`) startup registration |
 | `ui/main.slint` | Slint component root exporting `SettingsWindow`, `OverlayWindow`, `RuleView`, and `FormattedParagraph` |
-| `ui/settings.slint` | Settings window, sidebar navigation, 5-section rule editor, and interactive 7×24 schedule matrix |
+| `ui/settings.slint` | Settings window shell, sidebar navigation, sub-tab routing, save/discard commit actions, and strict mode lock presentation |
+| `ui/settings_general_tab.slint` | General preferences tab component (`GeneralTab`): autostart, theme colors/opacity, Slint renderer, 24h HUD bins/quotas, and backup/transfer |
+| `ui/settings_rules_overview.slint` | Rules overview list component (`RulesOverview`): rule cards, ordering, enablement, snooze, reset, and duplicate/delete actions |
+| `ui/settings_rule_editor.slint` | 5-section rule editor component (`RuleEditor`): targets, triggers, actions, message template formatting toolbar, preview card, and schedule matrix |
+| `ui/settings_live_status_tab.slint` | Live telemetry status tab component (`LiveStatusTab`): ActivityWatch server connection and real-time screen-time metrics |
+| `ui/settings_widgets.slint` | Reusable settings widgets: `RuleView` schema, `SectionCard`, `FormRow`, `ColorSettingRow`, `SidebarNavItem`, `StatusBadge`, and format buttons |
 | `ui/overlay.slint` | Full-screen break enforcer, HUD toast, HUD grace countdown timer, and 24-hour screen time histogram cards |
 | `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component with alignment-aware text underlines |
 | `ui/executable_selector.slint` | Executable chip list, file browser trigger, and running process selector |

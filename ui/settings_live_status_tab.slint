@@ -1,0 +1,52 @@
+import { SectionCard, FormRow } from "settings_widgets.slint";
+
+export component LiveStatusTab inherits VerticalLayout {
+    in property <bool> aw-connected: false;
+    in property <int> aw-port: 5600;
+    in property <string> current-session-duration-text: "--";
+    in property <string> today-screentime-text: "--";
+    in property <string> current-active-app: "--";
+
+    spacing: 18px;
+
+    Text {
+        text: "Live ActivityWatch Status";
+        font-size: 22px;
+        font-weight: 700;
+        color: #f8fafc;
+    }
+
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 14px;
+
+        FormRow {
+            label: "ActivityWatch Server:";
+            label-width: 200px;
+            Text {
+                text: root.aw-connected ? "● Connected (localhost:" + root.aw-port + ")" : "○ Disconnected / Connecting...";
+                color: root.aw-connected ? #10b981 : #ef4444;
+                font-weight: 700;
+            }
+        }
+
+        FormRow {
+            label: "Current Session Duration:";
+            label-width: 200px;
+            Text { text: root.current-session-duration-text; color: #38bdf8; font-weight: 700; }
+        }
+
+        FormRow {
+            label: "Today's Active Time:";
+            label-width: 200px;
+            Text { text: root.today-screentime-text; color: #f8fafc; font-weight: 700; }
+        }
+
+        FormRow {
+            label: "Active Foreground Window:";
+            label-width: 200px;
+            Text { text: root.current-active-app; color: #a78bfa; font-weight: 600; }
+        }
+    }
+}
+
