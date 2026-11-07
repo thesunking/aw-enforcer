@@ -125,28 +125,10 @@ pub fn kill_target_processes<S: AsRef<str>>(target_executables: &[S]) -> usize {
         }
 
         // Never allow wildcard "*" to terminate all system processes
-        if exe_name_matches_targets(exe_name, target_executables) {
-            #[cfg(test)]
-            {
-                killed_count += 1;
-            }
-            #[cfg(not(test))]
-            {
-                tracing::info!(
-                    "Terminating target process: {} (PID: {})",
-                    exe_name,
-                    pid
-                );
-                unsafe {
-                    let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                    if !h_proc.is_null() {
-                        if TerminateProcess(h_proc, 1) != 0 {
-                            killed_count += 1;
-                        }
-                        CloseHandle(h_proc);
-                    }
-                }
-            }
+        if exe_name_matches_targets(exe_name, target_executables)
+            && terminate_process_by_pid(pid, exe_name)
+        {
+            killed_count += 1;
         }
     });
 
@@ -750,6 +732,29 @@ pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
             Some(exe_name.to_string())
         } else {
             None
+        }
+    }
+}
+
+/// Opens the target process with `PROCESS_TERMINATE` access, terminates it with exit code `1`,
+/// and closes the process handle, returning `true` if the process was successfully terminated.
+fn terminate_process_by_pid(pid: u32, exe_name: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (pid, exe_name);
+        true
+    }
+    #[cfg(not(test))]
+    {
+        tracing::info!("Terminating target process: {} (PID: {})", exe_name, pid);
+        unsafe {
+            let h_proc = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h_proc.is_null() {
+                return false;
+            }
+            let terminated = TerminateProcess(h_proc, 1) != 0;
+            CloseHandle(h_proc);
+            terminated
         }
     }
 }
