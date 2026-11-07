@@ -4,9 +4,11 @@ import { RuleView, StatusBadge } from "settings_widgets.slint";
 export component RulesOverview inherits VerticalLayout {
     in property <bool> ui-locked-by-strict: false;
     in property <bool> strict-lock-active: false;
+    in property <bool> pause-all-rules: false;
     in property <[RuleView]> rules: [];
 
     callback add-rule();
+    callback toggle-pause-all();
     callback toggle-rule-enabled(int, bool);
     callback move-rule(int, int);
     callback snooze-rule(int, int);
@@ -29,11 +31,51 @@ export component RulesOverview inherits VerticalLayout {
             vertical-alignment: center;
         }
 
-        Button {
-            text: "+ Add Rule";
-            primary: true;
-            enabled: !root.ui-locked-by-strict;
-            clicked => { root.add-rule(); }
+        HorizontalLayout {
+            spacing: 10px;
+
+            Rectangle {
+                height: 32px;
+                border-radius: 6px;
+                border-width: 1px;
+                background: root.ui-locked-by-strict ? #1e293b :
+                            root.pause-all-rules ? (pause_touch.pressed ? #991b1b : (pause_touch.has-hover ? #b91c1c : #ef4444)) :
+                            (pause_touch.pressed ? #0f172a : (pause_touch.has-hover ? #334155 : #1e293b));
+                border-color: root.ui-locked-by-strict ? #334155 :
+                              root.pause-all-rules ? #f87171 :
+                              (pause_touch.has-hover ? #64748b : #475569);
+                animate background { duration: 150ms; }
+                animate border-color { duration: 150ms; }
+
+                pause_touch := TouchArea {
+                    enabled: !root.ui-locked-by-strict;
+                    mouse-cursor: !root.ui-locked-by-strict ? pointer : not-allowed;
+                    clicked => {
+                        root.toggle-pause-all();
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    alignment: center;
+
+                    Text {
+                        text: root.pause-all-rules ? "Unpause All Rules" : "Pause All Rules";
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: root.ui-locked-by-strict ? #64748b : (root.pause-all-rules ? #ffffff : #f8fafc);
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Button {
+                text: "+ Add Rule";
+                primary: true;
+                enabled: !root.ui-locked-by-strict;
+                clicked => { root.add-rule(); }
+            }
         }
     }
 

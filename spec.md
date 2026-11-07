@@ -425,6 +425,7 @@ graph LR
 - **Global Session Telemetry & Limit Rules:** Live Status (Tab 2) and system tray tooltip session telemetry track the user's overall continuous active screen time via `calculate_continuous_session_from_merged` across all merged ActivityWatch intervals (`merged_all_intervals`), ensuring session duration is reported accurately even when the user only has daily `Limit` rules or app-specific rules configured, and snoozed `Period` rules continue updating `current_session_seconds` for telemetry.
 - **Snooze Status Badges & Sub-Minute Formatting (`src/formatter.rs`):** Live Status (Tab 2) and rule overview badges format remaining snooze durations via `format_snooze_badge`, displaying `Snoozed (Xs)` when remaining time drops below 60 seconds and ceiling-rounded `Snoozed (Xm)` when 60 seconds or more, providing real-time countdown feedback as snoozes near expiration.
 - **Schedule Grid Alignment & Presets (`ui/schedule_grid.slint`, `src/config.rs`):** The 24 hourly row labels and the 7×24 interactive matrix use matching 432px container heights and 1px top/bottom padding to guarantee pixel-exact row alignment. The schedule grid provides one-click presets via `RuleSchedule::from_preset`: `"work_hours"` (M-F 9-5), `"evenings"` (M-F 18-24, Sat-Sun 8-24), `"weekends"` (Sat-Sun all hours, M-F inactive), `"select_all"`, and `"clear"`.
+- **Pause All Rules Toggle in Rules Overview (`ui/settings_rules_overview.slint`):** A dedicated toggle button is situated alongside the `+ Add Rule` button in the `Configured Rules` header row. When rules are active, the button displays `"Pause All Rules"` with standard dark styling. When rules are paused, it transitions to high-visibility red (`#ef4444`) displaying `"Unpause All Rules"`. Clicking the button immediately updates the configuration, notifies the engine (`DaemonCommand::SetPauseAll`), and synchronizes the system tray menu item and icon state.
 
 ### 6.3 System Tray Architecture & Tri-State Status Indicator (`src/tray.rs`, `src/engine.rs`)
 The Windows system tray lifecycle, context menu construction, tri-state icon rendering, and event polling are isolated within `src/tray.rs`. The `TrayManager` struct encapsulates menu item handles, cached `current_state: TrayIconState`, and the underlying `tray_icon::TrayIcon`. It translates low-level tray double-clicks and menu clicks into high-level domain `TrayAction`s via `process_events`.
@@ -453,7 +454,7 @@ The system tray icon dynamically reflects the real-time operational state of the
   - `"Show Activity Stats"`: Dispatches `DaemonCommand::ShowStatsOverlay` to open the 24-Hour Statistics HUD.
   - `"Dismiss Break Overlay"`: Dismisses active non-strict break overlays. Disabled (`set_enabled(false)`) when strict lock is active.
   - `"Snooze All (15m)"` / `"Resume Snoozed Rules"`: Toggles global snooze across all rules. Dynamically updates label text based on `any_snoozed` and is disabled under strict lock.
-  - `"Pause All Rules"` / `"Resume All Rules"`: Toggles `pause_all_rules`. Disabled under strict lock.
+  - `"Pause All Rules"` / `"Unpause All Rules"`: Toggles `pause_all_rules`. Disabled under strict lock.
   - `"Quit"`: Terminates the application.
 
 ---

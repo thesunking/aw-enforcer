@@ -9,7 +9,6 @@ export component GeneralTab inherits VerticalLayout {
     in-out property <string> api-key: "";
     in-out property <int> day-start-hour: 4;
     in-out property <bool> suppress-fullscreen-d3d: true;
-    in-out property <bool> pause-all-rules: false;
     in-out property <string> slint-renderer: "femtovg";
     in-out property <string> slint-renderer-display: "OpenGL (renderer-femtovg)";
     in-out property <bool> destroy-windows-on-hide: true;
@@ -114,17 +113,6 @@ export component GeneralTab inherits VerticalLayout {
             CheckBox {
                 text: "Downgrade breaks during fullscreen apps & presentations";
                 checked <=> root.suppress-fullscreen-d3d;
-                enabled: !root.ui-locked-by-strict;
-                toggled => { root.has-changes(); }
-            }
-        }
-
-        FormRow {
-            label: "Pause All Rules:";
-            label-width: 220px;
-            CheckBox {
-                text: "Pause all rule alerts and enforcement indefinitely";
-                checked <=> root.pause-all-rules;
                 enabled: !root.ui-locked-by-strict;
                 toggled => { root.has-changes(); }
             }

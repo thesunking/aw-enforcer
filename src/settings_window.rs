@@ -232,7 +232,7 @@ fn wire_general_settings_callbacks(settings_win: &SettingsWindow, ctx: &Settings
                         .set_destroy_windows_on_hide(new_destroy);
                 }
                 item_pause.set_text(if updated_config.general.pause_all_rules {
-                    "Resume All Rules"
+                    "Unpause All Rules"
                 } else {
                     "Pause All Rules"
                 });
@@ -609,7 +609,7 @@ fn wire_rule_crud_callbacks(settings_win: &SettingsWindow, ctx: &SettingsContext
     // Select rule
     {
         let rm = ctx.rules_model.clone();
-        let sw = settings_weak;
+        let sw = settings_weak.clone();
         settings_win.on_select_rule(move |idx| {
             if let Some(win) = sw.upgrade() {
                 let u = idx as usize;
@@ -622,6 +622,38 @@ fn wire_rule_crud_callbacks(settings_win: &SettingsWindow, ctx: &SettingsContext
                     win.set_selected_rule_idx(-1);
                     refresh_rule_regex_validation(&win, &rm);
                 }
+            }
+        });
+    }
+
+    // Toggle pause all rules
+    {
+        let cfg_cell = ctx.current_config.clone();
+        let cmd_tx = ctx.command_tx.clone();
+        let item_pause = ctx.item_pause.clone();
+        let sw = settings_weak;
+        settings_win.on_toggle_pause_all(move || {
+            if let Some(win) = sw.upgrade() {
+                if is_ui_locked_by_strict(&win) {
+                    return;
+                }
+                let new_paused = !win.get_pause_all_rules();
+                win.set_pause_all_rules(new_paused);
+                {
+                    let mut cfg = cfg_cell.borrow_mut();
+                    cfg.general.pause_all_rules = new_paused;
+                    if let Err(e) = cfg.save() {
+                        tracing::error!("Failed to save config on pause toggle: {e}");
+                    }
+                }
+                item_pause.set_text(if new_paused {
+                    "Unpause All Rules"
+                } else {
+                    "Pause All Rules"
+                });
+                cmd_tx
+                    .send(DaemonCommand::SetPauseAll { paused: new_paused })
+                    .ok();
             }
         });
     }
@@ -1788,5 +1820,11 @@ mod tests {
         assert!(ls.histogram_values.is_empty());
         assert!(ls.histogram_labels.is_empty());
         assert!(ls.is_loading);
+    }
+
+    #[test]
+    fn test_pause_all_rules_default_false() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.general.pause_all_rules);
     }
 }

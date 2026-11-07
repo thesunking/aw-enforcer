@@ -117,7 +117,7 @@ AW-Enforcer automatically loads and saves its configuration to:
 | `ui/main.slint` | Slint component root exporting `SettingsWindow`, `OverlayWindow`, `RuleView`, and `FormattedParagraph` |
 | `ui/settings.slint` | Settings window shell, sidebar navigation, sub-tab routing, save/discard commit actions, and strict mode lock presentation |
 | `ui/settings_general_tab.slint` | General preferences tab component (`GeneralTab`): autostart, theme colors/opacity, Slint renderer, 24h HUD bins/quotas, and backup/transfer |
-| `ui/settings_rules_overview.slint` | Rules overview list component (`RulesOverview`): rule cards, ordering, enablement, snooze, reset, and duplicate/delete actions |
+| `ui/settings_rules_overview.slint` | Rules overview list component (`RulesOverview`): rule cards, ordering, enablement, snooze, reset, duplicate/delete actions, and dynamic Pause/Unpause All Rules button |
 | `ui/settings_rule_editor.slint` | 5-section rule editor component (`RuleEditor`): targets, triggers, actions, message template formatting toolbar, preview card, and schedule matrix |
 | `ui/settings_live_status_tab.slint` | Live telemetry status tab component (`LiveStatusTab`): ActivityWatch server connection, real-time screen-time metrics, and embedded `ActivityHistogram` |
 | `ui/settings_widgets.slint` | Reusable settings widgets: `RuleView` schema, `SectionCard`, `FormRow`, `ColorSettingRow`, `SidebarNavItem`, `StatusBadge`, and format buttons |

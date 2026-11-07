@@ -142,6 +142,7 @@ export component SettingsWindow inherits Window {
     callback toggle-rule-enabled(int /* rule_idx */, bool /* enabled */);
     callback snooze-rule(int /* rule_idx */, int /* minutes */);
     callback reset-rule-session(int /* rule_idx */);
+    callback toggle-pause-all();
 
     callback add-known-app-to-rule(int /* rule_idx */, string /* app */);
     callback remove-executable-from-rule(int /* rule_idx */, int /* exe_idx */);
@@ -419,7 +420,6 @@ export component SettingsWindow inherits Window {
                     api-key <=> root.api-key;
                     day-start-hour <=> root.day-start-hour;
                     suppress-fullscreen-d3d <=> root.suppress-fullscreen-d3d;
-                    pause-all-rules <=> root.pause-all-rules;
                     slint-renderer <=> root.slint-renderer;
                     slint-renderer-display <=> root.slint-renderer-display;
                     destroy-windows-on-hide <=> root.destroy-windows-on-hide;
@@ -507,9 +507,11 @@ export component SettingsWindow inherits Window {
                     if root.selected-rule-idx == -1 : RulesOverview {
                         ui-locked-by-strict: root.ui-locked-by-strict;
                         strict-lock-active: root.strict-lock-active;
+                        pause-all-rules: root.pause-all-rules;
                         rules: root.rules;
 
                         add-rule => { root.add-rule(); }
+                        toggle-pause-all => { root.toggle-pause-all(); }
                         toggle-rule-enabled(idx, enabled) => { root.toggle-rule-enabled(idx, enabled); }
                         move-rule(from, to) => { root.move-rule(from, to); }
                         snooze-rule(idx, mins) => { root.snooze-rule(idx, mins); }
