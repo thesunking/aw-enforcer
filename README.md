@@ -99,7 +99,9 @@ AW-Enforcer automatically loads and saves its configuration to:
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Single-instance mutex, system tray menu, event-driven Slint UI dispatch, and Tokio runtime setup |
+| `src/main.rs` | Single-instance mutex & activation event polling, overlay action dispatch, main Slint timer loop, and Tokio async runtime setup |
+| `src/settings_window.rs` | `SettingsWindow` lifecycle management, full callback wiring, live telemetry synchronization, ActivityWatch health polling, and input validation / model conversion helpers |
+| `src/tray.rs` | System tray menu construction, `TrayManager` lifecycle, `TrayAction` event polling, tri-state RGBA icon asset caching (`create_default_tray_icon`, `create_paused_tray_icon`, `create_alert_tray_icon`), and dynamic status/tooltip synchronization |
 | `src/config.rs` | TOML configuration schema, serde serialization, `strftime` validation, duration/quota bounds clamping, target/schedule normalization, unique rule ID enforcement, and `Config::sanitize()` / `Rule::sanitize()` safety invariants |
 | `src/aw_client.rs` | Asynchronous ActivityWatch REST client (`/api/0/buckets/` dynamic discovery, thread-safe hostname ranking, and `filter_period_intersect` queries) |
 | `src/engine.rs` | Real-time 1s countdown loop, periodic ActivityWatch polling loop, command dispatch, and 3-stage rule evaluation pipeline |
