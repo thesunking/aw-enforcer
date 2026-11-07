@@ -1,0 +1,94 @@
+import { Button } from "std-widgets.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { ProgressBar } from "overlay_widgets.slint";
+
+export component BreakEnforcer inherits VerticalLayout {
+    in property <string> title: "Break Required";
+    in property <[FormattedParagraph]> message-paragraphs;
+    in property <string> countdown-text: "00:00";
+    in property <float> progress-ratio: 1.0;
+    in property <color> accent-color: #3b82f6;
+    in property <color> text-color: #f8fafc;
+    in property <bool> is-user-idle: true;
+    in property <bool> click-through: false;
+    in property <bool> strict-mode: false;
+    in property <bool> allow-snooze: true;
+
+    callback skip-break();
+    callback snooze-clicked(int /* minutes */);
+
+    spacing: 16px;
+
+    // Title
+    Text {
+        text: root.title != "" ? root.title : "Break Required";
+        font-size: 22px;
+        font-weight: 700;
+        color: root.text-color;
+        horizontal-alignment: center;
+    }
+
+    // Formatted Message Body
+    FormattedText {
+        paragraphs: root.message-paragraphs;
+    }
+
+    // Big Countdown Timer
+    Rectangle {
+        height: 64px;
+        background: #0f172a;
+        border-radius: 8px;
+
+        Text {
+            text: root.countdown-text;
+            font-size: 36px;
+            font-weight: 800;
+            color: root.is-user-idle ? #38bdf8 : #f59e0b;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // Progress Bar
+    ProgressBar {
+        progress: root.progress-ratio;
+        fill-color: root.accent-color;
+        bar-height: 6px;
+    }
+
+    if !root.is-user-idle : Text {
+        text: "⏸ Input detected — timer paused until you step away";
+        color: #f59e0b;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+    }
+
+    // Interaction controls (hidden if click-through == true)
+    if !root.click-through : HorizontalLayout {
+        spacing: 12px;
+        alignment: center;
+
+        if !root.strict-mode : Button {
+            text: "Skip Break";
+            clicked => {
+                root.skip-break();
+            }
+        }
+
+        if root.allow-snooze : Button {
+            text: "Snooze (5m)";
+            clicked => {
+                root.snooze-clicked(5);
+            }
+        }
+    }
+
+    if root.click-through : Text {
+        text: "Click-through break active. Dismiss via system tray or step away from your PC.";
+        color: #94a3b8;
+        font-size: 12px;
+        horizontal-alignment: center;
+    }
+}
+

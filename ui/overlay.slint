@@ -1,37 +1,9 @@
-import { Button, ComboBox, ScrollView } from "std-widgets.slint";
-import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { WindowDragArea } from "overlay_widgets.slint";
+import { BreakEnforcer } from "break_enforcer.slint";
+import { HudToast } from "hud_toast.slint";
+import { HudTimer } from "hud_timer.slint";
 import { ActivityHistogram } from "activity_histogram.slint";
-
-component WindowDragArea inherits TouchArea {
-    in property <bool> click-through: false;
-    callback drag();
-
-    enabled: !root.click-through;
-    mouse-cursor: root.click-through ? default : move;
-    pointer-event(pe) => {
-        if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
-            root.drag();
-        }
-    }
-}
-
-component ProgressBar inherits Rectangle {
-    in property <float> progress: 1.0;
-    in property <color> fill-color: #3b82f6;
-    in property <length> bar-height: 6px;
-
-    height: root.bar-height;
-    background: #334155;
-    border-radius: root.bar-height / 2;
-
-    Rectangle {
-        x: 0;
-        width: parent.width * Math.min(Math.max(root.progress, 0.0), 1.0);
-        height: parent.height;
-        background: root.fill-color;
-        border-radius: root.bar-height / 2;
-    }
-}
+import { FormattedParagraph } from "formatted_text.slint";
 
 export component OverlayWindow inherits Window {
     no-frame: true;
@@ -98,78 +70,20 @@ export component OverlayWindow inherits Window {
 
                     VerticalLayout {
                         padding: 24px;
-                        spacing: 16px;
 
-                        // Title
-                        Text {
-                            text: root.title-text != "" ? root.title-text : "Break Required";
-                            font-size: 22px;
-                            font-weight: 700;
-                            color: root.text-color;
-                            horizontal-alignment: center;
-                        }
-
-                        // Formatted Message Body
-                        FormattedText {
-                            paragraphs: root.message-paragraphs;
-                        }
-
-                        // Big Countdown Timer
-                        Rectangle {
-                            height: 64px;
-                            background: #0f172a;
-                            border-radius: 8px;
-
-                            Text {
-                                text: root.countdown-text;
-                                font-size: 36px;
-                                font-weight: 800;
-                                color: root.is-user-idle ? #38bdf8 : #f59e0b;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        // Progress Bar
-                        ProgressBar {
-                            progress: root.progress-ratio;
-                            fill-color: root.accent-color;
-                            bar-height: 6px;
-                        }
-
-                        if !root.is-user-idle : Text {
-                            text: "⏸ Input detected — timer paused until you step away";
-                            color: #f59e0b;
-                            font-size: 13px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                        }
-
-                        // Interaction controls (hidden if click-through == true)
-                        if !root.click-through : HorizontalLayout {
-                            spacing: 12px;
-                            alignment: center;
-
-                            if !root.strict-mode : Button {
-                                text: "Skip Break";
-                                clicked => {
-                                    root.skip-break-clicked(root.rule-id);
-                                }
-                            }
-
-                            if root.allow-snooze : Button {
-                                text: "Snooze (5m)";
-                                clicked => {
-                                    root.snooze-clicked(root.rule-id, 5);
-                                }
-                            }
-                        }
-
-                        if root.click-through : Text {
-                            text: "Click-through break active. Dismiss via system tray or step away from your PC.";
-                            color: #94a3b8;
-                            font-size: 12px;
-                            horizontal-alignment: center;
+                        BreakEnforcer {
+                            title: root.title-text;
+                            message-paragraphs: root.message-paragraphs;
+                            countdown-text: root.countdown-text;
+                            progress-ratio: root.progress-ratio;
+                            accent-color: root.accent-color;
+                            text-color: root.text-color;
+                            is-user-idle: root.is-user-idle;
+                            click-through: root.click-through;
+                            strict-mode: root.strict-mode;
+                            allow-snooze: root.allow-snooze;
+                            skip-break => { root.skip-break-clicked(root.rule-id); }
+                            snooze-clicked(m) => { root.snooze-clicked(root.rule-id, m); }
                         }
                     }
                 }
@@ -195,74 +109,20 @@ export component OverlayWindow inherits Window {
 
         VerticalLayout {
             padding: 16px;
-            spacing: 12px;
 
-            // Header
-            HorizontalLayout {
-                spacing: 8px;
-
-                Text {
-                    text: "🔔 " + (root.title-text != "" ? root.title-text : "Limit Warning");
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: root.text-color;
-                    vertical-alignment: center;
-                }
-
-                if root.show-time-remaining : Text {
-                    text: root.countdown-text;
-                    font-size: 15px;
-                    font-weight: 700;
-                    color: #38bdf8;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
-                }
-            }
-
-            Rectangle {
-                clip: true;
-                vertical-stretch: 1;
-                FormattedText {
-                    width: 100%;
-                    paragraphs: root.message-paragraphs;
-                }
-            }
-
-            // Controls: Snooze dropdown & Acknowledge
-            HorizontalLayout {
-                spacing: 8px;
-                alignment: end;
-                height: 34px;
-
-                if root.allow-snooze && !root.strict-mode && root.snooze-options.length > 0 : HorizontalLayout {
-                    spacing: 8px;
-
-                    ComboBox {
-                        width: 110px;
-                        model: root.snooze-labels;
-                        current-index <=> root.selected-snooze-index;
-                    }
-
-                    Button {
-                        text: "Snooze";
-                        clicked => {
-                            root.snooze-clicked(
-                                root.rule-id,
-                                root.snooze-options.length > 0
-                                    ? root.snooze-options[Math.min(Math.max(root.selected-snooze-index, 0), root.snooze-options.length - 1)]
-                                    : 5
-                            );
-                        }
-                    }
-                }
-
-                Button {
-                    text: "OK";
-                    primary: true;
-                    clicked => {
-                        root.acknowledge-toast-clicked(root.rule-id);
-                    }
-                }
+            HudToast {
+                title: root.title-text;
+                message-paragraphs: root.message-paragraphs;
+                countdown-text: root.countdown-text;
+                show-time-remaining: root.show-time-remaining;
+                text-color: root.text-color;
+                allow-snooze: root.allow-snooze;
+                strict-mode: root.strict-mode;
+                snooze-labels: root.snooze-labels;
+                snooze-options: root.snooze-options;
+                selected-snooze-index <=> root.selected-snooze-index;
+                snooze-clicked(m) => { root.snooze-clicked(root.rule-id, m); }
+                acknowledge-clicked => { root.acknowledge-toast-clicked(root.rule-id); }
             }
         }
     }
@@ -285,63 +145,19 @@ export component OverlayWindow inherits Window {
 
         VerticalLayout {
             padding: 16px;
-            spacing: 10px;
 
-            // Header & Countdown
-            HorizontalLayout {
-                Text {
-                    text: "⚠️ " + (root.title-text != "" ? root.title-text : "Quota Approaching");
-                    font-size: 15px;
-                    font-weight: 700;
-                    color: root.text-color;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: root.countdown-text;
-                    font-size: 18px;
-                    font-weight: 800;
-                    color: #f59e0b;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
-                }
-            }
-
-            Rectangle {
-                clip: true;
-                vertical-stretch: 1;
-                FormattedText {
-                    width: 100%;
-                    paragraphs: root.message-paragraphs;
-                }
-            }
-
-            // Progress Bar
-            ProgressBar {
-                progress: root.progress-ratio;
-                fill-color: #f59e0b;
-                bar-height: 5px;
-            }
-
-            // Controls: Snooze & Dismiss when non-strict and interactive
-            if (root.allow-snooze || root.rule-id == "test_preview" || root.rule-id == "test_timer") && !root.strict-mode && !root.click-through : HorizontalLayout {
-                spacing: 8px;
-                alignment: end;
-                height: 30px;
-
-                if root.allow-snooze : Button {
-                    text: "Snooze (5m)";
-                    clicked => {
-                        root.snooze-clicked(root.rule-id, 5);
-                    }
-                }
-
-                Button {
-                    text: "Dismiss";
-                    clicked => {
-                        root.acknowledge-toast-clicked(root.rule-id);
-                    }
-                }
+            HudTimer {
+                title: root.title-text;
+                message-paragraphs: root.message-paragraphs;
+                countdown-text: root.countdown-text;
+                progress-ratio: root.progress-ratio;
+                text-color: root.text-color;
+                allow-snooze: root.allow-snooze;
+                strict-mode: root.strict-mode;
+                click-through: root.click-through;
+                is-test-mode: root.rule-id == "test_preview" || root.rule-id == "test_timer";
+                snooze-clicked(m) => { root.snooze-clicked(root.rule-id, m); }
+                dismiss-clicked => { root.acknowledge-toast-clicked(root.rule-id); }
             }
         }
     }

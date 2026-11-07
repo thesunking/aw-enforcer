@@ -1,0 +1,78 @@
+import { Button } from "std-widgets.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { ProgressBar } from "overlay_widgets.slint";
+
+export component HudTimer inherits VerticalLayout {
+    in property <string> title: "Quota Approaching";
+    in property <[FormattedParagraph]> message-paragraphs;
+    in property <string> countdown-text: "00:00";
+    in property <float> progress-ratio: 1.0;
+    in property <color> text-color: #f8fafc;
+    in property <bool> allow-snooze: false;
+    in property <bool> strict-mode: false;
+    in property <bool> click-through: false;
+    in property <bool> is-test-mode: false;
+
+    callback snooze-clicked(int /* minutes */);
+    callback dismiss-clicked();
+
+    spacing: 10px;
+
+    // Header & Countdown
+    HorizontalLayout {
+        Text {
+            text: "⚠️ " + (root.title != "" ? root.title : "Quota Approaching");
+            font-size: 15px;
+            font-weight: 700;
+            color: root.text-color;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.countdown-text;
+            font-size: 18px;
+            font-weight: 800;
+            color: #f59e0b;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+
+    Rectangle {
+        clip: true;
+        vertical-stretch: 1;
+        FormattedText {
+            width: 100%;
+            paragraphs: root.message-paragraphs;
+        }
+    }
+
+    // Progress Bar
+    ProgressBar {
+        progress: root.progress-ratio;
+        fill-color: #f59e0b;
+        bar-height: 5px;
+    }
+
+    // Controls: Snooze & Dismiss when non-strict and interactive
+    if (root.allow-snooze || root.is-test-mode) && !root.strict-mode && !root.click-through : HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        height: 30px;
+
+        if root.allow-snooze : Button {
+            text: "Snooze (5m)";
+            clicked => {
+                root.snooze-clicked(5);
+            }
+        }
+
+        Button {
+            text: "Dismiss";
+            clicked => {
+                root.dismiss-clicked();
+            }
+        }
+    }
+}
+

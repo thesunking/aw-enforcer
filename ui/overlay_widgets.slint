@@ -1,0 +1,31 @@
+export component WindowDragArea inherits TouchArea {
+    in property <bool> click-through: false;
+    callback drag();
+
+    enabled: !root.click-through;
+    mouse-cursor: root.click-through ? default : move;
+    pointer-event(pe) => {
+        if pe.kind == PointerEventKind.down && pe.button == PointerEventButton.left {
+            root.drag();
+        }
+    }
+}
+
+export component ProgressBar inherits Rectangle {
+    in property <float> progress: 1.0;
+    in property <color> fill-color: #3b82f6;
+    in property <length> bar-height: 6px;
+
+    height: root.bar-height;
+    background: #334155;
+    border-radius: root.bar-height / 2;
+
+    Rectangle {
+        x: 0;
+        width: parent.width * Math.min(Math.max(root.progress, 0.0), 1.0);
+        height: parent.height;
+        background: root.fill-color;
+        border-radius: root.bar-height / 2;
+    }
+}
+

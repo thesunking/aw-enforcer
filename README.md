@@ -121,8 +121,12 @@ AW-Enforcer automatically loads and saves its configuration to:
 | `ui/settings_rule_editor.slint` | 5-section rule editor component (`RuleEditor`): targets, triggers, actions, message template formatting toolbar, preview card, and schedule matrix |
 | `ui/settings_live_status_tab.slint` | Live telemetry status tab component (`LiveStatusTab`): ActivityWatch server connection, real-time screen-time metrics, and embedded `ActivityHistogram` |
 | `ui/settings_widgets.slint` | Reusable settings widgets: `RuleView` schema, `SectionCard`, `FormRow`, `ColorSettingRow`, `SidebarNavItem`, `StatusBadge`, and format buttons |
-| `ui/overlay.slint` | Full-screen break enforcer, HUD toast, and HUD grace countdown timer cards, embedding `ActivityHistogram` for HUD status mode |
+| `ui/overlay.slint` | Overlay window shell (`OverlayWindow`) routing between fullscreen breaks, HUD toast, HUD timer, and HUD status modes |
+| `ui/break_enforcer.slint` | Full-screen break enforcer overlay card (`BreakEnforcer`) with countdown timer, idle detection banner, and skip/snooze controls |
+| `ui/hud_toast.slint` | Interactive HUD toast card (`HudToast`) with notification header, rich-text body, snooze dropdown, and acknowledge action |
+| `ui/hud_timer.slint` | HUD timer / grace countdown card (`HudTimer`) with warning header, countdown, progress bar, and snooze/dismiss actions |
 | `ui/activity_histogram.slint` | Shared 24-hour activity timeline histogram component (`ActivityHistogram`) displaying status badges, dynamic capacity-scaled timeline bars, decimated time labels, and active/target screentime summary |
+| `ui/overlay_widgets.slint` | Shared overlay widgets: draggable window handle (`WindowDragArea`) and styled ratio progress bar (`ProgressBar`) |
 | `ui/formatted_text.slint` | Reusable rich-text paragraph renderer component with alignment-aware text underlines |
 | `ui/executable_selector.slint` | Executable chip list, file browser trigger, and running process selector |
 | `ui/duration_input.slint` | Reusable numeric value + `Hr`/`Min`/`Sec` unit selector |

@@ -1,0 +1,88 @@
+import { Button, ComboBox } from "std-widgets.slint";
+import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+
+export component HudToast inherits VerticalLayout {
+    in property <string> title: "Limit Warning";
+    in property <[FormattedParagraph]> message-paragraphs;
+    in property <string> countdown-text: "";
+    in property <bool> show-time-remaining: false;
+    in property <color> text-color: #f8fafc;
+    in property <bool> allow-snooze: true;
+    in property <bool> strict-mode: false;
+    in property <[string]> snooze-labels: ["5 min", "10 min", "15 min"];
+    in property <[int]> snooze-options: [5, 10, 15];
+    in-out property <int> selected-snooze-index: 0;
+
+    callback snooze-clicked(int /* minutes */);
+    callback acknowledge-clicked();
+
+    spacing: 12px;
+
+    // Header
+    HorizontalLayout {
+        spacing: 8px;
+
+        Text {
+            text: "🔔 " + (root.title != "" ? root.title : "Limit Warning");
+            font-size: 16px;
+            font-weight: 700;
+            color: root.text-color;
+            vertical-alignment: center;
+        }
+
+        if root.show-time-remaining : Text {
+            text: root.countdown-text;
+            font-size: 15px;
+            font-weight: 700;
+            color: #38bdf8;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+
+    Rectangle {
+        clip: true;
+        vertical-stretch: 1;
+        FormattedText {
+            width: 100%;
+            paragraphs: root.message-paragraphs;
+        }
+    }
+
+    // Controls: Snooze dropdown & Acknowledge
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        height: 34px;
+
+        if root.allow-snooze && !root.strict-mode && root.snooze-options.length > 0 : HorizontalLayout {
+            spacing: 8px;
+
+            ComboBox {
+                width: 110px;
+                model: root.snooze-labels;
+                current-index <=> root.selected-snooze-index;
+            }
+
+            Button {
+                text: "Snooze";
+                clicked => {
+                    root.snooze-clicked(
+                        root.snooze-options.length > 0
+                            ? root.snooze-options[Math.min(Math.max(root.selected-snooze-index, 0), root.snooze-options.length - 1)]
+                            : 5
+                    );
+                }
+            }
+        }
+
+        Button {
+            text: "OK";
+            primary: true;
+            clicked => {
+                root.acknowledge-clicked();
+            }
+        }
+    }
+}
+
