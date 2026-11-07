@@ -452,69 +452,91 @@ impl OverlayManager {
     /// Lazily instantiates Slint `OverlayWindow` instances and wires UI callbacks until `self.windows.len() >= required`.
     pub fn ensure_window_count(&mut self, required: usize) {
         while self.windows.len() < required {
-            if let Ok(win) = OverlayWindow::new() {
-                win.hide().ok();
-                Self::apply_theme_to_window(&win, &self.overlay_config);
-
-                let win_weak = win.as_weak();
-                let pos_ref = self.status_pos.clone();
-                win.on_drag_status_window(move || {
-                    if let Some(w) = win_weak.upgrade() {
-                        if let Some(hwnd) = Self::extract_hwnd(&w) {
-                            unsafe {
-                                ReleaseCapture();
-                                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
-                                let mut r: RECT = std::mem::zeroed();
-                                if GetWindowRect(hwnd, &mut r) != 0 {
-                                    *pos_ref.borrow_mut() = Some((r.left, r.top));
-                                }
-
-                                // Modal Win32 drag loop swallows WM_LBUTTONUP. Synthesize mouse release and move
-                                // to release Slint's internal pointer capture and immediately restore cursor and clickability.
-                                let mut pt: POINT = std::mem::zeroed();
-                                GetCursorPos(&mut pt);
-                                ScreenToClient(hwnd, &mut pt);
-                                let lparam = ((pt.x as u32) & 0xFFFF) | (((pt.y as u32) & 0xFFFF) << 16);
-                                PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam as isize);
-                                PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam as isize);
-                            }
-                        }
-                    }
-                });
-
-                if let Some(ref tx) = self.command_tx {
-                    let t1 = tx.clone();
-                    win.on_snooze_clicked(move |rid, mins| {
-                        // Engine handles both BreakRule and AppRule IDs on SnoozeBreak
-                        t1.send(crate::engine::DaemonCommand::SnoozeBreak {
-                            rule_id: rid.to_string(),
-                            minutes: mins as u32,
-                        })
-                        .ok();
-                    });
-                    let t2 = tx.clone();
-                    win.on_skip_break_clicked(move |rid| {
-                        t2.send(crate::engine::DaemonCommand::SkipBreak {
-                            rule_id: rid.to_string(),
-                        })
-                        .ok();
-                    });
-                    let t3 = tx.clone();
-                    win.on_acknowledge_toast_clicked(move |rid| {
-                        t3.send(crate::engine::DaemonCommand::AcknowledgeAppWarning {
-                            rule_id: rid.to_string(),
-                        })
-                        .ok();
-                    });
-                    let t4 = tx.clone();
-                    win.on_close_status_clicked(move || {
-                        t4.send(crate::engine::DaemonCommand::CloseOverlay).ok();
-                    });
-                }
+            if let Ok(win) = self.create_overlay_window() {
                 self.windows.push(win);
             } else {
                 break;
             }
+        }
+    }
+
+    /// Instantiates a single `OverlayWindow`, applies the current theme, and wires its UI callbacks.
+    fn create_overlay_window(&self) -> Result<OverlayWindow, slint::PlatformError> {
+        let win = OverlayWindow::new()?;
+        win.hide().ok();
+        Self::apply_theme_to_window(&win, &self.overlay_config);
+        self.wire_overlay_window_callbacks(&win);
+        Ok(win)
+    }
+
+    /// Wires drag and command callbacks onto an `OverlayWindow` instance.
+    fn wire_overlay_window_callbacks(&self, win: &OverlayWindow) {
+        let win_weak = win.as_weak();
+        let pos_ref = self.status_pos.clone();
+        win.on_drag_status_window(move || {
+            if let Some(w) = win_weak.upgrade() {
+                if let Some(hwnd) = Self::extract_hwnd(&w) {
+                    if let Some(new_pos) = Self::perform_win32_window_drag(hwnd) {
+                        *pos_ref.borrow_mut() = Some(new_pos);
+                    }
+                }
+            }
+        });
+
+        if let Some(ref tx) = self.command_tx {
+            let t1 = tx.clone();
+            win.on_snooze_clicked(move |rid, mins| {
+                // Engine handles both BreakRule and AppRule IDs on SnoozeBreak
+                t1.send(crate::engine::DaemonCommand::SnoozeBreak {
+                    rule_id: rid.to_string(),
+                    minutes: mins as u32,
+                })
+                .ok();
+            });
+            let t2 = tx.clone();
+            win.on_skip_break_clicked(move |rid| {
+                t2.send(crate::engine::DaemonCommand::SkipBreak {
+                    rule_id: rid.to_string(),
+                })
+                .ok();
+            });
+            let t3 = tx.clone();
+            win.on_acknowledge_toast_clicked(move |rid| {
+                t3.send(crate::engine::DaemonCommand::AcknowledgeAppWarning {
+                    rule_id: rid.to_string(),
+                })
+                .ok();
+            });
+            let t4 = tx.clone();
+            win.on_close_status_clicked(move || {
+                t4.send(crate::engine::DaemonCommand::CloseOverlay).ok();
+            });
+        }
+    }
+
+    /// Initiates a native Win32 caption drag (`WM_NCLBUTTONDOWN` + `HTCAPTION`), synthesizes pointer
+    /// release messages so Slint's internal pointer capture is cleared, and returns the resulting `(left, top)` window position.
+    fn perform_win32_window_drag(hwnd: HWND) -> Option<(i32, i32)> {
+        unsafe {
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            let mut r: RECT = std::mem::zeroed();
+            let new_pos = if GetWindowRect(hwnd, &mut r) != 0 {
+                Some((r.left, r.top))
+            } else {
+                None
+            };
+
+            // Modal Win32 drag loop swallows WM_LBUTTONUP. Synthesize mouse release and move
+            // to release Slint's internal pointer capture and immediately restore cursor and clickability.
+            let mut pt: POINT = std::mem::zeroed();
+            GetCursorPos(&mut pt);
+            ScreenToClient(hwnd, &mut pt);
+            let lparam = ((pt.x as u32) & 0xFFFF) | (((pt.y as u32) & 0xFFFF) << 16);
+            PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam as isize);
+            PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam as isize);
+
+            new_pos
         }
     }
 
