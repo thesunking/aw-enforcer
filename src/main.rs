@@ -27,7 +27,7 @@ mod tray;
 
 use aw_client::AwClient;
 use config::AppConfig;
-use engine::{DaemonCommand, Engine, OverlayAction};
+use engine::{DaemonCommand, Engine, OverlayAction, TrayIconState};
 use overlay::OverlayManager;
 use settings_window::{
     open_settings_window, spawn_aw_connection_check, update_rules_model_statuses, LiveUiState,
@@ -52,16 +52,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|a| a == "--minimized" || a == "--autostart");
 
-    let _instance_lock = match acquire_single_instance(start_minimized) {
-        Some(lock) => lock,
-        None => {
-            tracing::info!("Another instance of AW-Enforcer is already running. Exiting.");
-            return Ok(());
-        }
+    let Some(instance_lock) = acquire_single_instance(start_minimized) else {
+        tracing::info!("Another instance of AW-Enforcer is already running. Exiting.");
+        return Ok(());
     };
-    let activate_event_val = _instance_lock.activate_event as isize;
+    let activate_event_val = instance_lock.activate_event as isize;
 
-    // 3. Load application configuration & sync Windows autostart registry key
+    // 3. Load application configuration & environment
+    let config = init_config_and_environment();
+    let current_config = Rc::new(RefCell::new(config.clone()));
+
+    // 4. Initialize ActivityWatch REST Client
+    let aw_client = Arc::new(AwClient::new(
+        config.general.aw_port,
+        &config.general.api_key,
+    ));
+
+    // 5. Establish Tokio communication channels
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
+    let (overlay_action_tx, overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
+
+    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
+    let tokio_rt = spawn_engine_worker(
+        config.clone(),
+        aw_client.clone(),
+        command_rx,
+        overlay_action_tx,
+    );
+
+    // 7. Initialize OverlayManager and System Tray Manager
+    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
+        config.overlay.clone(),
+        Some(command_tx.clone()),
+        config.general.destroy_windows_on_hide,
+    )));
+    let tray_manager = Rc::new(RefCell::new(TrayManager::new(config.general.pause_all_rules)?));
+
+    // 8. Shared UI context container for SettingsWindow, overlays, and tray
+    let settings_ctx = SettingsContext {
+        settings_slot: Rc::new(RefCell::new(None)),
+        rules_model: Rc::new(VecModel::from(Vec::<RuleView>::new())),
+        current_config,
+        ui_aw_client: Rc::new(RefCell::new(aw_client)),
+        live_state: Rc::new(RefCell::new(LiveUiState::default())),
+        aw_connected_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        command_tx,
+        rt_handle: tokio_rt.handle().clone(),
+        item_pause: tray_manager.borrow().item_pause(),
+        overlay_manager,
+    };
+
+    // 9. Event-driven overlay action dispatch
+    setup_overlay_action_dispatch(&settings_ctx, tray_manager.clone(), overlay_action_rx);
+
+    // 10. Main Thread UI Loop Timer (processes tray events, countdowns, and connection health)
+    let main_timer = slint::Timer::default();
+    start_main_ui_timer(&main_timer, &settings_ctx, tray_manager, activate_event_val);
+
+    // 11. Handle startup launch options (--minimized, --autostart, --test-break)
+    handle_startup_launch_options(&settings_ctx, &args, start_minimized);
+
+    // 12. Run Slint Win32 GUI Event Loop until explicit tray Quit
+    slint::run_event_loop_until_quit()?;
+
+    Ok(())
+}
+
+/// Loads application configuration, initializes the configured Slint renderer,
+/// synchronizes the Windows startup registry key, and registers the application AUMID.
+fn init_config_and_environment() -> AppConfig {
     let config = AppConfig::load();
     if std::env::var("SLINT_BACKEND").is_err() {
         if config.general.slint_renderer.eq_ignore_ascii_case("software") {
@@ -80,20 +139,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Failed to synchronize Windows autostart registry key on launch: {e}");
     }
     enforcer::ensure_app_user_model_id_registered();
-    let current_config = Rc::new(RefCell::new(config.clone()));
+    config
+}
 
-    // 4. Initialize ActivityWatch REST Client
-    let aw_client = Arc::new(AwClient::new(
-        config.general.aw_port,
-        &config.general.api_key,
-    ));
-    let ui_aw_client = Rc::new(RefCell::new(aw_client.clone()));
-
-    // 5. Establish Tokio communication channels
-    let (command_tx, command_rx) = mpsc::unbounded_channel::<DaemonCommand>();
-    let (overlay_action_tx, mut overlay_action_rx) = mpsc::unbounded_channel::<OverlayAction>();
-
-    // 6. Build shared multi-threaded Tokio runtime and spawn background worker thread
+/// Builds the shared multithreaded Tokio runtime and spawns the background worker driving
+/// the rule evaluation engine and command dispatch loop.
+fn spawn_engine_worker(
+    config: AppConfig,
+    aw_client: Arc<AwClient>,
+    command_rx: mpsc::UnboundedReceiver<DaemonCommand>,
+    overlay_action_tx: mpsc::UnboundedSender<OverlayAction>,
+) -> Arc<tokio::runtime::Runtime> {
     let tokio_rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -101,16 +157,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Failed to build Tokio runtime"),
     );
-    let rt_handle = tokio_rt.handle().clone();
 
-    let worker_config = config.clone();
-    let worker_client = aw_client.clone();
     let initial_poll_secs = config.general.poll_interval_seconds.max(2);
     let bg_rt = tokio_rt.clone();
 
     std::thread::spawn(move || {
         bg_rt.block_on(async move {
-            let mut engine = Engine::new(worker_config, worker_client, overlay_action_tx);
+            let mut engine = Engine::new(config, aw_client, overlay_action_tx);
             let mut cmd_rx = command_rx;
 
             let mut ticker_1s = tokio::time::interval(Duration::from_secs(1));
@@ -137,101 +190,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // 7. Initialize OverlayManager with theme configuration
-    let overlay_manager = Rc::new(RefCell::new(OverlayManager::new(
-        config.overlay.clone(),
-        Some(command_tx.clone()),
-        config.general.destroy_windows_on_hide,
-    )));
+    tokio_rt
+}
 
-    // 8. Shared UI state for lazy SettingsWindow instantiation
-    let settings_slot: Rc<RefCell<Option<SettingsWindow>>> = Rc::new(RefCell::new(None));
-    let live_ui_state: Rc<RefCell<LiveUiState>> = Rc::new(RefCell::new(LiveUiState::default()));
-    let aw_connected_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rules_model = Rc::new(VecModel::from(Vec::<RuleView>::new()));
+/// Sets up thread-local overlay action handler and spawns the Tokio forwarder to dispatch
+/// actions from the background engine to the Slint GUI thread.
+fn setup_overlay_action_dispatch(
+    ctx: &SettingsContext,
+    tray_manager: Rc<RefCell<TrayManager>>,
+    mut overlay_action_rx: mpsc::UnboundedReceiver<OverlayAction>,
+) {
+    let overlay_mgr = ctx.overlay_manager.clone();
+    let settings_slot_ref = ctx.settings_slot.clone();
+    let rules_model_ref = ctx.rules_model.clone();
+    let live_state_ref = ctx.live_state.clone();
+    let tray_mgr_ref = tray_manager;
 
-    // 9. Build System Tray Manager
-    let tray_manager = Rc::new(RefCell::new(TrayManager::new(config.general.pause_all_rules)?));
-
-    // 10. Event-driven overlay action dispatch
-    {
-        let overlay_mgr = overlay_manager.clone();
-        let settings_slot_ref = settings_slot.clone();
-        let rules_model_ref = rules_model.clone();
-        let live_state_ref = live_ui_state.clone();
-        let tray_mgr_ref = tray_manager.clone();
-
-        OVERLAY_ACTION_HANDLER.with(|cell| {
-            *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
-                let mut mgr = overlay_mgr.borrow_mut();
-                match action {
-                    OverlayAction::Show(mode) => {
-                        mgr.show_mode(mode);
-                        mgr.apply_pending_win32_styles();
-                    }
-                    OverlayAction::UpdateCountdown {
-                        remaining,
-                        total,
-                        is_idle,
-                    } => {
-                        mgr.update_countdown(remaining, total, is_idle);
-                    }
-                    OverlayAction::UpdateTheme(theme_cfg) => {
-                        mgr.update_overlay_config(theme_cfg);
-                    }
-                    OverlayAction::UpdateLiveStatus {
+    OVERLAY_ACTION_HANDLER.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(move |action: OverlayAction| {
+            let mut mgr = overlay_mgr.borrow_mut();
+            match action {
+                OverlayAction::Show(mode) => {
+                    mgr.show_mode(mode);
+                    mgr.apply_pending_win32_styles();
+                }
+                OverlayAction::UpdateCountdown {
+                    remaining,
+                    total,
+                    is_idle,
+                } => {
+                    mgr.update_countdown(remaining, total, is_idle);
+                }
+                OverlayAction::UpdateTheme(theme_cfg) => {
+                    mgr.update_overlay_config(theme_cfg);
+                }
+                OverlayAction::UpdateLiveStatus {
+                    session_duration_text,
+                    screentime_text,
+                    active_app,
+                    strict_lock_active,
+                    rule_statuses,
+                    tray_tooltip,
+                    any_snoozed,
+                    tray_state,
+                } => {
+                    apply_live_status_update(
+                        &live_state_ref,
+                        &settings_slot_ref,
+                        &rules_model_ref,
+                        &tray_mgr_ref,
                         session_duration_text,
                         screentime_text,
                         active_app,
                         strict_lock_active,
                         rule_statuses,
-                        tray_tooltip,
+                        &tray_tooltip,
                         any_snoozed,
                         tray_state,
-                    } => {
-                        {
-                            let mut ls = live_state_ref.borrow_mut();
-                            ls.session_duration_text = session_duration_text.clone();
-                            ls.screentime_text = screentime_text.clone();
-                            ls.active_app = active_app.clone();
-                            ls.strict_lock_active = strict_lock_active;
-                            ls.rule_statuses = rule_statuses.clone();
-                            ls.any_snoozed = any_snoozed;
-                        }
-
-                        if let Some(ref win) = *settings_slot_ref.borrow() {
-                            win.set_current_session_duration_text(session_duration_text.as_str().into());
-                            win.set_today_screentime_text(screentime_text.as_str().into());
-                            win.set_current_active_app(active_app.as_str().into());
-                            win.set_strict_lock_active(strict_lock_active);
-                            if !strict_lock_active {
-                                win.set_strict_unlocked(false);
-                                win.set_strict_unlock_countdown(0);
-                            }
-                        }
-
-                        tray_mgr_ref.borrow_mut().sync_live_status(
-                            strict_lock_active,
-                            any_snoozed,
-                            &tray_tooltip,
-                            tray_state,
-                        );
-
-                        if settings_slot_ref
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|w| w.window().is_visible())
-                        {
-                            update_rules_model_statuses(&rules_model_ref, &rule_statuses);
-                        }
-                    }
-                    OverlayAction::Hide => mgr.hide_all(),
+                    );
                 }
-            }));
-        });
-    }
+                OverlayAction::Hide => mgr.hide_all(),
+            }
+        }));
+    });
 
-    let overlay_forwarder_handle = rt_handle.clone();
+    let overlay_forwarder_handle = ctx.rt_handle.clone();
     overlay_forwarder_handle.spawn(async move {
         while let Some(action) = overlay_action_rx.recv().await {
             slint::invoke_from_event_loop(move || {
@@ -244,157 +267,217 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok();
         }
     });
+}
 
-    // 11. Main Thread UI Loop Timer (processes tray events, countdowns, and connection health)
-    let main_timer = slint::Timer::default();
-    let settings_ctx = SettingsContext {
-        settings_slot: settings_slot.clone(),
-        rules_model: rules_model.clone(),
-        current_config: current_config.clone(),
-        ui_aw_client: ui_aw_client.clone(),
-        live_state: live_ui_state.clone(),
-        aw_connected_flag: aw_connected_flag.clone(),
-        command_tx: command_tx.clone(),
-        rt_handle: rt_handle.clone(),
-        item_pause: tray_manager.borrow().item_pause(),
-        overlay_manager: overlay_manager.clone(),
-    };
+/// Updates the cached live UI state, applies telemetry text to the SettingsWindow if open,
+/// updates rule overview statuses, and synchronizes system tray menu items and icon.
+#[allow(clippy::too_many_arguments)]
+fn apply_live_status_update(
+    live_state_ref: &Rc<RefCell<LiveUiState>>,
+    settings_slot_ref: &Rc<RefCell<Option<SettingsWindow>>>,
+    rules_model_ref: &Rc<VecModel<RuleView>>,
+    tray_mgr_ref: &Rc<RefCell<TrayManager>>,
+    session_duration_text: String,
+    screentime_text: String,
+    active_app: String,
+    strict_lock_active: bool,
+    rule_statuses: Vec<(String, String)>,
+    tray_tooltip: &str,
+    any_snoozed: bool,
+    tray_state: TrayIconState,
+) {
     {
-        let ctx = settings_ctx.clone();
-        let overlay_mgr = overlay_manager.clone();
-        let settings_slot_ref = settings_slot.clone();
-        let live_state_ref = live_ui_state.clone();
-        let aw_connected_flag_ref = aw_connected_flag.clone();
-        let cmd_tx = command_tx.clone();
-        let cfg_cell = current_config.clone();
-        let ui_client_cell = ui_aw_client.clone();
-        let handle = rt_handle.clone();
-        let tray_mgr = tray_manager.clone();
-
-        let mut conn_check_counter = 0u32;
-        let mut unlock_counter = 0u32;
-
-        main_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(250),
-            move || {
-                let open_settings = |show: bool| open_settings_window(&ctx, show);
-
-                // Strict unlock countdown tick (~1s = 4 ticks at 250ms)
-                unlock_counter += 1;
-                if unlock_counter >= 4 {
-                    unlock_counter = 0;
-                    if let Some(ref win) = *settings_slot_ref.borrow() {
-                        let cd = win.get_strict_unlock_countdown();
-                        if cd > 0 {
-                            let next_cd = cd - 1;
-                            win.set_strict_unlock_countdown(next_cd);
-                            if next_cd == 0 {
-                                win.set_strict_unlocked(true);
-                            }
-                        }
-                    }
-                }
-
-                // Poll named activation event from a second instance
-                if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
-                    if let Err(e) = open_settings(true) {
-                        tracing::error!("Failed to open SettingsWindow on activation event: {e}");
-                    }
-                }
-
-                // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
-                overlay_mgr.borrow_mut().apply_pending_win32_styles();
-
-                // Process System Tray Events (Double-clicks and context menu actions)
-                tray_mgr.borrow().process_events(|action| match action {
-                    TrayAction::OpenSettings => {
-                        if let Err(e) = open_settings(true) {
-                            tracing::error!("Failed to open SettingsWindow on tray action: {e}");
-                        }
-                    }
-                    TrayAction::ShowStats => {
-                        cmd_tx.send(DaemonCommand::ShowStatsOverlay).ok();
-                    }
-                    TrayAction::DismissBreak => {
-                        cmd_tx.send(DaemonCommand::DismissBreakOverlay).ok();
-                    }
-                    TrayAction::ToggleSnoozeAll => {
-                        let is_locked = live_state_ref.borrow().strict_lock_active;
-                        if !is_locked {
-                            let was_snoozed = live_state_ref.borrow().any_snoozed;
-                            if was_snoozed {
-                                cmd_tx.send(DaemonCommand::ClearSnoozeAll).ok();
-                            } else {
-                                cmd_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
-                            }
-                        }
-                    }
-                    TrayAction::TogglePauseAll => {
-                        let is_locked = live_state_ref.borrow().strict_lock_active;
-                        if !is_locked {
-                            let new_paused = {
-                                let mut cfg = cfg_cell.borrow_mut();
-                                cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
-                                if let Err(e) = cfg.save() {
-                                    tracing::error!("Failed to save config on pause toggle: {e}");
-                                }
-                                cfg.general.pause_all_rules
-                            };
-                            tray_mgr.borrow().set_pause_label(new_paused);
-                            if let Some(ref win) = *settings_slot_ref.borrow() {
-                                win.set_pause_all_rules(new_paused);
-                            }
-                            cmd_tx
-                                .send(DaemonCommand::SetPauseAll { paused: new_paused })
-                                .ok();
-                        }
-                    }
-                    TrayAction::Quit => {
-                        slint::quit_event_loop().ok();
-                    }
-                });
-
-                // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
-                conn_check_counter += 1;
-                if conn_check_counter >= 12 {
-                    conn_check_counter = 0;
-                    if let Some(win) = settings_slot_ref.borrow().as_ref() {
-                        if win.window().is_visible() {
-                            spawn_aw_connection_check(
-                                win.as_weak(),
-                                aw_connected_flag_ref.clone(),
-                                ui_client_cell.borrow().clone(),
-                                &handle,
-                            );
-                        }
-                    }
-                }
-            },
-        );
+        let mut ls = live_state_ref.borrow_mut();
+        ls.session_duration_text = session_duration_text.clone();
+        ls.screentime_text = screentime_text.clone();
+        ls.active_app = active_app.clone();
+        ls.strict_lock_active = strict_lock_active;
+        ls.rule_statuses = rule_statuses.clone();
+        ls.any_snoozed = any_snoozed;
     }
 
-    let open_settings = |show: bool| open_settings_window(&settings_ctx, show);
+    if let Some(ref win) = *settings_slot_ref.borrow() {
+        win.set_current_session_duration_text(session_duration_text.as_str().into());
+        win.set_today_screentime_text(screentime_text.as_str().into());
+        win.set_current_active_app(active_app.as_str().into());
+        win.set_strict_lock_active(strict_lock_active);
+        if !strict_lock_active {
+            win.set_strict_unlocked(false);
+            win.set_strict_unlock_countdown(0);
+        }
+    }
 
-    // Show Settings Window unless launched with --minimized / --autostart
+    tray_mgr_ref.borrow_mut().sync_live_status(
+        strict_lock_active,
+        any_snoozed,
+        tray_tooltip,
+        tray_state,
+    );
+
+    if settings_slot_ref
+        .borrow()
+        .as_ref()
+        .is_some_and(|w| w.window().is_visible())
+    {
+        update_rules_model_statuses(rules_model_ref, &rule_statuses);
+    }
+}
+
+/// Configures and starts the repeated 250ms main UI timer responsible for polling activation events,
+/// ticking the strict unlock countdown, maintaining overlay Win32 styles, polling tray events,
+/// and checking ActivityWatch connectivity.
+fn start_main_ui_timer(
+    main_timer: &slint::Timer,
+    ctx: &SettingsContext,
+    tray_manager: Rc<RefCell<TrayManager>>,
+    activate_event_val: isize,
+) {
+    let ctx = ctx.clone();
+    let tray_mgr = tray_manager;
+    let mut conn_check_counter = 0u32;
+    let mut unlock_counter = 0u32;
+
+    main_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(250),
+        move || {
+            // Strict unlock countdown tick (~1s = 4 ticks at 250ms)
+            unlock_counter += 1;
+            if unlock_counter >= 4 {
+                unlock_counter = 0;
+                tick_strict_unlock_countdown(&ctx.settings_slot);
+            }
+
+            // Poll named activation event from a second instance
+            if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
+                if let Err(e) = open_settings_window(&ctx, true) {
+                    tracing::error!("Failed to open SettingsWindow on activation event: {e}");
+                }
+            }
+
+            // Continuously ensure any realized overlay HWNDs receive their native Win32 styles & placement
+            ctx.overlay_manager.borrow_mut().apply_pending_win32_styles();
+
+            // Process System Tray Events (Double-clicks and context menu actions)
+            tray_mgr.borrow().process_events(|action| {
+                handle_tray_action(action, &ctx, &tray_mgr);
+            });
+
+            // Periodically check ActivityWatch connection status (~every 3 seconds when settings window is open)
+            conn_check_counter += 1;
+            if conn_check_counter >= 12 {
+                conn_check_counter = 0;
+                if let Some(win) = ctx.settings_slot.borrow().as_ref() {
+                    if win.window().is_visible() {
+                        spawn_aw_connection_check(
+                            win.as_weak(),
+                            ctx.aw_connected_flag.clone(),
+                            ctx.ui_aw_client.borrow().clone(),
+                            &ctx.rt_handle,
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// Decrements the strict unlock countdown timer when the SettingsWindow is open.
+fn tick_strict_unlock_countdown(settings_slot: &Rc<RefCell<Option<SettingsWindow>>>) {
+    if let Some(ref win) = *settings_slot.borrow() {
+        let cd = win.get_strict_unlock_countdown();
+        if cd > 0 {
+            let next_cd = cd - 1;
+            win.set_strict_unlock_countdown(next_cd);
+            if next_cd == 0 {
+                win.set_strict_unlocked(true);
+            }
+        }
+    }
+}
+
+/// Dispatches high-level tray actions triggered by user interactions with the system tray icon or menu.
+fn handle_tray_action(
+    action: TrayAction,
+    ctx: &SettingsContext,
+    tray_mgr: &Rc<RefCell<TrayManager>>,
+) {
+    match action {
+        TrayAction::OpenSettings => {
+            if let Err(e) = open_settings_window(ctx, true) {
+                tracing::error!("Failed to open SettingsWindow on tray action: {e}");
+            }
+        }
+        TrayAction::ShowStats => {
+            ctx.command_tx.send(DaemonCommand::ShowStatsOverlay).ok();
+        }
+        TrayAction::DismissBreak => {
+            ctx.command_tx.send(DaemonCommand::DismissBreakOverlay).ok();
+        }
+        TrayAction::ToggleSnoozeAll => {
+            let is_locked = ctx.live_state.borrow().strict_lock_active;
+            if !is_locked {
+                let was_snoozed = ctx.live_state.borrow().any_snoozed;
+                if was_snoozed {
+                    ctx.command_tx.send(DaemonCommand::ClearSnoozeAll).ok();
+                } else {
+                    ctx.command_tx.send(DaemonCommand::SnoozeAll { minutes: 15 }).ok();
+                }
+            }
+        }
+        TrayAction::TogglePauseAll => {
+            let is_locked = ctx.live_state.borrow().strict_lock_active;
+            if !is_locked {
+                let new_paused = {
+                    let mut cfg = ctx.current_config.borrow_mut();
+                    cfg.general.pause_all_rules = !cfg.general.pause_all_rules;
+                    if let Err(e) = cfg.save() {
+                        tracing::error!("Failed to save config on pause toggle: {e}");
+                    }
+                    cfg.general.pause_all_rules
+                };
+                tray_mgr.borrow().set_pause_label(new_paused);
+                if let Some(ref win) = *ctx.settings_slot.borrow() {
+                    win.set_pause_all_rules(new_paused);
+                }
+                ctx.command_tx
+                    .send(DaemonCommand::SetPauseAll { paused: new_paused })
+                    .ok();
+            }
+        }
+        TrayAction::Quit => {
+            slint::quit_event_loop().ok();
+        }
+    }
+}
+
+/// Evaluates command-line startup options to either display the SettingsWindow, pre-instantiate it,
+/// or trigger a test break overlay.
+fn handle_startup_launch_options(
+    ctx: &SettingsContext,
+    args: &[String],
+    start_minimized: bool,
+) {
+    let open_settings = |show: bool| open_settings_window(ctx, show);
+
+    let destroy_on_hide = ctx.current_config.borrow().general.destroy_windows_on_hide;
     if !start_minimized {
         if let Err(e) = open_settings(true) {
             tracing::error!("Failed to open SettingsWindow on startup: {e}");
         }
-    } else if !config.general.destroy_windows_on_hide {
+    } else if !destroy_on_hide {
         if let Err(e) = open_settings(false) {
             tracing::error!("Failed to pre-instantiate SettingsWindow on startup: {e}");
         }
     }
 
     if args.iter().any(|a| a == "--test-break") {
-        command_tx.send(DaemonCommand::TriggerTestOverlay { mode: "break".to_string() }).ok();
+        ctx.command_tx
+            .send(DaemonCommand::TriggerTestOverlay {
+                mode: "break".to_string(),
+            })
+            .ok();
     }
-
-    // 11. Run Slint Win32 GUI Event Loop until explicit tray Quit
-    slint::run_event_loop_until_quit()?;
-
-    Ok(())
 }
 
 /// Ensures only a single instance of AW-Enforcer runs at any time.
