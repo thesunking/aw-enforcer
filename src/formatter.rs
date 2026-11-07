@@ -942,13 +942,15 @@ mod tests {
 
     #[test]
     fn test_format_plain_message() {
-        let mut ctx = MessageContext::default();
-        ctx.rule_name = "Workday Break".to_string();
-        ctx.app = "chrome.exe".to_string();
-        ctx.session_duration = "50m".to_string();
-        ctx.break_time = "10m".to_string();
-        ctx.remaining = "5m".to_string();
-        ctx.limit = "1h".to_string();
+        let ctx = MessageContext {
+            rule_name: "Workday Break".to_string(),
+            app: "chrome.exe".to_string(),
+            session_duration: "50m".to_string(),
+            break_time: "10m".to_string(),
+            remaining: "5m".to_string(),
+            limit: "1h".to_string(),
+            ..Default::default()
+        };
 
         let raw = "# Time to stretch!\r\n[color=#38bdf8 size=18 bold] Active for {session_duration} in {app}.\r\n## [Reminder] Please step away for {break_time}.";
         let plain = format_plain_message(raw, &ctx);
@@ -1014,10 +1016,12 @@ mod tests {
 
     #[test]
     fn test_single_pass_interpolation_no_recursive_expansion_and_alias() {
-        let mut ctx = MessageContext::default();
-        ctx.app = "Important Document {limit} - Notes".to_string();
-        ctx.limit = "2h".to_string();
-        ctx.rule_name = "Break Rule".to_string();
+        let ctx = MessageContext {
+            app: "Important Document {limit} - Notes".to_string(),
+            limit: "2h".to_string(),
+            rule_name: "Break Rule".to_string(),
+            ..Default::default()
+        };
 
         // 1. {app} contains literal "{limit}" which must NOT be recursively expanded
         let result = ctx.interpolate("{app} - {limit}");

@@ -172,7 +172,6 @@ pub fn send_system_notification(title: &str, message: &str) {
         TEST_NOTIFICATIONS_SENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut last = LAST_TEST_NOTIFICATION.lock().unwrap();
         *last = Some((title.to_string(), message.to_string()));
-        return;
     }
     #[cfg(not(test))]
     {
@@ -271,7 +270,7 @@ pub fn is_foreground_browser() -> bool {
             return false;
         }
         get_window_process_name(hwnd)
-            .map_or(false, |exe| exe_name_matches_targets(&exe, BROWSER_EXES))
+            .is_some_and(|exe| exe_name_matches_targets(&exe, BROWSER_EXES))
     }
 }
 

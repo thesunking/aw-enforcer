@@ -193,9 +193,7 @@ pub fn find_matching_window_for_rule(
                     let win_match = win_match
                         .or_else(|| enforcer::find_matching_window(enforcer::BROWSER_EXES, None));
 
-                    if win_match.is_none() {
-                        return None;
-                    }
+                    win_match.as_ref()?;
                 }
             }
 
@@ -319,6 +317,7 @@ pub fn calculate_usage_for_rule(
 
 /// Calculates continuous session duration for a rule, choosing between zero-allocation pre-merged
 /// clipping for wildcard executable rules and rule-filtered traversal for specific rules.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_rule_session_duration(
     rule: &Rule,
     compiled_re: Option<&Regex>,
@@ -681,7 +680,7 @@ mod tests {
         let dur_wildcard = calculate_rule_session_duration(
             &wildcard_rule,
             None,
-            &[ev1.clone()],
+            std::slice::from_ref(&ev1),
             &intervals,
             now,
             now_utc,

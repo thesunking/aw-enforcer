@@ -228,7 +228,7 @@ impl AwClient {
     /// Checks whether web buckets need a refresh (unverified or >=60 seconds since last check).
     fn should_refresh_web_buckets(&self) -> bool {
         let last_check = *self.last_web_bucket_check.lock().unwrap_or_else(|e| e.into_inner());
-        last_check.map_or(true, |t| t.elapsed() >= Duration::from_secs(60))
+        last_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
     }
 
     /// Resolves an ActivityWatch API endpoint URL given an API path.
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_bucket_selection_excludes_synced() {
-        let keys = vec![
+        let keys = [
             "aw-watcher-window_DESKTOP_synced".to_string(),
             "aw-watcher-window_LOCAL".to_string(),
             "aw-watcher-afk_DESKTOP-synced".to_string(),
@@ -479,7 +479,7 @@ mod tests {
         assert_eq!(web_buckets, vec!["aw-watcher-web-brave", "aw-watcher-web-edge"]);
 
         // When only synced web buckets exist, web_buckets should be empty (no fallback)
-        let keys_only_synced_web = vec![
+        let keys_only_synced_web = [
             "aw-watcher-web-chrome_synced".to_string(),
             "aw-watcher-web-firefox-synced".to_string(),
         ];

@@ -122,13 +122,13 @@ impl StatsHudCache {
             current_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
         let mut bin_seconds = vec![0.0f32; bin_count];
 
-        for i in 0..bin_count {
+        for (i, bin_sec) in bin_seconds.iter_mut().enumerate().take(bin_count) {
             let b_start = start_time + Duration::minutes((i as i64) * bin_size_mins);
             let b_end = b_start + Duration::minutes(bin_size_mins);
             let b_start_utc = b_start.with_timezone(&Utc);
             let b_end_utc = b_end.with_timezone(&Utc);
 
-            bin_seconds[i] =
+            *bin_sec =
                 compute_overlap_from_merged_intervals(merged_intervals, b_start_utc, b_end_utc)
                     as f32;
         }

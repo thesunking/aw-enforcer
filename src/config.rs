@@ -551,7 +551,7 @@ impl DurationConfig {
     }
 
     /// Converts the duration into total seconds using saturating multiplication.
-    pub fn to_seconds(&self) -> u32 {
+    pub fn to_seconds(self) -> u32 {
         match self.unit {
             TimeUnit::Hr => self.value.saturating_mul(3600),
             TimeUnit::Min => self.value.saturating_mul(60),
@@ -560,7 +560,7 @@ impl DurationConfig {
     }
 
     /// Formats the duration as a compact string such as `"2h"`, `"45m"`, or `"30s"`.
-    pub fn to_short_string(&self) -> String {
+    pub fn to_short_string(self) -> String {
         match self.unit {
             TimeUnit::Hr => format!("{}h", self.value),
             TimeUnit::Min => format!("{}m", self.value),
@@ -652,7 +652,7 @@ impl RuleSchedule {
         let Some(day_str) = self.days().get(day).copied() else {
             return false;
         };
-        day_str.chars().nth(hour).map_or(false, |c| c == '1')
+        day_str.chars().nth(hour) == Some('1')
     }
 
     /// Flattens the 7x24 schedule into a 168-element boolean array for the Slint UI matrix.

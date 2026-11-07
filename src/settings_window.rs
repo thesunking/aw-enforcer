@@ -1281,7 +1281,7 @@ pub fn refresh_message_editor_state(
     } else {
         MessageContext::sample()
     };
-    let alignment = if rule.map_or(false, |r| r.action.as_str() == "Show Notification") {
+    let alignment = if rule.is_some_and(|r| r.action.as_str() == "Show Notification") {
         TextHorizontalAlignment::Left
     } else {
         TextHorizontalAlignment::Center

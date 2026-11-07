@@ -36,7 +36,7 @@ impl TrayManager {
         let item_dismiss = MenuItem::with_id("dismiss_break", "Dismiss Break Overlay", true, None);
         let item_snooze = MenuItem::with_id("snooze_15m", "Snooze All (15m)", true, None);
         let initial_pause_label = if pause_all_rules {
-            "Resume All Rules"
+            "Unpause All Rules"
         } else {
             "Pause All Rules"
         };
@@ -112,10 +112,10 @@ impl TrayManager {
         }
     }
 
-    /// Updates the label of the "Pause All Rules" / "Resume All Rules" menu item.
+    /// Updates the label of the "Pause All Rules" / "Unpause All Rules" menu item.
     pub fn set_pause_label(&self, paused: bool) {
         self.item_pause.set_text(if paused {
-            "Resume All Rules"
+            "Unpause All Rules"
         } else {
             "Pause All Rules"
         });

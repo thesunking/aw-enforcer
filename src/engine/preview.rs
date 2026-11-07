@@ -109,7 +109,7 @@ impl Engine {
         let default_msg = format!(
             "[color=#f59e0b bold] {} in {}.",
             rule.action.as_str(),
-            &ctx.remaining
+            ctx.remaining
         );
         let raw_msg = if !rule.message.trim().is_empty() {
             &rule.message

@@ -472,7 +472,7 @@ mod tests {
             "https://www.youtube.com",
         );
 
-        let filtered = filter_web_events_by_active_browser_windows(&[web_ev.clone()], &[]);
+        let filtered = filter_web_events_by_active_browser_windows(std::slice::from_ref(&web_ev), &[]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].timestamp, web_ev.timestamp);
         assert_eq!(filtered[0].duration, web_ev.duration);

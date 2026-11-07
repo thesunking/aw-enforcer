@@ -584,6 +584,7 @@ impl OverlayManager {
     }
 
     /// Positions and shows overlay window `idx`, then applies its Win32 extended styles and DWM composition attributes.
+    #[allow(clippy::too_many_arguments)]
     fn apply_win32_overlay_styles(
         &mut self,
         idx: usize,

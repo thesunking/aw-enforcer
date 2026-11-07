@@ -996,6 +996,7 @@ impl Engine {
     // ========================================================================
 
     /// Evaluates a single enabled, in-schedule rule against recent ActivityWatch events and triggers warnings or actions.
+    #[allow(clippy::too_many_arguments)]
     pub async fn evaluate_rule(
         &mut self,
         rule: &Rule,
@@ -2049,8 +2050,10 @@ mod tests {
     async fn test_snooze_and_skip_break_state() {
         let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
         let aw_client = Arc::new(AwClient::new(5600, ""));
-        let mut cfg = AppConfig::default();
-        cfg.rules = vec![Rule::default_template(0)];
+        let cfg = AppConfig {
+            rules: vec![Rule::default_template(0)],
+            ..Default::default()
+        };
         let rule_id = cfg.rules[0].id.clone();
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
@@ -2099,8 +2102,10 @@ mod tests {
     async fn test_dismiss_break_overlay_completes_cycle_when_pending_break_active() {
         let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
         let aw_client = Arc::new(AwClient::new(5600, ""));
-        let mut cfg = AppConfig::default();
-        cfg.rules = vec![Rule::default_template(0)];
+        let cfg = AppConfig {
+            rules: vec![Rule::default_template(0)],
+            ..Default::default()
+        };
         let rule_id = cfg.rules[0].id.clone();
         let mut engine = Engine::new(cfg, aw_client, overlay_tx);
 
@@ -2230,7 +2235,7 @@ mod tests {
 
         // First evaluation triggers Stage 1 warning
         engine
-            .evaluate_rule(&rule, None, now, &[ev.clone()], start_of_day_utc, now_utc, &[])
+            .evaluate_rule(&rule, None, now, std::slice::from_ref(&ev), start_of_day_utc, now_utc, &[])
             .await;
 
         let rt = engine.runtimes.get("rule-snooze-warn").unwrap();
@@ -3318,7 +3323,7 @@ mod tests {
                 &rule,
                 re.as_ref(),
                 now,
-                &[ev_empty_title.clone()],
+                std::slice::from_ref(&ev_empty_title),
                 start_of_day_utc,
                 now_utc,
                 &[],
@@ -4645,7 +4650,7 @@ mod tests {
                 &rule_zero_grace,
                 None,
                 now,
-                &[ev.clone()],
+                std::slice::from_ref(&ev),
                 start_of_day_utc,
                 now_utc,
                 &[],
@@ -4666,7 +4671,7 @@ mod tests {
                 &rule_long_grace,
                 None,
                 now,
-                &[ev.clone()],
+                std::slice::from_ref(&ev),
                 start_of_day_utc,
                 now_utc,
                 &[],
@@ -4816,7 +4821,7 @@ mod tests {
 
         // Trigger break
         engine
-            .evaluate_rule(&rule, None, now, &[ev.clone()], start_of_day_utc, now_utc, &[])
+            .evaluate_rule(&rule, None, now, std::slice::from_ref(&ev), start_of_day_utc, now_utc, &[])
             .await;
 
         // If system was active (< 1500ms idle), evaluate_rule placed rule in pending_break_since.
@@ -5399,7 +5404,7 @@ mod tests {
 
         let rt = engine.runtimes.get("rule-period-global-snooze").unwrap();
         assert_eq!(rt.current_session_seconds, 0, "AFK during global snooze should reset current_session_seconds to 0");
-        assert_eq!(rt.warned_current_cycle, false, "AFK during global snooze should reset warned_current_cycle");
+        assert!(!rt.warned_current_cycle, "AFK during global snooze should reset warned_current_cycle");
     }
 
     // ========================================================================
