@@ -1,5 +1,6 @@
 import { Button, ComboBox, ScrollView } from "std-widgets.slint";
 import { FormattedText, FormattedParagraph } from "formatted_text.slint";
+import { ActivityHistogram } from "activity_histogram.slint";
 
 component WindowDragArea inherits TouchArea {
     in property <bool> click-through: false;
@@ -349,10 +350,6 @@ export component OverlayWindow inherits Window {
     // 4. HUD STATUS / 24-HOUR HISTOGRAM CARD
     // ==========================================
     if root.mode == "hud_status" : Rectangle {
-        property <color> status-color: root.is-loading ? #38bdf8 :
-            (root.status-level == "Great" ? #10b981 :
-            (root.status-level == "Okay" ? #f59e0b : #ef4444));
-
         width: 100%;
         height: 100%;
         background: root.backdrop-color.with-alpha(root.overlay-opacity);
@@ -370,154 +367,19 @@ export component OverlayWindow inherits Window {
             padding-right: 24px;
             padding-top: 16px;
             padding-bottom: 16px;
-            spacing: 12px;
-            alignment: space-between;
 
-            // Header & Evaluation Badge
-            HorizontalLayout {
-                alignment: space-between;
-                spacing: 12px;
-                height: 28px;
-
-                Text {
-                    text: "📊 " + (root.title-text != "" ? root.title-text : "24-Hour Screen Time Activity");
-                    font-size: 15px;
-                    font-weight: 700;
-                    color: root.text-color;
-                    vertical-alignment: center;
-                }
-
-                // Status Badge
-                VerticalLayout {
-                    alignment: center;
-
-                    Rectangle {
-                        height: 24px;
-                        border-radius: 4px;
-                        background: status-color.with-alpha(0.2);
-                        border-width: 1px;
-                        border-color: status-color;
-
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            alignment: center;
-
-                            Text {
-                                text: root.is-loading ? "Loading..." : root.status-level;
-                                font-size: 12px;
-                                font-weight: 700;
-                                color: status-color;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Histogram Bars + Formatted Time Labels Container
-            Rectangle {
-                height: 150px;
-                background: #0f172a;
-                border-radius: 6px;
-
-                if root.is-loading : VerticalLayout {
-                    alignment: center;
-                    spacing: 8px;
-                    Text {
-                        text: "⏳ Loading 24-Hour Timeline...";
-                        font-size: 14px;
-                        font-weight: 600;
-                        color: #38bdf8;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Querying ActivityWatch REST API...";
-                        font-size: 11px;
-                        color: #94a3b8;
-                        horizontal-alignment: center;
-                    }
-                }
-
-                if !root.is-loading : VerticalLayout {
-                    padding-left: 14px;
-                    padding-right: 18px;
-                    padding-top: 10px;
-                    padding-bottom: 8px;
-                    spacing: 4px;
-
-                    // Bars Row
-                    HorizontalLayout {
-                        height: 114px;
-                        spacing: 3px;
-                        alignment: space-between;
-
-                        for val[idx] in root.histogram-values : Rectangle {
-                            horizontal-stretch: 1;
-                            min-width: 2px;
-                            height: 114px;
-
-                            Rectangle {
-                                width: 100%;
-                                height: Math.max(114px * Math.min(Math.max(val, 0.0), 1.0), 2px);
-                                y: parent.height - self.height;
-                                background: val > 0.8 ? #ef4444 : (val > 0.5 ? #f59e0b : root.accent-color);
-                                border-radius: 2px;
-                            }
-                        }
-                    }
-
-                    // Time Labels Row (formatted via config.stats.histogram_time_format)
-                    HorizontalLayout {
-                        height: 14px;
-                        spacing: 3px;
-                        alignment: space-between;
-
-                        for lbl[idx] in root.histogram-labels : Rectangle {
-                            horizontal-stretch: 1;
-                            min-width: 2px;
-
-                            Rectangle {
-                                width: 36px;
-                                x: (parent.width - self.width) / 2;
-
-                                Text {
-                                    text: lbl;
-                                    color: #94a3b8;
-                                    font-size: 8px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Bottom Summary & Close Button
-            HorizontalLayout {
-                alignment: space-between;
-                spacing: 12px;
-                height: 32px;
-
-                Text {
-                    text: root.is-loading ? "Fetching activity from ActivityWatch server..." : ("Active: " + Math.floor(root.total-active-minutes / 60) + "h " + Math.mod(root.total-active-minutes, 60) + "m  /  Target: " + Math.floor(root.target-minutes / 60) + "h " + Math.mod(root.target-minutes, 60) + "m");
-                    color: #94a3b8;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                }
-
-                if !root.click-through : VerticalLayout {
-                    alignment: center;
-
-                    Button {
-                        height: 28px;
-                        text: "Close";
-                        clicked => {
-                            root.close-status-clicked();
-                        }
-                    }
-                }
+            ActivityHistogram {
+                title: root.title-text;
+                status-level: root.status-level;
+                total-active-minutes: root.total-active-minutes;
+                target-minutes: root.target-minutes;
+                histogram-values: root.histogram-values;
+                histogram-labels: root.histogram-labels;
+                is-loading: root.is-loading;
+                accent-color: root.accent-color;
+                text-color: root.text-color;
+                show-close-button: !root.click-through;
+                close-clicked => { root.close-status-clicked(); }
             }
         }
     }

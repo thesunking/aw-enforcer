@@ -76,6 +76,12 @@ pub enum OverlayAction {
         tray_tooltip: String,
         any_snoozed: bool,
         tray_state: TrayIconState,
+        status_level: String,
+        total_active_minutes: u32,
+        target_minutes: u32,
+        histogram_values: Vec<f32>,
+        histogram_labels: Vec<String>,
+        is_loading: bool,
     },
     Hide,
 }
@@ -156,24 +162,26 @@ impl Engine {
         let now_utc = now.with_timezone(&Utc);
 
         let mut min_start_utc = start_of_day_utc;
+        let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
+        let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
+        let new_bin_start = align_stats_bin_start(now, bin_size_mins);
+
         if let Some(ref cache) = self.stats_cache {
-            if matches!(self.active_overlay_mode, OverlayMode::HudStatus { is_loading: false, .. }) {
-                let bin_count = self.config.stats.histogram_bin_count.max(1) as usize;
-                let bin_size_mins = self.config.stats.histogram_bin_size_minutes.max(1) as i64;
-                let config_changed = cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins;
-                let new_bin_start = align_stats_bin_start(now, bin_size_mins);
-                let elapsed_bins = if !config_changed && new_bin_start > cache.current_bin_start {
-                    ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0) as usize
-                } else {
-                    0
-                };
-                if config_changed || elapsed_bins > 1 {
-                    let start_time = new_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
-                    min_start_utc = min_start_utc.min(start_time.with_timezone(&Utc));
-                } else {
-                    min_start_utc = min_start_utc.min(cache.current_bin_start.with_timezone(&Utc));
-                }
+            let config_changed = cache.bin_seconds.len() != bin_count || cache.bin_size_mins != bin_size_mins;
+            let elapsed_bins = if !config_changed && new_bin_start > cache.current_bin_start {
+                ((new_bin_start - cache.current_bin_start).num_minutes() / bin_size_mins).max(0) as usize
+            } else {
+                0
+            };
+            if config_changed || elapsed_bins > 1 {
+                let start_time = new_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+                min_start_utc = min_start_utc.min(start_time.with_timezone(&Utc));
+            } else {
+                min_start_utc = min_start_utc.min(cache.current_bin_start.with_timezone(&Utc));
             }
+        } else {
+            let start_time = new_bin_start - Duration::minutes(((bin_count - 1) as i64) * bin_size_mins);
+            min_start_utc = min_start_utc.min(start_time.with_timezone(&Utc));
         }
 
         let mut has_url_rules = false;
@@ -422,6 +430,48 @@ impl Engine {
                         .is_some()
             });
 
+        // 6. Live-refresh or initialize the 24-Hour Statistics HUD cache
+        if let Some(ref mut cache) = self.stats_cache {
+            cache.refresh_from_events(now, &self.config.stats, &merged_all_intervals);
+        } else {
+            self.stats_cache = Some(StatsHudCache::from_intervals(
+                now,
+                &self.config.stats,
+                &merged_all_intervals,
+                false,
+            ));
+        }
+
+        let (status_level, total_active_minutes, target_minutes, histogram_values, histogram_labels, is_loading) =
+            if let Some(OverlayMode::HudStatus {
+                status_level,
+                total_active_minutes,
+                target_minutes,
+                bin_values,
+                bin_labels,
+                is_loading,
+                ..
+            }) = self.build_hud_status_from_cache()
+            {
+                (
+                    status_level,
+                    total_active_minutes,
+                    target_minutes,
+                    bin_values,
+                    bin_labels,
+                    is_loading,
+                )
+            } else {
+                (
+                    "Loading...".to_string(),
+                    0,
+                    self.config.stats.daily_screentime_target_minutes,
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                )
+            };
+
         let tray_state = self.current_tray_state(now);
 
         self.overlay_tx
@@ -434,10 +484,16 @@ impl Engine {
                 tray_tooltip,
                 any_snoozed,
                 tray_state,
+                status_level,
+                total_active_minutes,
+                target_minutes,
+                histogram_values,
+                histogram_labels,
+                is_loading,
             })
             .ok();
 
-        // 6. Live-refresh the 24-Hour Statistics HUD if currently open (reusing all_events without extra AW queries)
+        // 7. Live-refresh the 24-Hour Statistics HUD if currently open (reusing all_events without extra AW queries)
         self.refresh_stats_overlay_from_events(now, &merged_all_intervals);
     }
 
@@ -5542,5 +5598,46 @@ mod tests {
         }
 
         assert_eq!(paused_tray_state, Some(TrayIconState::Paused));
+    }
+
+    #[tokio::test]
+    async fn test_update_live_status_emits_histogram_telemetry() {
+        let (overlay_tx, mut overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(56999, ""));
+        let mut cfg = AppConfig::default();
+        cfg.stats.histogram_bin_count = 24;
+        cfg.stats.daily_screentime_target_minutes = 480;
+
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+        engine.poll_tick().await;
+
+        let mut received_status = None;
+        while let Ok(action) = overlay_rx.try_recv() {
+            if let OverlayAction::UpdateLiveStatus {
+                status_level,
+                target_minutes,
+                histogram_values,
+                histogram_labels,
+                is_loading,
+                ..
+            } = action
+            {
+                received_status = Some((
+                    status_level,
+                    target_minutes,
+                    histogram_values,
+                    histogram_labels,
+                    is_loading,
+                ));
+            }
+        }
+
+        let (status_level, target_minutes, values, labels, is_loading) =
+            received_status.expect("UpdateLiveStatus must be emitted");
+        assert_eq!(target_minutes, 480);
+        assert!(!is_loading);
+        assert!(matches!(status_level.as_str(), "Great" | "Okay" | "Excessive"));
+        assert_eq!(values.len(), 24);
+        assert_eq!(labels.len(), 24);
     }
 }

@@ -43,6 +43,12 @@ pub struct LiveUiState {
     pub strict_lock_active: bool,
     pub rule_statuses: Vec<(String, String)>,
     pub any_snoozed: bool,
+    pub status_level: String,
+    pub total_active_minutes: u32,
+    pub target_minutes: u32,
+    pub histogram_values: Vec<f32>,
+    pub histogram_labels: Vec<String>,
+    pub is_loading: bool,
 }
 
 impl Default for LiveUiState {
@@ -54,6 +60,12 @@ impl Default for LiveUiState {
             strict_lock_active: false,
             rule_statuses: Vec::new(),
             any_snoozed: false,
+            status_level: "Loading...".to_string(),
+            total_active_minutes: 0,
+            target_minutes: 480,
+            histogram_values: Vec::new(),
+            histogram_labels: Vec::new(),
+            is_loading: true,
         }
     }
 }
@@ -995,6 +1007,19 @@ pub fn sync_live_state_to_ui(
     win.set_today_screentime_text(ls.screentime_text.as_str().into());
     win.set_current_active_app(ls.active_app.as_str().into());
     win.set_strict_lock_active(ls.strict_lock_active);
+    win.set_status_level(ls.status_level.as_str().into());
+    win.set_total_active_minutes(ls.total_active_minutes as i32);
+    win.set_target_minutes(ls.target_minutes as i32);
+    win.set_is_loading(ls.is_loading);
+    win.set_histogram_values(ModelRc::from(Rc::new(VecModel::from(
+        ls.histogram_values.clone(),
+    ))));
+    let labels: Vec<slint::SharedString> = ls
+        .histogram_labels
+        .iter()
+        .map(|s| s.as_str().into())
+        .collect();
+    win.set_histogram_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
     update_rules_model_statuses(rules_model, &ls.rule_statuses);
 }
 
@@ -1752,5 +1777,16 @@ mod tests {
         view.warn_before_val = 1;
         view.warn_before_unit = "Min".into();
         assert!(check_warn_before_exceeds_threshold(&view));
+    }
+
+    #[test]
+    fn test_live_ui_state_defaults() {
+        let ls = LiveUiState::default();
+        assert_eq!(ls.status_level, "Loading...");
+        assert_eq!(ls.total_active_minutes, 0);
+        assert_eq!(ls.target_minutes, 480);
+        assert!(ls.histogram_values.is_empty());
+        assert!(ls.histogram_labels.is_empty());
+        assert!(ls.is_loading);
     }
 }

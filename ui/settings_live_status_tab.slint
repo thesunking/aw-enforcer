@@ -1,4 +1,5 @@
 import { SectionCard, FormRow } from "settings_widgets.slint";
+import { ActivityHistogram } from "activity_histogram.slint";
 
 export component LiveStatusTab inherits VerticalLayout {
     in property <bool> aw-connected: false;
@@ -6,6 +7,16 @@ export component LiveStatusTab inherits VerticalLayout {
     in property <string> current-session-duration-text: "--";
     in property <string> today-screentime-text: "--";
     in property <string> current-active-app: "--";
+
+    // 24-Hour Histogram properties
+    in property <string> status-level: "Loading...";
+    in property <int> total-active-minutes: 0;
+    in property <int> target-minutes: 480;
+    in property <[float]> histogram-values;
+    in property <[string]> histogram-labels;
+    in property <bool> is-loading: false;
+    in property <color> accent-color: #38bdf8;
+    in property <color> text-color: #f8fafc;
 
     spacing: 18px;
 
@@ -48,5 +59,22 @@ export component LiveStatusTab inherits VerticalLayout {
             Text { text: root.current-active-app; color: #a78bfa; font-weight: 600; }
         }
     }
-}
 
+    SectionCard {
+        card-padding: 20px;
+        card-spacing: 14px;
+
+        ActivityHistogram {
+            title: "24-Hour Screen Time Activity";
+            status-level: root.status-level;
+            total-active-minutes: root.total-active-minutes;
+            target-minutes: root.target-minutes;
+            histogram-values: root.histogram-values;
+            histogram-labels: root.histogram-labels;
+            is-loading: root.is-loading;
+            accent-color: root.accent-color;
+            text-color: root.text-color;
+            show-close-button: false;
+        }
+    }
+}

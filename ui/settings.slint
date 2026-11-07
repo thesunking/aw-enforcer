@@ -116,6 +116,12 @@ export component SettingsWindow inherits Window {
     in property <string> current-session-duration-text: "0m";
     in property <string> today-screentime-text: "0h 0m";
     in property <string> current-active-app: "None";
+    in property <string> status-level: "Loading...";
+    in property <int> total-active-minutes: 0;
+    in property <int> target-minutes: 480;
+    in property <[float]> histogram-values;
+    in property <[string]> histogram-labels;
+    in property <bool> is-loading: false;
 
     // Callbacks to Rust daemon
     callback save-config();
@@ -590,6 +596,14 @@ export component SettingsWindow inherits Window {
                     current-session-duration-text: root.current-session-duration-text;
                     today-screentime-text: root.today-screentime-text;
                     current-active-app: root.current-active-app;
+                    status-level: root.status-level;
+                    total-active-minutes: root.total-active-minutes;
+                    target-minutes: root.target-minutes;
+                    histogram-values: root.histogram-values;
+                    histogram-labels: root.histogram-labels;
+                    is-loading: root.is-loading;
+                    accent-color: root.accent-color-preview;
+                    text-color: root.text-color-preview;
                 }
             }
         }

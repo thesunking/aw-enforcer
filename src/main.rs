@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slint::{ComponentHandle, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
@@ -233,6 +233,12 @@ fn setup_overlay_action_dispatch(
                     tray_tooltip,
                     any_snoozed,
                     tray_state,
+                    status_level,
+                    total_active_minutes,
+                    target_minutes,
+                    histogram_values,
+                    histogram_labels,
+                    is_loading,
                 } => {
                     apply_live_status_update(
                         &live_state_ref,
@@ -247,6 +253,12 @@ fn setup_overlay_action_dispatch(
                         &tray_tooltip,
                         any_snoozed,
                         tray_state,
+                        status_level,
+                        total_active_minutes,
+                        target_minutes,
+                        histogram_values,
+                        histogram_labels,
+                        is_loading,
                     );
                 }
                 OverlayAction::Hide => mgr.hide_all(),
@@ -285,6 +297,12 @@ fn apply_live_status_update(
     tray_tooltip: &str,
     any_snoozed: bool,
     tray_state: TrayIconState,
+    status_level: String,
+    total_active_minutes: u32,
+    target_minutes: u32,
+    histogram_values: Vec<f32>,
+    histogram_labels: Vec<String>,
+    is_loading: bool,
 ) {
     {
         let mut ls = live_state_ref.borrow_mut();
@@ -294,6 +312,12 @@ fn apply_live_status_update(
         ls.strict_lock_active = strict_lock_active;
         ls.rule_statuses = rule_statuses.clone();
         ls.any_snoozed = any_snoozed;
+        ls.status_level = status_level.clone();
+        ls.total_active_minutes = total_active_minutes;
+        ls.target_minutes = target_minutes;
+        ls.histogram_values = histogram_values.clone();
+        ls.histogram_labels = histogram_labels.clone();
+        ls.is_loading = is_loading;
     }
 
     if let Some(ref win) = *settings_slot_ref.borrow() {
@@ -301,6 +325,16 @@ fn apply_live_status_update(
         win.set_today_screentime_text(screentime_text.as_str().into());
         win.set_current_active_app(active_app.as_str().into());
         win.set_strict_lock_active(strict_lock_active);
+        win.set_status_level(status_level.as_str().into());
+        win.set_total_active_minutes(total_active_minutes as i32);
+        win.set_target_minutes(target_minutes as i32);
+        win.set_is_loading(is_loading);
+        win.set_histogram_values(ModelRc::from(Rc::new(VecModel::from(histogram_values))));
+        let labels: Vec<slint::SharedString> = histogram_labels
+            .iter()
+            .map(|s| s.as_str().into())
+            .collect();
+        win.set_histogram_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
         if !strict_lock_active {
             win.set_strict_unlocked(false);
             win.set_strict_unlock_countdown(0);
