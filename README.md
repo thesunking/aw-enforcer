@@ -30,6 +30,12 @@
   3. **Stage 3 — Action Execution:** Executes the configured rule action when the countdown completes.
   - **Universal Strict Mode:** Supported across all rule actions to hide Skip/Snooze controls and lock settings/tray bypasses during grace countdowns and break enforcement (while warning/notification toasts can still be acknowledged and dismissed).
 
+- **Tri-State System Tray Visual Indicator:**
+  - **Sky Blue (`#38bdf8`):** Normal active monitoring with rules active and within schedule.
+  - **Slate Gray (`#94a3b8`):** All rules paused (`Pause All Rules`), indicating dormant monitoring.
+  - **Alert Red (`#ef4444`):** At least one active rule is currently in a warning period, grace countdown, or active break enforcement.
+  - Icon changes are transition-only, eliminating redundant Win32 GDI icon allocation and redraw overhead during live telemetry ticks.
+
 - **Customizable Appearance & 24-Hour Statistics HUD:**
   - Full control over overlay opacity, accent color, background color, and text color in **General Settings**.
   - Draggable non-fullscreen HUD overlay cards (`HudToast`, `HudTimer`, `HudStatus`).

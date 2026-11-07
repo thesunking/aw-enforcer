@@ -93,7 +93,7 @@ flowchart TD
 ```
 
 - **Win32 Enforcer Subsystem (`src/enforcer.rs`):** Centralizes all platform-specific Win32 FFI calls (`windows_sys`), including window enumeration (`EnumWindows`), process inspection and termination, simulated keyboard input (`SendInput`), workstation locking, fullscreen/presentation state querying (`SHQueryUserNotificationState`), physical user idle tracking (`GetLastInputInfo`, `GetTickCount`), and WinRT toast notifications.
-- **Rule Engine & State Machine (`src/engine.rs`):** Implemented in 100% safe Rust with zero direct Win32 FFI dependencies, evaluating telemetry against user-configured rules and delegating OS interactions to `src/enforcer.rs`.
+- **Rule Engine & State Machine (`src/engine.rs`):** Implemented in 100% safe Rust with zero direct Win32 FFI dependencies, evaluating telemetry against user-configured rules, maintaining system tray icon status (`TrayIconState::Normal`, `TrayIconState::Paused`, `TrayIconState::Alert`) via `current_tray_state`, and delegating OS interactions to `src/enforcer.rs`.
 - **Interval & Time Arithmetic Subsystem (`src/engine/intervals.rs`):** Isolates stateless interval operations, including non-overlapping interval coalescing (`merge_overlapping_intervals`), binary-searched overlap duration calculation (`compute_overlap_from_merged_intervals`), browser window web event intersection (`filter_web_events_by_active_browser_windows`), zero-allocation backward continuous session traversal (`calculate_continuous_session_from_merged`, `calculate_continuous_session_from_merged_clipped`), and logical day anchoring (`logical_day_start`).
 - **Target Matching Subsystem (`src/engine/matcher.rs`):** Isolates event and active window target resolution, URL host extraction (`extract_url_host`), executable and URL matching predicates (`matched_url_or_app_matches_rule`, `is_wildcard_executables_rule`, `event_matches_rule`), recency cutoff and active window lookup (`calculate_recency_cutoff`, `find_latest_matching_event`, `find_matching_window_for_rule`), and rule-filtered duration calculators (`calculate_continuous_session_for_rule`, `calculate_usage_for_rule`).
 - **Per-Rule State Machine (`src/engine/runtime.rs`):** Implements `RuleRuntime` modeling ephemeral per-rule state across polling cycles and ticks, including cycle completion (`complete_cycle`), active session resets (`reset_session`), daily quota rollovers (`reset_for_new_day`), state-preserving snooze logic (`snooze`), regex cache invalidation avoidance (`set_last_matched_title`), and dynamic configuration reloads (`update_from_rule`).
@@ -104,7 +104,7 @@ flowchart TD
 1. **Slint Event Loop (Main Thread):** Owns window handles, OpenGL/FemtoVG render contexts, and the Win32 message pump for the system tray. It periodically polls for activation events via a 250ms timer.
 2. **Tokio Async Engine Runtime (Background):** A 2-worker multithreaded Tokio runtime driving periodic polling ticks (`poll_interval_seconds`) and a 1-second high-resolution `realtime_tick()` timer.
 3. **MPSC Command Channel:** User interactions in the GUI or tray dispatch `DaemonCommand` messages to the engine through a non-blocking Tokio MPSC channel (`tokio::sync::mpsc::Sender<DaemonCommand>`).
-4. **UI Dispatch Pipeline:** The engine communicates state changes back to the UI via `slint::invoke_from_event_loop` using typed `OverlayAction` variants, preventing UI freezes during network I/O or Win32 process scans.
+4. **UI Dispatch Pipeline:** The engine communicates state changes back to the UI via `slint::invoke_from_event_loop` using typed `OverlayAction` variants (including `OverlayAction::UpdateLiveStatus` carrying session telemetry, rule statuses, tray tooltip text, snooze flags, and `tray_state: TrayIconState`), preventing UI freezes during network I/O or Win32 process scans.
 
 ---
 
@@ -418,6 +418,34 @@ graph LR
 - **Snooze Status Badges & Sub-Minute Formatting (`src/formatter.rs`):** Live Status (Tab 2) and rule overview badges format remaining snooze durations via `format_snooze_badge`, displaying `Snoozed (Xs)` when remaining time drops below 60 seconds and ceiling-rounded `Snoozed (Xm)` when 60 seconds or more, providing real-time countdown feedback as snoozes near expiration.
 - **Schedule Grid Alignment & Presets (`ui/schedule_grid.slint`, `src/config.rs`):** The 24 hourly row labels and the 7×24 interactive matrix use matching 432px container heights and 1px top/bottom padding to guarantee pixel-exact row alignment. The schedule grid provides one-click presets via `RuleSchedule::from_preset`: `"work_hours"` (M-F 9-5), `"evenings"` (M-F 18-24, Sat-Sun 8-24), `"weekends"` (Sat-Sun all hours, M-F inactive), `"select_all"`, and `"clear"`.
 
+### 6.3 System Tray Architecture & Tri-State Status Indicator (`src/main.rs`, `src/engine.rs`)
+AW-Enforcer features a persistent Windows system tray icon that dynamically reflects the real-time operational state of the enforcement engine across three distinct color indicators:
+
+| State | Color Code | RGB (Dec) | Visual Asset | Trigger Criteria & Operational Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| **Normal** | Sky Blue (`#38bdf8`) | `(56, 189, 248)` | `assets/tray_icon_32.rgba`<br>`assets/fluent_clock_pause_24_regular.svg` | **Active Monitoring:** Daemon is actively tracking telemetry; rules are enabled and within schedule with no active warnings, grace periods, or break enforcements. |
+| **Paused** | Slate Gray (`#94a3b8`) | `(148, 163, 184)` | `assets/tray_icon_paused_32.rgba`<br>`assets/fluent_clock_pause_24_regular_paused.svg` | **All Rules Paused:** User toggled `pause_all_rules == true`. Overrides all rule warnings and countdowns to indicate dormant monitoring. |
+| **Alert** | Alert Red (`#ef4444`) | `(239, 68, 68)` | `assets/tray_icon_alert_32.rgba`<br>`assets/fluent_clock_pause_24_regular_alert.svg` | **Attention Required:** At least one enabled, scheduled, unsnoozed rule is currently in a **Warning Period** (`rt.warned_current_cycle == true`), **Grace Period** (`rt.grace_countdown.is_some()`), or **Active Enforcement** (`rt.active_break.is_some()`, `rt.pending_break_since.is_some()`, or `is_rule_displayed`). |
+
+- **Evaluation Hierarchy (`Engine::current_tray_state`):** Strict priority ensures unambiguous user signaling:
+  1. `TrayIconState::Paused`: Evaluated first. If `config.general.pause_all_rules` is `true`, the icon is gray regardless of pending break or warning states.
+  2. `TrayIconState::Alert`: Evaluated second. If not paused, checks whether any enabled rule within its active schedule (`rule.schedule.is_active(day_index, hour_index)`) and not currently snoozed (`global_snoozed_until` or `rt.snoozed_until`) is in warning, grace, active break, pending break, or displayed overlay state.
+  3. `TrayIconState::Normal`: Default state when monitoring is active without alerts or pauses.
+- **Embedded Asset Pipeline:** All three icon variants are 32×32 unmultiplied straight RGBA8 binaries (4,096 bytes) embedded into the executable at compile time via `include_bytes!`:
+  - `create_default_tray_icon()` loads `tray_icon_32.rgba`.
+  - `create_paused_tray_icon()` loads `tray_icon_paused_32.rgba`.
+  - `create_alert_tray_icon()` loads `tray_icon_alert_32.rgba`.
+  Both the paused (gray) and alert (red) binaries retain the pixel-identical alpha antialiasing channel from the original Fluent ClockPause 24 Regular vector mask.
+- **Transition-Only Updates & GDI Optimization:** The UI thread tracks `current_tray_state` in a `RefCell<TrayIconState>`. When receiving `OverlayAction::UpdateLiveStatus`, the tray icon is only updated via `ti.set_icon(Some(icon))` if `current_tray_state != tray_state`. This eliminates redundant Win32 GDI icon allocation and redraw calls during high-frequency status and telemetry ticks.
+- **Startup Consistency:** On application launch, `main()` inspects `config.general.pause_all_rules` to construct the tray icon with `create_paused_tray_icon()` if initially paused, or `create_default_tray_icon()` otherwise, guaranteeing correct visual state before the first background polling tick.
+- **Tray Menu Actions & Strict Anti-Bypass Integration:**
+  - `"Open Settings"`: Focuses or lazily instantiates the Settings window.
+  - `"Show Activity Stats"`: Dispatches `DaemonCommand::ShowStatsOverlay` to open the 24-Hour Statistics HUD.
+  - `"Dismiss Break Overlay"`: Dismisses active non-strict break overlays. Disabled (`set_enabled(false)`) when strict lock is active.
+  - `"Snooze All (15m)"` / `"Resume Snoozed Rules"`: Toggles global snooze across all rules. Dynamically updates label text based on `any_snoozed` and is disabled under strict lock.
+  - `"Pause All Rules"` / `"Resume All Rules"`: Toggles `pause_all_rules`. Disabled under strict lock.
+  - `"Quit"`: Terminates the application.
+
 ---
 
 ## 7. Security, Anti-Bypass & Reliability Architecture
@@ -432,6 +460,7 @@ graph LR
 | **Poisoned Mutex Recovery** | Safe Lock Unwrapping | All synchronization locks use `.unwrap_or_else(|e| e.into_inner())` to prevent daemon panics if an internal thread panics. |
 | **Native Toast Branding** | Custom WinRT AUMID Registration | Registers `AW-Enforcer` under `HKCU\Software\Classes\AppUserModelId\AW-Enforcer` with `DisplayName = "AW-Enforcer"` and executable `IconUri` on launch, replacing generic PowerShell toast attribution with branded headers and falling back gracefully. |
 | **Idempotent Registry Autostart** | Registry Key Read Comparison | `set_autostart` checks whether `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AW-Enforcer` already equals the current executable `--autostart` command before writing, skipping redundant `key.set_value` Win32 calls on configuration saves. `is_autostart_enabled` queries presence and path match. |
+| **Tri-State System Tray Feedback** | Embedded RGBA Buffers & State Evaluation | Dynamically updates system tray icon color (`Normal` Blue `#38bdf8`, `Paused` Gray `#94a3b8`, `Alert` Red `#ef4444`) evaluated via `Engine::current_tray_state` with Paused > Alert > Normal priority, applying changes exclusively on state transitions to avoid redundant Win32 GDI icon redraws. |
 
 ---
 
@@ -464,3 +493,4 @@ The application maintains comprehensive test coverage across all domain componen
 - **Alert Preview & Test Overlay Tests (`src/engine/preview.rs`):** Tests for `Engine::trigger_test_overlay` across BreakEnforcer, HUD Toast, and HUD Timer modes and `Engine::preview_rule_alert` across BreakEnforcer, Windows Notification, HUD Toast, and HUD Timer actions with grace and warning countdown previews.
 - **Configuration & Sanitization Tests (`src/config.rs`):** Verifies atomic file saves, corrupted file backup creation, TCP port clamping, and color sanitization.
 - **Format & String Interpolation Tests (`src/formatter.rs`):** Verifies single-pass template parsing, case-insensitive attribute toggling (including uppercase hex colors), grace-aware preview context interpolation, cross-trigger placeholder fallbacks, fallback template defaults (`rule_message_fallback`), sub-minute snooze badge countdown formatting (`format_snooze_badge`), and Markdown tag stripping for Windows Action Center toasts.
+- **System Tray Status & Asset Integrity Tests (`src/engine.rs`):** Tests for 32×32 RGBA binary integrity (4,096 bytes each, pixel-matching alpha antialiasing channel, and expected RGB color channels for Normal, Paused, and Alert icons), state machine evaluation priority (`Paused` > `Alert` > `Normal`), active break / grace / warning alert triggers, schedule-inactive / snooze suppression, and live status dispatch (`OverlayAction::UpdateLiveStatus`).
