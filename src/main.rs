@@ -385,7 +385,7 @@ fn start_main_ui_timer(
             }
 
             // Poll named activation event from a second instance
-            if unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) } == WAIT_OBJECT_0 {
+            if is_activation_event_signaled(activate_event_val) {
                 if let Err(e) = open_settings_window(&ctx, true) {
                     tracing::error!("Failed to open SettingsWindow on activation event: {e}");
                 }
@@ -552,6 +552,12 @@ fn acquire_single_instance(is_background_launch: bool) -> Option<SingleInstanceL
             activate_event,
         })
     }
+}
+
+/// Performs a non-blocking check (`0`ms timeout) to see if a second instance signaled the activation event.
+fn is_activation_event_signaled(activate_event_val: isize) -> bool {
+    activate_event_val != 0
+        && unsafe { WaitForSingleObject(activate_event_val as HANDLE, 0) == WAIT_OBJECT_0 }
 }
 
 /// RAII guard keeping the single-instance mutex and named activation event handles alive
