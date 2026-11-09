@@ -238,12 +238,10 @@ fn resolve_preview_app(rule: &Rule, trimmed_name: &str) -> String {
         crate::config::MonitorSelection::Executables => rule
             .target_executables
             .iter()
-            .find(|t| {
-                let s = t.trim();
-                !s.is_empty() && s != "*"
-            })
-            .cloned()
-            .unwrap_or_else(|| "code.exe".to_string()),
+            .map(|t| t.trim())
+            .find(|s| !s.is_empty() && *s != "*" && *s != "#" && !s.starts_with('!'))
+            .unwrap_or("code.exe")
+            .to_string(),
     }
 }
 
@@ -1070,5 +1068,22 @@ mod tests {
 
         rule.action = RuleAction::LockWorkstation;
         assert_eq!(rule_message_fallback(&rule), "");
+    }
+
+    #[test]
+    fn test_build_preview_context_skips_exclusions_and_comments() {
+        let mut rule = Rule::default_template(0);
+        rule.monitor_selection = crate::config::MonitorSelection::Executables;
+        rule.target_executables = vec![
+            "*".to_string(),
+            "#".to_string(),
+            "!zoom.exe".to_string(),
+        ];
+        let ctx = build_preview_context(&rule);
+        assert_eq!(ctx.app, "code.exe");
+
+        rule.target_executables.push("discord.exe".to_string());
+        let ctx2 = build_preview_context(&rule);
+        assert_eq!(ctx2.app, "discord.exe");
     }
 }

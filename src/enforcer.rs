@@ -592,7 +592,7 @@ pub fn exe_name_matches_targets<S: AsRef<str>>(
 
     for target in target_executables {
         let t = target.as_ref().trim();
-        if t.is_empty() || t == "*" || t.starts_with('!') {
+        if t.is_empty() || t == "*" || t == "#" || t.starts_with('!') {
             continue;
         }
         if target_matches_exe(t, exe_base, exe_stem) {
@@ -610,8 +610,10 @@ pub fn exe_name_is_excluded<S: AsRef<str>>(exe_name: &str, target_executables: &
     }
     target_executables.iter().any(|target| {
         let t = target.as_ref().trim();
-        t.strip_prefix('!')
-            .is_some_and(|rest| target_matches_exe(rest, exe_base, exe_stem))
+        t.strip_prefix('!').is_some_and(|rest| {
+            let r = rest.trim();
+            !r.is_empty() && r != "*" && r != "#" && target_matches_exe(r, exe_base, exe_stem)
+        })
     })
 }
 
@@ -651,11 +653,11 @@ pub fn normalize_exe_stem(name: &str) -> (&str, &str) {
     (basename, stem)
 }
 
-/// Returns true if `targets` contains at least one non-empty, non-wildcard, non-exclusion executable entry.
+/// Returns true if `targets` contains at least one non-empty, non-wildcard, non-comment, non-exclusion executable entry.
 pub fn has_specific_targets<S: AsRef<str>>(targets: &[S]) -> bool {
     targets.iter().any(|t| {
         let s = t.as_ref().trim();
-        !s.is_empty() && s != "*" && !s.starts_with('!')
+        !s.is_empty() && s != "*" && s != "#" && !s.starts_with('!')
     })
 }
 
@@ -668,7 +670,10 @@ pub fn has_wildcard_target<S: AsRef<str>>(targets: &[S]) -> bool {
 pub fn has_exclusion_targets<S: AsRef<str>>(targets: &[S]) -> bool {
     targets.iter().any(|t| {
         let s = t.as_ref().trim();
-        s.starts_with('!') && !s[1..].trim().is_empty()
+        s.strip_prefix('!').is_some_and(|rest| {
+            let r = rest.trim();
+            !r.is_empty() && r != "*" && r != "#"
+        })
     })
 }
 
@@ -1030,5 +1035,18 @@ mod tests {
         assert!(!matches_title_regex("Google Search", Some(&re)));
         assert!(!matches_title_regex("", Some(&re)));
         assert!(!matches_title_regex("YouTube", None));
+    }
+
+    #[test]
+    fn test_exe_name_matches_targets_with_comment_sentinels_and_exclusions() {
+        let targets = vec!["#".to_string(), "!zoom.exe".to_string()];
+        assert!(!has_specific_targets(&targets));
+        assert!(has_exclusion_targets(&targets));
+        assert!(exe_name_matches_targets("code.exe", &targets));
+        assert!(!exe_name_matches_targets("zoom.exe", &targets));
+
+        let invalid_exclusions = vec!["!".to_string(), "!*".to_string(), "!#".to_string()];
+        assert!(!has_exclusion_targets(&invalid_exclusions));
+        assert!(!exe_name_matches_targets("code.exe", &invalid_exclusions));
     }
 }

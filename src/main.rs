@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, VecModel};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0,
@@ -30,7 +30,7 @@ use config::AppConfig;
 use engine::{DaemonCommand, Engine, OverlayAction, TrayIconState};
 use overlay::OverlayManager;
 use settings_window::{
-    open_settings_window, spawn_aw_connection_check, update_rules_model_statuses, LiveUiState,
+    open_settings_window, spawn_aw_connection_check, sync_live_state_to_ui, LiveUiState,
     SettingsContext,
 };
 use tray::{TrayAction, TrayManager};
@@ -323,24 +323,7 @@ fn apply_live_status_update(
     }
 
     if let Some(ref win) = *settings_slot_ref.borrow() {
-        win.set_current_session_duration_text(session_duration_text.as_str().into());
-        win.set_today_screentime_text(screentime_text.as_str().into());
-        win.set_current_active_app(active_app.as_str().into());
-        win.set_strict_lock_active(strict_lock_active);
-        win.set_status_level(status_level.as_str().into());
-        win.set_total_active_minutes(total_active_minutes as i32);
-        win.set_target_minutes(target_minutes as i32);
-        win.set_is_loading(is_loading);
-        win.set_histogram_values(ModelRc::from(Rc::new(VecModel::from(histogram_values))));
-        let labels: Vec<slint::SharedString> = histogram_labels
-            .iter()
-            .map(|s| s.as_str().into())
-            .collect();
-        win.set_histogram_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
-        if !strict_lock_active {
-            win.set_strict_unlocked(false);
-            win.set_strict_unlock_countdown(0);
-        }
+        sync_live_state_to_ui(win, rules_model_ref, &live_state_ref.borrow());
     }
 
     tray_mgr_ref.borrow_mut().sync_live_status(
@@ -349,14 +332,6 @@ fn apply_live_status_update(
         tray_tooltip,
         tray_state,
     );
-
-    if settings_slot_ref
-        .borrow()
-        .as_ref()
-        .is_some_and(|w| w.window().is_visible())
-    {
-        update_rules_model_statuses(rules_model_ref, &rule_statuses);
-    }
 }
 
 /// Configures and starts the repeated 250ms main UI timer responsible for polling activation events,

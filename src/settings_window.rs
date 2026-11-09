@@ -763,11 +763,13 @@ fn wire_executable_target_callbacks(settings_win: &SettingsWindow, ctx: &Setting
                     rule_view.target_executables.iter().collect();
                 if e_idx < current_targets.len() {
                     current_targets.remove(e_idx);
-                    if current_targets.is_empty() && rule_view.action.as_str() == "Kill Process" {
-                        rule_view.action = "Close Window".into();
-                    }
                     rule_view.target_executables =
                         ModelRc::from(Rc::new(VecModel::from(current_targets)));
+                    if first_specific_executable(&rule_view.target_executables).is_none()
+                        && rule_view.action.as_str() == "Kill Process"
+                    {
+                        rule_view.action = "Close Window".into();
+                    }
                     load_rule_into_editor(win, rule_view, rm);
                     return true;
                 }
@@ -1052,6 +1054,10 @@ pub fn sync_live_state_to_ui(
         .map(|s| s.as_str().into())
         .collect();
     win.set_histogram_labels(ModelRc::from(Rc::new(VecModel::from(labels))));
+    if !ls.strict_lock_active {
+        win.set_strict_unlocked(false);
+        win.set_strict_unlock_countdown(0);
+    }
     update_rules_model_statuses(rules_model, &ls.rule_statuses);
 }
 
@@ -1310,11 +1316,11 @@ pub fn set_color_preview(win: &SettingsWindow, kind: &str, hex: &str) {
     }
 }
 
-/// Validates regular expressions for the currently selected rule if Title or URL monitoring is selected.
-/// When Executables monitoring is selected, sets `rule-regex-valid = true` and `rule-regex-error = ""`.
-pub fn refresh_rule_regex_validation(win: &SettingsWindow, _rm: &VecModel<RuleView>) {
+/// Validates regular expressions for the currently selected rule (and any other rule in `rm`) if Title or URL monitoring is selected.
+/// When all rules have valid regex patterns, sets `rule-regex-valid = true` and `rule-regex-error = ""`.
+pub fn refresh_rule_regex_validation(win: &SettingsWindow, rm: &VecModel<RuleView>) {
     let cur_idx = win.get_selected_rule_idx();
-    let (valid, err) = if cur_idx >= 0 {
+    let (mut valid, mut err) = if cur_idx >= 0 {
         let mode = win.get_rule_monitor_selection();
         match mode.as_str() {
             "Titles" => validate_rule_pattern("Titles", &win.get_rule_title_regex(), ""),
@@ -1324,6 +1330,31 @@ pub fn refresh_rule_regex_validation(win: &SettingsWindow, _rm: &VecModel<RuleVi
     } else {
         (true, String::new())
     };
+
+    if valid {
+        for i in 0..rm.row_count() {
+            if cur_idx >= 0 && i == cur_idx as usize {
+                continue;
+            }
+            if let Some(r) = rm.row_data(i) {
+                let (r_valid, r_err) = validate_rule_pattern(
+                    r.monitor_selection.as_str(),
+                    r.title_regex.as_str(),
+                    r.url_regex.as_str(),
+                );
+                if !r_valid {
+                    let name = if !r.name.trim().is_empty() {
+                        r.name.to_string()
+                    } else {
+                        format!("Rule {}", i + 1)
+                    };
+                    valid = false;
+                    err = format!("Rule '{name}': {r_err}");
+                    break;
+                }
+            }
+        }
+    }
 
     win.set_rule_regex_valid(valid);
     win.set_rule_regex_error(if valid { "".into() } else { err.into() });
@@ -1406,22 +1437,34 @@ pub fn add_executable_to_rule(
     let Some(normalized) = normalize_executable_name(exe_name) else {
         return;
     };
+    let bare_normalized = normalized.strip_prefix('!').unwrap_or(&normalized);
     update_rule_at(rm, sw, rule_idx, |rule_view, win, rm| {
         let mut targets: Vec<slint::SharedString> = rule_view
             .target_executables
             .iter()
-            .filter(|t| is_specific_executable(t.as_str()))
+            .filter(|t| is_ui_target_entry(t.as_str()))
             .collect();
-        if !targets
+        if targets
             .iter()
             .any(|t| t.as_str().eq_ignore_ascii_case(&normalized))
         {
-            targets.push(normalized.as_str().into());
-            rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
-            load_rule_into_editor(win, rule_view, rm);
-            return true;
+            return false;
         }
-        false
+        // Remove any opposite-polarity entry for the same base executable
+        targets.retain(|t| {
+            let s = t.as_str().trim();
+            let bare_existing = s.strip_prefix('!').unwrap_or(s).trim();
+            !bare_existing.eq_ignore_ascii_case(bare_normalized)
+        });
+        targets.push(normalized.as_str().into());
+        if first_specific_executable_slice(&targets).is_none()
+            && rule_view.action.as_str() == "Kill Process"
+        {
+            rule_view.action = "Close Window".into();
+        }
+        rule_view.target_executables = ModelRc::from(Rc::new(VecModel::from(targets)));
+        load_rule_into_editor(win, rule_view, rm);
+        true
     });
 }
 
@@ -1451,7 +1494,7 @@ pub fn rule_to_view(rule: &Rule) -> RuleView {
     let targets: Vec<slint::SharedString> = rule
         .target_executables
         .iter()
-        .filter(|s| is_specific_executable(s))
+        .filter(|s| is_ui_target_entry(s))
         .map(|s| slint::SharedString::from(s.trim()))
         .collect();
     let targets_model = ModelRc::from(Rc::new(VecModel::from(targets)));
@@ -1511,11 +1554,11 @@ pub fn view_to_rule(view: &RuleView) -> Rule {
     let mut targets: Vec<String> = view
         .target_executables
         .iter()
-        .filter(|s| is_specific_executable(s.as_str()))
+        .filter(|s| is_ui_target_entry(s.as_str()))
         .map(|s| s.trim().to_string())
         .collect();
-    if targets.is_empty() {
-        targets.push("*".to_string());
+    if !targets.iter().any(|s| is_specific_executable(s)) {
+        targets.insert(0, "*".to_string());
     }
 
     let monitor_selection = MonitorSelection::from_str_lossy(view.monitor_selection.as_str());
@@ -1556,7 +1599,7 @@ pub fn view_to_rule(view: &RuleView) -> Rule {
     rule
 }
 
-/// Returns the first non-empty, non-wildcard executable from a rule's target executables model.
+/// Returns the first non-empty, non-wildcard, non-exclusion executable from a rule's target executables model.
 pub fn first_specific_executable(targets: &slint::ModelRc<slint::SharedString>) -> Option<String> {
     targets.iter().find_map(|t| {
         let s = t.trim();
@@ -1564,33 +1607,63 @@ pub fn first_specific_executable(targets: &slint::ModelRc<slint::SharedString>) 
     })
 }
 
-/// Normalizes an executable name by trimming whitespace, appending `.exe` if missing,
-/// cleanly handling internal or trailing `.exe` with surrounding spaces,
-/// and returning `None` if the input is empty or wildcard `*`.
+fn first_specific_executable_slice(targets: &[slint::SharedString]) -> Option<String> {
+    targets.iter().find_map(|t| {
+        let s = t.trim();
+        is_specific_executable(s).then(|| s.to_string())
+    })
+}
+
+/// Normalizes an executable name by trimming whitespace, preserving an optional leading `!` exclusion prefix,
+/// appending `.exe` if missing, cleanly handling internal or trailing `.exe` with surrounding spaces,
+/// and returning `None` if the input is empty, wildcard `*`, or comment sentinel `#`.
 pub fn normalize_executable_name(exe_name: &str) -> Option<String> {
     let trimmed = exe_name.trim();
-    if trimmed.is_empty() || trimmed == "*" {
+    if trimmed.is_empty() || trimmed == "*" || trimmed == "#" {
         return None;
     }
-    if trimmed.to_ascii_lowercase().ends_with(".exe") {
-        let mut stem = trimmed[..trimmed.len() - 4].trim();
+    let (prefix, rest) = if let Some(stripped) = trimmed.strip_prefix('!') {
+        ("!", stripped.trim())
+    } else {
+        ("", trimmed)
+    };
+    if rest.is_empty() || rest == "*" || rest == "#" {
+        return None;
+    }
+    if rest.to_ascii_lowercase().ends_with(".exe") {
+        let mut stem = rest[..rest.len() - 4].trim();
         while stem.to_ascii_lowercase().ends_with(".exe") {
             stem = stem[..stem.len() - 4].trim();
         }
-        if stem.is_empty() || stem == "*" {
+        if stem.is_empty() || stem == "*" || stem == "#" {
             return None;
         }
-        let ext = &trimmed[trimmed.len() - 4..];
-        Some(format!("{}{}", stem, ext))
+        let ext = &rest[rest.len() - 4..];
+        Some(format!("{prefix}{stem}{ext}"))
     } else {
-        Some(format!("{}.exe", trimmed))
+        Some(format!("{prefix}{rest}.exe"))
     }
 }
 
-/// Returns true if an executable name is non-empty and not a wildcard (`*`).
+/// Returns true if an executable entry is a positive specific executable (non-empty, non-wildcard `*`, non-comment `#`, and not `!`-excluded).
 pub fn is_specific_executable(s: &str) -> bool {
     let trimmed = s.trim();
-    !trimmed.is_empty() && trimmed != "*"
+    !trimmed.is_empty() && trimmed != "*" && trimmed != "#" && !trimmed.starts_with('!')
+}
+
+/// Returns true if a target executable string should be retained as a visible chip in the UI
+/// (includes both positive specific executables and valid `!`-prefixed exclusions, while excluding `*` and `#`).
+pub fn is_ui_target_entry(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "*" || trimmed == "#" {
+        return false;
+    }
+    if let Some(rest) = trimmed.strip_prefix('!') {
+        let r = rest.trim();
+        !r.is_empty() && r != "*" && r != "#"
+    } else {
+        true
+    }
 }
 
 /// Constructs a `DurationConfig` from a Slint view integer value and unit string, clamping to `min_val`.
@@ -1648,8 +1721,20 @@ mod tests {
         assert!(!is_specific_executable("   "));
         assert!(!is_specific_executable("*"));
         assert!(!is_specific_executable("  *  "));
+        assert!(!is_specific_executable("#"));
+        assert!(!is_specific_executable("!zoom.exe"));
+        assert!(!is_specific_executable("  !discord.exe  "));
         assert!(is_specific_executable("steam.exe"));
         assert!(is_specific_executable("  game.exe  "));
+
+        assert!(!is_ui_target_entry(""));
+        assert!(!is_ui_target_entry("*"));
+        assert!(!is_ui_target_entry("#"));
+        assert!(!is_ui_target_entry("!"));
+        assert!(!is_ui_target_entry("!*"));
+        assert!(!is_ui_target_entry("!#"));
+        assert!(is_ui_target_entry("!zoom.exe"));
+        assert!(is_ui_target_entry("steam.exe"));
     }
 
     #[test]
@@ -1732,6 +1817,42 @@ mod tests {
             normalize_executable_name("  discord.exe  "),
             Some("discord.exe".to_string())
         );
+        assert_eq!(normalize_executable_name("#"), None);
+        assert_eq!(normalize_executable_name("!"), None);
+        assert_eq!(normalize_executable_name("!*"), None);
+        assert_eq!(normalize_executable_name("!#"), None);
+        assert_eq!(normalize_executable_name("!.exe"), None);
+        assert_eq!(
+            normalize_executable_name("!zoom"),
+            Some("!zoom.exe".to_string())
+        );
+        assert_eq!(
+            normalize_executable_name("  !  zoom.exe  "),
+            Some("!zoom.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rule_to_view_and_view_to_rule_preserves_exclusions_and_wildcard() {
+        let mut rule = Rule::default_template(0);
+        rule.target_executables = vec!["*".to_string(), "!zoom.exe".to_string()];
+        rule.action = RuleAction::KillProcess;
+
+        let view = rule_to_view(&rule);
+        let view_targets: Vec<String> = view
+            .target_executables
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(view_targets, vec!["!zoom.exe"]);
+        assert_eq!(first_specific_executable(&view.target_executables), None);
+
+        let roundtripped = view_to_rule(&view);
+        assert_eq!(
+            roundtripped.target_executables,
+            vec!["*".to_string(), "!zoom.exe".to_string()]
+        );
+        assert_eq!(roundtripped.action, RuleAction::CloseWindow);
     }
 
     #[test]
