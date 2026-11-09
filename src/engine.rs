@@ -554,8 +554,19 @@ impl Engine {
                 }
             }
         }
+        let globally_inactive = self.config.general.pause_all_rules
+            || self.global_snoozed_until.is_some_and(|u| u > now);
+
         for rule_id in &launched_breaks {
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == *rule_id).cloned() {
+                let rule_snoozed = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|rt| rt.snoozed_until)
+                    .is_some_and(|u| u > now);
+                if !rule.enabled || globally_inactive || rule_snoozed {
+                    continue;
+                }
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let matched_app = if rule.monitor_selection == MonitorSelection::Urls {
                     self.runtimes
@@ -691,10 +702,21 @@ impl Engine {
 
         if grace_displayed_finished {
             self.active_overlay_mode = OverlayMode::Hidden;
+            if self.has_any_active_countdown() {
+                self.transition_to_active_countdown_or_hide();
+            }
         }
 
         for rule_id in &completed_enforcements {
             if let Some(rule) = self.config.rules.iter().find(|r| r.id == *rule_id).cloned() {
+                let rule_snoozed = self
+                    .runtimes
+                    .get(&rule.id)
+                    .and_then(|rt| rt.snoozed_until)
+                    .is_some_and(|u| u > now);
+                if !rule.enabled || globally_inactive || rule_snoozed {
+                    continue;
+                }
                 let re = self.runtimes.get(&rule.id).and_then(|r| r.compiled_regex.clone());
                 let target_window = if rule.monitor_selection == MonitorSelection::Urls {
                     let maybe_title_re = self
@@ -782,13 +804,17 @@ impl Engine {
     pub async fn handle_command(&mut self, cmd: DaemonCommand) {
         match cmd {
             DaemonCommand::SnoozeBreak { rule_id, minutes } => {
+                let now = Local::now();
+                if self.is_strict_lock_active(now) {
+                    tracing::warn!("SnoozeBreak ignored: strict enforcement active");
+                    return;
+                }
                 if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
                     if rule.strict_mode {
                         tracing::warn!("SnoozeBreak ignored: strict mode active for rule {}", rule_id);
                         return;
                     }
                 }
-                let now = Local::now();
                 let until = now + Duration::minutes(minutes as i64);
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
                     rt.snooze(until);
@@ -841,6 +867,11 @@ impl Engine {
                 }
             }
             DaemonCommand::SkipBreak { rule_id } => {
+                let now = Local::now();
+                if self.is_strict_lock_active(now) {
+                    tracing::warn!("SkipBreak ignored: strict enforcement active");
+                    return;
+                }
                 if let Some(rule) = self.config.rules.iter().find(|r| r.id == rule_id) {
                     if rule.strict_mode {
                         tracing::warn!("SkipBreak ignored: strict mode active for rule {}", rule_id);
@@ -848,7 +879,7 @@ impl Engine {
                     }
                 }
                 if let Some(rt) = self.runtimes.get_mut(&rule_id) {
-                    rt.complete_cycle(Local::now());
+                    rt.complete_cycle(now);
                 }
                 self.transition_if_displayed_or_idle(&rule_id);
                 self.poll_tick().await;
@@ -1560,6 +1591,19 @@ impl Engine {
                 }
             }
         }
+        if let OverlayMode::HudToast {
+            rule_id: ref prev_id,
+            ..
+        } = self.active_overlay_mode
+        {
+            if mode.rule_id() != Some(prev_id.as_str()) {
+                if let Some(rt) = self.runtimes.get_mut(prev_id) {
+                    if rt.active_break.is_none() {
+                        rt.can_rollback_completion = false;
+                    }
+                }
+            }
+        }
         if !matches!(mode, OverlayMode::HudStatus { .. }) {
             self.stats_cache = None;
         }
@@ -1570,9 +1614,29 @@ impl Engine {
 
     /// Hides any active overlay and resets `active_overlay_mode` to `OverlayMode::Hidden`.
     fn hide_overlay(&mut self) {
+        if let OverlayMode::HudToast { ref rule_id, .. } = self.active_overlay_mode {
+            if let Some(rt) = self.runtimes.get_mut(rule_id) {
+                if rt.active_break.is_none() {
+                    rt.can_rollback_completion = false;
+                }
+            }
+        }
         self.active_overlay_mode = OverlayMode::Hidden;
         self.stats_cache = None;
         self.overlay_tx.send(OverlayAction::Hide).ok();
+    }
+
+
+    /// Returns true if any enabled rule currently has a non-zero active break or un-dismissed grace countdown.
+    fn has_any_active_countdown(&self) -> bool {
+        self.config.rules.iter().any(|r| {
+            r.enabled
+                && self.runtimes.get(&r.id).is_some_and(|rt| {
+                    rt.active_break.is_some_and(|(rem, _)| rem > 0)
+                        || (!rt.grace_dismissed
+                            && rt.grace_countdown.is_some_and(|(rem, _)| rem > 0))
+                })
+        })
     }
 
 
@@ -5644,5 +5708,168 @@ mod tests {
         assert!(matches!(status_level.as_str(), "Great" | "Okay" | "Excessive"));
         assert_eq!(values.len(), 24);
         assert_eq!(labels.len(), 24);
+    }
+
+    #[tokio::test]
+    async fn test_grace_completion_does_not_clobber_concurrent_active_countdown() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(56999, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule_notify = Rule::default_template(0);
+        rule_notify.id = "rule-notify-grace".to_string();
+        rule_notify.action = RuleAction::ShowNotification;
+        rule_notify.notification_method = NotificationMethod::Hud;
+        rule_notify.grace_duration = DurationConfig::new(5, TimeUnit::Sec);
+        rule_notify.trigger = TriggerType::Limit;
+
+        let mut rule_kill = Rule::default_template(1);
+        rule_kill.id = "rule-kill-grace".to_string();
+        rule_kill.action = RuleAction::KillProcess;
+        rule_kill.target_executables = vec!["explorer.exe".to_string()];
+        rule_kill.grace_duration = DurationConfig::new(10, TimeUnit::Sec);
+        rule_kill.trigger = TriggerType::Limit;
+
+        cfg.rules = vec![rule_notify, rule_kill];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        // rule-notify-grace has 1s remaining and is currently displayed; rule-kill-grace has 5s remaining in background
+        engine
+            .runtimes
+            .get_mut("rule-notify-grace")
+            .unwrap()
+            .grace_countdown = Some((1, 5));
+        engine
+            .runtimes
+            .get_mut("rule-kill-grace")
+            .unwrap()
+            .grace_countdown = Some((5, 10));
+        engine.active_overlay_mode = OverlayMode::HudTimer {
+            rule_id: "rule-notify-grace".to_string(),
+            title: "Notify Grace".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 5,
+            remaining_seconds: 1,
+            allow_snooze: true,
+            strict_mode: false,
+        };
+
+        // Tick realtime: rule-notify-grace finishes (1 -> 0), rule-kill-grace decrements (5 -> 4).
+        // Because rule-kill-grace is an active HudTimer (priority 3), rule-notify-grace's HudToast (priority 2)
+        // must NOT clobber rule-kill-grace's HudTimer!
+        engine.realtime_tick().await;
+
+        assert_eq!(
+            engine.active_overlay_mode.rule_id(),
+            Some("rule-kill-grace"),
+            "Concurrent active HudTimer must not be clobbered by lower-priority HudToast after grace completion"
+        );
+        assert!(matches!(
+            engine.active_overlay_mode,
+            OverlayMode::HudTimer {
+                remaining_seconds: 4,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_preempted_hud_toast_clears_rollback_and_strict_lock_blocks_other_rule_snooze_skip() {
+        let (overlay_tx, _overlay_rx) = mpsc::unbounded_channel();
+        let aw_client = Arc::new(AwClient::new(56999, ""));
+        let mut cfg = AppConfig::default();
+
+        let mut rule_toast = Rule::default_template(0);
+        rule_toast.id = "rule-toast".to_string();
+        rule_toast.action = RuleAction::ShowNotification;
+        rule_toast.notification_method = NotificationMethod::Hud;
+
+        let mut rule_strict = Rule::default_template(1);
+        rule_strict.id = "rule-strict".to_string();
+        rule_strict.action = RuleAction::ShowOverlay;
+        rule_strict.strict_mode = true;
+
+        cfg.rules = vec![rule_toast, rule_strict];
+        let mut engine = Engine::new(cfg, aw_client, overlay_tx);
+
+        let now = Local::now();
+        let t_prev = now - Duration::minutes(40);
+        let t_completed = now - Duration::seconds(5);
+        {
+            let rt = engine.runtimes.get_mut("rule-toast").unwrap();
+            rt.prev_completed_at = Some(t_prev);
+            rt.last_completed_at = Some(t_completed);
+            rt.can_rollback_completion = true;
+            rt.action_executed_today = true;
+        }
+        engine.active_overlay_mode = OverlayMode::HudToast {
+            rule_id: "rule-toast".to_string(),
+            title: "Toast".to_string(),
+            paragraphs: Vec::new(),
+            snooze_options_minutes: vec![5],
+            duration_seconds: 10,
+            remaining_seconds: 8,
+            show_time_remaining: true,
+        };
+
+        // Preempt rule-toast with rule-strict's HudTimer
+        engine.show_overlay(OverlayMode::HudTimer {
+            rule_id: "rule-strict".to_string(),
+            title: "Strict Grace".to_string(),
+            paragraphs: Vec::new(),
+            duration_seconds: 15,
+            remaining_seconds: 15,
+            allow_snooze: false,
+            strict_mode: true,
+        });
+
+        assert!(
+            !engine
+                .runtimes
+                .get("rule-toast")
+                .unwrap()
+                .can_rollback_completion,
+            "Preempting a HudToast must clear can_rollback_completion on the preempted rule"
+        );
+
+        // Activate strict lock on rule-strict and verify SnoozeBreak & SkipBreak on rule-toast are blocked
+        engine
+            .runtimes
+            .get_mut("rule-strict")
+            .unwrap()
+            .grace_countdown = Some((15, 15));
+        assert!(engine.is_strict_lock_active(Local::now()));
+
+        engine
+            .handle_command(DaemonCommand::SnoozeBreak {
+                rule_id: "rule-toast".to_string(),
+                minutes: 15,
+            })
+            .await;
+        assert!(
+            engine
+                .runtimes
+                .get("rule-toast")
+                .unwrap()
+                .snoozed_until
+                .is_none(),
+            "SnoozeBreak on any rule must be blocked while strict lock is active"
+        );
+
+        engine
+            .runtimes
+            .get_mut("rule-toast")
+            .unwrap()
+            .active_break = Some((60, 60));
+        engine
+            .handle_command(DaemonCommand::SkipBreak {
+                rule_id: "rule-toast".to_string(),
+            })
+            .await;
+        assert_eq!(
+            engine.runtimes.get("rule-toast").unwrap().active_break,
+            Some((60, 60)),
+            "SkipBreak on any rule must be blocked while strict lock is active"
+        );
     }
 }

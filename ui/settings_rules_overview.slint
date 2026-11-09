@@ -186,7 +186,7 @@ export component RulesOverview inherits VerticalLayout {
 
                 Button {
                     text: "Snooze 15m";
-                    enabled: !root.ui-locked-by-strict && r.enabled && !r.strict-mode;
+                    enabled: !root.strict-lock-active && r.enabled && !r.strict-mode;
                     clicked => {
                         root.snooze-rule(i, 15);
                     }
